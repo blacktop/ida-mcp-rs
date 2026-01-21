@@ -238,7 +238,8 @@ fn run_server() -> anyhow::Result<()> {
         rt.block_on(async move {
             info!("MCP server listening on stdio");
             let server = IdaMcpServer::new(Arc::new(worker_for_server), ServerMode::Stdio);
-            let mut service = Some(server.serve(stdio()).await?);
+            let sanitized = ida_mcp::server::SanitizedIdaServer(server);
+            let mut service = Some(sanitized.serve(stdio()).await?);
             let shutdown_notify = Arc::new(Notify::new());
             let shutdown_signal = shutdown_notify.clone();
 
@@ -310,14 +311,13 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
 
     let worker_for_factory = worker.clone();
     let worker_for_shutdown = worker.clone();
-    let server_handle =
-        thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime");
+    let server_handle = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
 
-            let result = rt.block_on(async move {
+        let result = rt.block_on(async move {
             let session_manager = Arc::new(LocalSessionManager::default());
             let cancel = tokio_util::sync::CancellationToken::new();
             let cancel_for_config = cancel.clone();
@@ -333,7 +333,12 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             };
 
             let service = StreamableHttpService::new(
-                move || Ok(IdaMcpServer::new(worker_for_factory.clone(), ServerMode::Http)),
+                move || {
+                    Ok(ida_mcp::server::SanitizedIdaServer(IdaMcpServer::new(
+                        worker_for_factory.clone(),
+                        ServerMode::Http,
+                    )))
+                },
                 session_manager,
                 config,
             );
@@ -387,10 +392,10 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
         });
-            if let Err(err) = result {
-                error!("HTTP server error: {err}");
-            }
-        });
+        if let Err(err) = result {
+            error!("HTTP server error: {err}");
+        }
+    });
 
     info!("Starting IDA worker loop");
     ida::run_ida_loop_no_init(rx);

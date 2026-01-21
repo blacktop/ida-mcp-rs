@@ -2424,3 +2424,66 @@ impl ServerHandler for IdaMcpServer {
         }
     }
 }
+
+use rmcp::model::*;
+use rmcp::service::{RequestContext, RoleServer};
+
+/// Wrapper that sanitizes tool schemas by removing `$schema` fields.
+///
+/// Some MCP clients (like Claude Desktop) choke on the JSON Schema `$schema` field.
+/// This wrapper intercepts `list_tools` to remove these fields while delegating
+/// all other methods to the inner server.
+pub struct SanitizedIdaServer<S>(pub S);
+
+impl<S> std::ops::Deref for SanitizedIdaServer<S> {
+    type Target = S;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Strips `$schema` keys from tool input schemas in place.
+fn sanitize_tool_schemas(result: &mut ListToolsResult) {
+    for tool in &mut result.tools {
+        let schema_arc = &mut tool.input_schema;
+        if let Some(map) = std::sync::Arc::get_mut(schema_arc) {
+            map.remove("$schema");
+        } else {
+            let mut map = (**schema_arc).clone();
+            map.remove("$schema");
+            *schema_arc = std::sync::Arc::new(map);
+        }
+    }
+}
+
+impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
+    async fn initialize(
+        &self,
+        params: InitializeRequestParam,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        self.0.initialize(params, ctx).await
+    }
+
+    async fn list_tools(
+        &self,
+        params: Option<PaginatedRequestParam>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let mut result = self.0.list_tools(params, ctx).await?;
+        sanitize_tool_schemas(&mut result);
+        Ok(result)
+    }
+
+    async fn call_tool(
+        &self,
+        params: CallToolRequestParam,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        self.0.call_tool(params, ctx).await
+    }
+
+    fn get_info(&self) -> ServerInfo {
+        self.0.get_info()
+    }
+}
