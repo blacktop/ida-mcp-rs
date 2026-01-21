@@ -868,7 +868,7 @@ dependencies = [
 [[package]]
 name = "idalib"
 version = "0.7.2+9.2.250908"
-source = "git+https://github.com/blacktop/idalib.git?branch=disasm-line#a9c053a4d198c2438e1812995575a046c4daf326"
+source = "git+https://github.com/blacktop/idalib.git?branch=disasm-line#d8096bbe06ba3597c991de909789b982cfaf4494"
 dependencies = [
  "anyhow",
  "autocxx",
@@ -882,7 +882,7 @@ dependencies = [
 [[package]]
 name = "idalib-build"
 version = "0.7.2+9.2.250908"
-source = "git+https://github.com/blacktop/idalib.git?branch=disasm-line#a9c053a4d198c2438e1812995575a046c4daf326"
+source = "git+https://github.com/blacktop/idalib.git?branch=disasm-line#d8096bbe06ba3597c991de909789b982cfaf4494"
 dependencies = [
  "anyhow",
  "idalib-sys",
@@ -891,7 +891,7 @@ dependencies = [
 [[package]]
 name = "idalib-sys"
 version = "0.7.2+9.2.250908"
-source = "git+https://github.com/blacktop/idalib.git?branch=disasm-line#a9c053a4d198c2438e1812995575a046c4daf326"
+source = "git+https://github.com/blacktop/idalib.git?branch=disasm-line#d8096bbe06ba3597c991de909789b982cfaf4494"
 dependencies = [
  "anyhow",
  "autocxx",
