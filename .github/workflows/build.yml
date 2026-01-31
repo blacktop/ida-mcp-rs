@@ -25,7 +25,9 @@ jobs:
       - name: Build
         env:
           IDADIR: /opt/idapro-9.2
-        run: cargo build --release --locked
+          # Enable verbose C++ compiler output
+          CC_ENABLE_DEBUG_OUTPUT: "1"
+        run: cargo build --release --locked -vv
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
