@@ -12,16 +12,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # TODO: Linux/Windows builds need idalib-sys fixes
-  # - Linux: C++ compilation issues with IDA SDK headers
-  # - Windows: Duplicate symbol linker errors
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        env:
+          IDADIR: /opt/idapro-9.2
+        run: cargo build --release --locked
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ida-mcp-linux-x86_64
+          path: target/release/ida-mcp
 
   build-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -37,8 +54,38 @@ jobs:
           name: ida-mcp-macos-arm64
           path: target/release/ida-mcp
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20"
+          directory: "${{ runner.temp }}/llvm-20"
+
+      - name: Configure LLVM environment
+        run: echo "LIBCLANG_PATH=$((gcm clang).source -replace "clang.exe")" >> $env:GITHUB_ENV
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        env:
+          IDADIR: C:\Program Files\IDA Professional 9.2
+        run: cargo build --release --locked
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ida-mcp-windows-x86_64
+          path: target/release/ida-mcp.exe
+
   release:
-    needs: [build-macos]
+    needs: [build-linux, build-macos, build-windows]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -57,16 +104,29 @@ jobs:
         run: |
           cd artifacts
 
+          # Linux
+          chmod +x ida-mcp-linux-x86_64/ida-mcp
+          tar -czvf ida-mcp_${GITHUB_REF_NAME#v}_Linux_x86_64.tar.gz \
+            -C ida-mcp-linux-x86_64 ida-mcp \
+            -C ${{ github.workspace }} README.md LICENSE
+
           # macOS
           chmod +x ida-mcp-macos-arm64/ida-mcp
           tar -czvf ida-mcp_${GITHUB_REF_NAME#v}_Darwin_arm64.tar.gz \
             -C ida-mcp-macos-arm64 ida-mcp \
             -C ${{ github.workspace }} README.md LICENSE
 
+          # Windows
+          zip ida-mcp_${GITHUB_REF_NAME#v}_Windows_x86_64.zip \
+            ida-mcp-windows-x86_64/ida-mcp.exe \
+            -j ${{ github.workspace }}/README.md \
+            -j ${{ github.workspace }}/LICENSE
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/*.tar.gz
+            artifacts/*.zip
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'rc') }}
