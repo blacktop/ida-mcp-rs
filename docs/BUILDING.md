@@ -5,30 +5,99 @@
 - IDA Pro 9.2+ with valid license
 - Rust 1.77+ (stable toolchain)
 - LLVM/Clang (for C++ bindings)
+- IDA SDK (from Hex-Rays)
 
-## Build
+## Platform-Specific Setup
+
+### macOS (ARM64)
 
 ```bash
+# Install Xcode command line tools (provides clang)
+xcode-select --install
+
+# Clone and build
 git clone https://github.com/blacktop/ida-mcp-rs.git
 cd ida-mcp-rs
 cargo build --release
 ```
 
-The binary is at `target/release/ida-mcp`.
+Default IDA path: `/Applications/IDA Professional 9.2.app/Contents/MacOS`
 
-## IDA Installation Path
+Override with `IDADIR`:
+```bash
+IDADIR='/Applications/IDA Home 9.2.app/Contents/MacOS' cargo build --release
+```
 
-Build is configured for IDA 9.2 at `/Applications/IDA Professional 9.2.app/Contents/MacOS`.
-
-Set `IDADIR` if your installation differs:
+### Linux (x86_64)
 
 ```bash
-IDADIR=/path/to/ida cargo build --release
+# Install dependencies (Ubuntu/Debian)
+sudo apt-get update
+sudo apt-get install -y build-essential llvm clang libclang-dev
+
+# Set IDA path
+export IDADIR=/opt/idapro-9.2
+
+# Clone and build
+git clone https://github.com/blacktop/ida-mcp-rs.git
+cd ida-mcp-rs
+cargo build --release
+```
+
+Common Linux IDA paths:
+- `/opt/idapro-9.2`
+- `/home/<user>/idapro-9.2`
+- `/usr/local/idapro-9.2`
+
+### Windows (x86_64)
+
+```powershell
+# Install LLVM (required for bindgen)
+# Option 1: winget
+winget install LLVM.LLVM
+
+# Option 2: Download from https://releases.llvm.org/
+
+# Set environment variables
+$env:IDADIR = "C:\Program Files\IDA Professional 9.2"
+$env:PATH = "$env:IDADIR;$env:PATH"
+
+# Ensure LLVM is in PATH
+$env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+
+# Clone and build
+git clone https://github.com/blacktop/ida-mcp-rs.git
+cd ida-mcp-rs
+cargo build --release
+```
+
+Common Windows IDA paths:
+- `C:\Program Files\IDA Professional 9.2`
+- `C:\IDA Professional 9.2`
+- `C:\Program Files\IDA Home 9.2`
+
+## Build Output
+
+The binary is at:
+- Linux/macOS: `target/release/ida-mcp`
+- Windows: `target/release/ida-mcp.exe`
+
+## IDA SDK (for CI builds)
+
+CI builds require the IDA SDK. Set `IDASDKDIR` to the SDK path:
+
+```bash
+export IDASDKDIR=/path/to/idasdk
+cargo build --release
 ```
 
 ## RPATH
 
-The IDA library path is baked into the binary via RPATH at build time, so no wrapper script or environment variables are needed at runtime.
+The IDA library path is baked into the binary via RPATH at build time. On macOS, this means the binary "just works" if built with the correct `IDADIR`.
+
+On Linux and Windows, users may need to set environment variables at runtime:
+- Linux: `IDADIR` or `LD_LIBRARY_PATH`
+- Windows: Add IDA directory to `PATH`
 
 ## Run modes
 
@@ -42,3 +111,7 @@ The IDA library path is baked into the binary via RPATH at build time, so no wra
 # CLI probe (test IDA connection)
 ./target/release/ida-mcp probe --path /path/to/binary --list 10
 ```
+
+## Cross-Compilation
+
+**Not supported.** idalib links against IDA's native libraries at build time. You must build natively on each platform with IDA installed.
