@@ -93,15 +93,24 @@ The binary links against IDA's libraries at runtime. Standard installation paths
 claude mcp add ida -- ida-mcp
 ```
 
-#### [Codex CLI](https://platform.openai.com/docs/guides/mcp)
+#### [Codex CLI](https://github.com/openai/codex)
 ```bash
-cursor mcp add ida -- ida-mcp
+codex mcp add ida -- ida-mcp
 ```
 
-#### [Gemini CLI](https://github.com/google/gemini-cli)
-
+#### [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 ```bash
-gemini mcp add ida ida-mcp
+gemini mcp add ida -- ida-mcp
+```
+
+#### [Cursor](https://cursor.com)
+Add to `.cursor/mcp.json`:
+```json
+{
+  "mcpServers": {
+    "ida": { "command": "ida-mcp" }
+  }
+}
 ```
 
 ### Usage
