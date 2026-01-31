@@ -31,17 +31,17 @@ See [docs/BUILDING.md](docs/BUILDING.md).
 
 #### macOS
 
+Standard IDA installations in `/Applications` work automatically:
 ```bash
-# Add to your MCP config
 claude mcp add ida -- ida-mcp
 ```
 
-If using IDA Home/Essential or non-standard path:
+If you see `Library not loaded: @rpath/libida.dylib`, set `DYLD_LIBRARY_PATH` to your IDA path:
 ```bash
-claude mcp add ida -s user -e DYLD_LIBRARY_PATH='/Applications/IDA Essential 9.2.app/Contents/MacOS' -- ida-mcp
+claude mcp add ida -e DYLD_LIBRARY_PATH='/path/to/IDA.app/Contents/MacOS' -- ida-mcp
 ```
 
-Common macOS IDA paths:
+Supported paths (auto-detected):
 - `/Applications/IDA Professional 9.2.app/Contents/MacOS`
 - `/Applications/IDA Professional 9.3.app/Contents/MacOS` (beta)
 - `/Applications/IDA Home 9.2.app/Contents/MacOS`
@@ -49,46 +49,42 @@ Common macOS IDA paths:
 
 #### Linux
 
+Standard IDA installations are auto-detected:
 ```bash
-# Set IDADIR to your IDA installation
-export IDADIR=/opt/idapro-9.2
-
-# Add to your MCP config
-claude mcp add ida -s user -e IDADIR='/opt/idapro-9.2' -- ida-mcp
+claude mcp add ida -- ida-mcp
 ```
 
-Common Linux IDA paths:
-- `/opt/idapro-9.2`
-- `/home/<user>/idapro-9.2`
-- `/usr/local/idapro-9.2`
+If you see library loading errors, set `IDADIR`:
+```bash
+claude mcp add ida -e IDADIR='/path/to/ida' -- ida-mcp
+```
+
+Supported paths (auto-detected):
+- `/opt/idapro-9.2`, `/opt/idapro-9.3`
+- `$HOME/idapro-9.2`, `$HOME/idapro-9.3`
+- `/usr/local/idapro-9.2`, `/usr/local/idapro-9.3`
 
 #### Windows
 
+Add your IDA directory to `PATH` (System Properties > Environment Variables):
 ```powershell
-# Set IDADIR environment variable (System Properties > Environment Variables)
-# Or in PowerShell profile:
-$env:IDADIR = "C:\Program Files\IDA Professional 9.2"
-$env:PATH = "$env:IDADIR;$env:PATH"
-
-# Add to MCP config
-# Note: You may need to set IDADIR globally in System Environment Variables
+$env:PATH = "C:\Program Files\IDA Professional 9.2;$env:PATH"
 claude mcp add ida -- ida-mcp
 ```
 
 Common Windows IDA paths:
 - `C:\Program Files\IDA Professional 9.2`
-- `C:\IDA Professional 9.2`
 - `C:\Program Files\IDA Home 9.2`
 
 ### Runtime Requirements
 
-The binary links against IDA's libraries at runtime:
+The binary links against IDA's libraries at runtime. Standard installation paths are auto-detected via baked RPATHs. For non-standard paths:
 
-| Platform | Library | How to Configure |
-|----------|---------|------------------|
-| macOS | `libidalib.dylib` | `DYLD_LIBRARY_PATH` or baked RPATH |
-| Linux | `libidalib.so` | `IDADIR` env var (RPATH baked at build) |
-| Windows | `idalib.dll` | Add `IDADIR` to `PATH` |
+| Platform | Library | Fallback Configuration |
+|----------|---------|------------------------|
+| macOS | `libida.dylib` | `DYLD_LIBRARY_PATH` |
+| Linux | `libida.so` | `IDADIR` or `LD_LIBRARY_PATH` |
+| Windows | `ida.dll` | Add IDA dir to `PATH` |
 
 ### Configure your AI agent
 

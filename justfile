@@ -67,11 +67,11 @@ update-beta-cask ida_version="9.3":
           ida-mcp@beta requires IDA Pro {{ida_version}}+ to be installed.
           This is a prerelease version for testing.
 
-          Set IDADIR before running:
-            export IDADIR="/Applications/IDA Professional {{ida_version}}.app/Contents/MacOS"
+          Standard IDA installations work automatically:
+            claude mcp add ida -- ida-mcp
 
-          For MCP integration with Claude Code:
-            claude mcp add ida -s user -e IDADIR='/Applications/IDA Professional {{ida_version}}.app/Contents/MacOS' -- ida-mcp
+          If using a non-standard path, set DYLD_LIBRARY_PATH:
+            claude mcp add ida -e DYLD_LIBRARY_PATH='/path/to/ida/Contents/MacOS' -- ida-mcp
         EOS
       end
     end
@@ -128,11 +128,11 @@ update-cask:
         <<~EOS
           ida-mcp requires IDA Pro 9.2+ to be installed.
 
-          Set IDADIR before running:
-            export IDADIR="/Applications/IDA Professional 9.2.app/Contents/MacOS"
+          Standard IDA installations work automatically:
+            claude mcp add ida -- ida-mcp
 
-          For MCP integration with Claude Code:
-            claude mcp add ida -s user -e IDADIR='/Applications/IDA Professional 9.2.app/Contents/MacOS' -- ida-mcp
+          If using a non-standard path, set DYLD_LIBRARY_PATH:
+            claude mcp add ida -e DYLD_LIBRARY_PATH='/path/to/ida/Contents/MacOS' -- ida-mcp
         EOS
       end
     end
