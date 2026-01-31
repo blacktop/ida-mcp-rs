@@ -1,2 +1,4 @@
-[env]
-IDADIR = "/Applications/IDA Professional 9.2.app/Contents/MacOS"
+# Platform-specific linker settings
+[target.x86_64-pc-windows-msvc]
+# Allow duplicate symbol definitions (needed for idalib-sys cxx bridge)
+rustflags = ["-C", "link-arg=/FORCE:MULTIPLE"]
