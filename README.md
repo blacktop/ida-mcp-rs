@@ -10,14 +10,14 @@ Headless IDA Pro MCP server for AI-powered reverse engineering.
 
 ### Install
 
-Via [Homebrew](https://brew.sh) (macOS only)
+**macOS** (via [Homebrew](https://brew.sh))
 ```bash
 brew install blacktop/tap/ida-mcp
 ```
 
-**Download binary**
+**Linux / Windows**
 
-Grab the latest release for your platform from [GitHub Releases](https://github.com/blacktop/ida-mcp-rs/releases).
+Download the latest binary for your platform from [GitHub Releases](https://github.com/blacktop/ida-mcp-rs/releases).
 
 **Build from source**
 
