@@ -13,22 +13,22 @@ release:
     cargo build --release
 
 # Build and publish prerelease (macOS ARM64 only, for local testing)
-prerelease ida_version="9.3": && (update-beta-cask ida_version)
+prerelease ida_version="9.4": && (update-beta-cask ida_version)
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-    IDADIR="/Applications/IDA Professional {{ida_version}}.app/Contents/MacOS" cargo build --release
+    IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
     mkdir -p dist
     rm -f "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
-    tar -czvf "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" -C target/release ida-mcp -C "{{justfile_directory()}}" README.md LICENSE
+    tar -czvf "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" -C target/release ida-mcp -C "{{ justfile_directory() }}" README.md LICENSE
     gh release create "v${VERSION}" \
         --prerelease \
         --title "IDA Pro MCP Server v${VERSION}" \
-        --notes "Prerelease for IDA Pro {{ida_version}} beta. Requires IDA Pro {{ida_version}} with valid license." \
+        --notes "Prerelease for IDA Pro {{ ida_version }} beta. Requires IDA Pro {{ ida_version }} with valid license." \
         "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
 
 # Update homebrew beta cask in tap
-update-beta-cask ida_version="9.3":
+update-beta-cask ida_version="9.4":
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
@@ -64,7 +64,7 @@ update-beta-cask ida_version="9.3":
 
       caveats do
         <<~EOS
-          ida-mcp@beta requires IDA Pro {{ida_version}}+ to be installed.
+          ida-mcp@beta requires IDA Pro {{ ida_version }}+ to be installed.
           This is a prerelease version for testing.
 
           Standard IDA installations work automatically:
