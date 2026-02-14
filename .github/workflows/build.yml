@@ -15,22 +15,22 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           submodules: true
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
       - name: Build
         env:
-          IDADIR: /opt/idapro-9.2
+          IDADIR: /opt/idapro-9.3
           # Enable verbose C++ compiler output
           CC_ENABLE_DEBUG_OUTPUT: "1"
         run: cargo build --release --locked -vv
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ida-mcp-linux-x86_64
           path: target/release/ida-mcp
@@ -38,20 +38,20 @@ jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           submodules: true
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
       - name: Build
         env:
-          IDADIR: /Applications/IDA Professional 9.2.app/Contents/MacOS
+          IDADIR: /Applications/IDA Professional 9.3.app/Contents/MacOS
         run: cargo build --release --locked
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ida-mcp-macos-arm64
           path: target/release/ida-mcp
@@ -60,7 +60,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Install LLVM
-        uses: KyleMayes/install-llvm-action@v2
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0  # v2
         with:
           version: "20"
           directory: "${{ runner.temp }}/llvm-20"
@@ -68,20 +68,20 @@ jobs:
       - name: Configure LLVM environment
         run: echo "LIBCLANG_PATH=$((gcm clang).source -replace "clang.exe")" >> $env:GITHUB_ENV
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           submodules: true
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
       - name: Build
         env:
-          IDADIR: C:\Program Files\IDA Professional 9.2
+          IDADIR: C:\Program Files\IDA Professional 9.3
         run: cargo build --release --locked
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ida-mcp-windows-x86_64
           path: target/release/ida-mcp.exe
@@ -93,12 +93,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           path: artifacts
 
@@ -125,7 +125,7 @@ jobs:
             -j ${{ github.workspace }}/LICENSE
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b  # v2
         with:
           files: |
             artifacts/*.tar.gz

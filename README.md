@@ -4,7 +4,7 @@ Headless IDA Pro MCP server for AI-powered reverse engineering.
 
 ## Prerequisites
 
-- IDA 9.2+ (stable) or IDA 9.3+ (beta) with valid license
+- IDA 9.3+ (or 9.2) with valid license
 
 ## Getting Started
 
@@ -12,11 +12,7 @@ Headless IDA Pro MCP server for AI-powered reverse engineering.
 
 Via [Homebrew](https://brew.sh) (macOS only)
 ```bash
-# Stable (IDA 9.2)
 brew install blacktop/tap/ida-mcp
-
-# Beta (IDA 9.3)
-brew install blacktop/tap/ida-mcp@beta
 ```
 
 **Download binary**
@@ -42,10 +38,10 @@ claude mcp add ida -e DYLD_LIBRARY_PATH='/path/to/IDA.app/Contents/MacOS' -- ida
 ```
 
 Supported paths (auto-detected):
+- `/Applications/IDA Professional 9.3.app/Contents/MacOS`
+- `/Applications/IDA Home 9.3.app/Contents/MacOS`
+- `/Applications/IDA Essential 9.3.app/Contents/MacOS`
 - `/Applications/IDA Professional 9.2.app/Contents/MacOS`
-- `/Applications/IDA Professional 9.3.app/Contents/MacOS` (beta)
-- `/Applications/IDA Home 9.2.app/Contents/MacOS`
-- `/Applications/IDA Essential 9.2.app/Contents/MacOS`
 
 #### Linux
 
@@ -60,21 +56,21 @@ claude mcp add ida -e IDADIR='/path/to/ida' -- ida-mcp
 ```
 
 Supported paths (auto-detected):
-- `/opt/idapro-9.2`, `/opt/idapro-9.3`
-- `$HOME/idapro-9.2`, `$HOME/idapro-9.3`
-- `/usr/local/idapro-9.2`, `/usr/local/idapro-9.3`
+- `/opt/idapro-9.3`, `/opt/idapro-9.2`
+- `$HOME/idapro-9.3`, `$HOME/idapro-9.2`
+- `/usr/local/idapro-9.3`, `/usr/local/idapro-9.2`
 
 #### Windows
 
 Add your IDA directory to `PATH` (System Properties > Environment Variables):
 ```powershell
-$env:PATH = "C:\Program Files\IDA Professional 9.2;$env:PATH"
+$env:PATH = "C:\Program Files\IDA Professional 9.3;$env:PATH"
 claude mcp add ida -- ida-mcp
 ```
 
 Common Windows IDA paths:
-- `C:\Program Files\IDA Professional 9.2`
-- `C:\Program Files\IDA Home 9.2`
+- `C:\Program Files\IDA Professional 9.3`
+- `C:\Program Files\IDA Home 9.3`
 
 ### Runtime Requirements
 
