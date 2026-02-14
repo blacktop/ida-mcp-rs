@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (install_path, ida_path, idalib_path) = idalib_build::idalib_install_paths_with(false);
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Set rpath to the IDA installation directory for runtime library loading.
 /// Adds multiple common IDA installation paths so the binary can find libraries
 /// without requiring DYLD_LIBRARY_PATH to be set.
-fn set_rpath(install_path: &PathBuf) {
+fn set_rpath(install_path: &Path) {
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| {
         if cfg!(target_os = "macos") {
             "macos".to_string()
@@ -84,6 +84,6 @@ fn set_rpath(install_path: &PathBuf) {
     }
 }
 
-fn add_rpath(path: &PathBuf) {
+fn add_rpath(path: &Path) {
     println!("cargo::rustc-link-arg=-Wl,-rpath,{}", path.display());
 }

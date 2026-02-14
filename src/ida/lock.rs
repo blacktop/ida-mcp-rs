@@ -266,6 +266,7 @@ pub(crate) fn detect_db_lock(path: &Path, _err: &IDAError) -> Option<String> {
 // Platform-specific file locking implementation
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // F_WRLCK is i32 on Linux, i16 on macOS
 fn try_lock_file(file: &File) -> Result<(), u32> {
     use std::os::unix::io::AsRawFd;
 
@@ -293,6 +294,7 @@ fn try_lock_file(_file: &File) -> Result<(), u32> {
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // F_WRLCK/F_UNLCK is i32 on Linux, i16 on macOS
 fn locked_by_pid(path: &Path) -> Option<u32> {
     use std::os::unix::io::AsRawFd;
 
@@ -331,6 +333,7 @@ fn locked_by_pid(_path: &Path) -> Option<u32> {
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // F_WRLCK/F_UNLCK is i32 on Linux, i16 on macOS
 fn locked_by_pid_from_fd(file: &File) -> Option<u32> {
     use std::os::unix::io::AsRawFd;
 
