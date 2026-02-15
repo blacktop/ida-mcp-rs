@@ -85,10 +85,17 @@ update-beta-cask ida_version="9.4":
     echo "Pushed beta cask to homebrew-tap"
 
 # Update homebrew stable cask in tap (run after GitHub release is created)
-update-cask:
+# Pass revision="" (default) for a fresh version, or revision="1" etc. for rebuilds.
+update-cask revision="":
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    REVISION="{{ revision }}"
+    if [[ -n "$REVISION" ]]; then
+        CASK_VERSION="${VERSION},${REVISION}"
+    else
+        CASK_VERSION="${VERSION}"
+    fi
     TAP_DIR="${HOME}/Developer/Mine/blacktop/homebrew-tap"
     TARBALL_URL="https://github.com/blacktop/ida-mcp-rs/releases/download/v${VERSION}/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
 
@@ -103,13 +110,22 @@ update-cask:
     curl -sL "$TARBALL_URL" -o "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
     SHA256=$(shasum -a 256 "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" | awk '{print $1}')
 
+    # When using a comma-separated version (e.g. "0.9.3,1"), Homebrew
+    # interpolates #{version} as "0.9.3,1". Use version.before_comma
+    # in the URL so only the base version appears in the download path.
+    if [[ -n "$REVISION" ]]; then
+        URL_VERSION='#{version.before_comma}'
+    else
+        URL_VERSION='#{version}'
+    fi
+
     cat > "$TAP_DIR/Casks/ida-mcp.rb" << EOF
     # This file is auto-generated. DO NOT EDIT.
     cask "ida-mcp" do
-      version "${VERSION}"
+      version "${CASK_VERSION}"
       sha256 "${SHA256}"
 
-      url "https://github.com/blacktop/ida-mcp-rs/releases/download/v#{version}/ida-mcp_#{version}_Darwin_arm64.tar.gz"
+      url "https://github.com/blacktop/ida-mcp-rs/releases/download/v${URL_VERSION}/ida-mcp_${URL_VERSION}_Darwin_arm64.tar.gz"
       name "ida-mcp"
       desc "Headless IDA Pro MCP Server for AI-powered binary analysis"
       homepage "https://github.com/blacktop/ida-mcp-rs"
@@ -138,10 +154,10 @@ update-cask:
     end
     EOF
 
-    echo "Generated $TAP_DIR/Casks/ida-mcp.rb"
+    echo "Generated $TAP_DIR/Casks/ida-mcp.rb (version: ${CASK_VERSION})"
     cd "$TAP_DIR"
     git add "Casks/ida-mcp.rb"
-    git commit -m "Update ida-mcp to ${VERSION}"
+    git commit -m "Update ida-mcp to ${CASK_VERSION}"
     git push
     echo "Pushed stable cask to homebrew-tap"
 
