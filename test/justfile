@@ -39,7 +39,8 @@ test: fixture
     fi
     echo "🧪 Running stdio integration test..."
     tmp="$(mktemp)"
-    RUST_LOG="{{rust_log}}" "{{server_bin}}" < payloads/mini.jsonl >"$tmp" 2>&1 || true
+    # Keep stdin open long enough for open_idb auto-analysis (~10s for raw binaries)
+    (cat payloads/mini.jsonl; sleep 30) | RUST_LOG="{{rust_log}}" "{{server_bin}}" >"$tmp" 2>&1 || true
     cat "$tmp"
     if rg -q '"isError"\s*:\s*true' "$tmp"; then
         rm -f "$tmp"
@@ -70,6 +71,212 @@ test-http: fixture
     echo "🧪 Running HTTP integration test..."
     RUST_LOG="{{rust_log}}" IDB_PATH="{{test_bin}}" MCP_HTTP_BIN="{{server_bin}}" ./http_integration.sh
     echo "✅ HTTP test passed"
+
+# Run IDAPython script integration test
+test-script: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{server_bin}}" ]; then
+        echo "Server binary not found: {{server_bin}}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    LOCK="{{test_lock}}"
+    if [ -f "$LOCK" ]; then
+        pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
+            exit 1
+        else
+            rm -f "$LOCK"
+        fi
+    fi
+    echo "🧪 Running IDAPython script test..."
+    tmp="$(mktemp)"
+    # Keep stdin open long enough for open_idb auto-analysis (~10s for raw binaries)
+    (cat payloads/script.jsonl; sleep 30) | RUST_LOG="{{rust_log}}" "{{server_bin}}" >"$tmp" 2>&1 || true
+    cat "$tmp"
+
+    # Check that the error test (id=6, division by zero) returned an error in the result
+    # but NOT as an MCP-level isError (run_script should succeed and report the Python error in the JSON)
+    if rg -q '"isError"\s*:\s*true' "$tmp"; then
+        echo "❌ Unexpected MCP-level error"
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    # Verify we got stdout from the function listing (id=3)
+    if ! rg -q '0x' "$tmp"; then
+        echo "❌ No function addresses in script output"
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    # Verify the error case returned a Python error message (id=6)
+    if ! rg -q 'division by zero' "$tmp"; then
+        echo "❌ Expected 'division by zero' error in script output"
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    # Verify stdout/stderr capture (id=7)
+    if ! rg -q 'stdout works' "$tmp"; then
+        echo "❌ stdout capture failed"
+        rm -f "$tmp"
+        exit 1
+    fi
+    if ! rg -q 'stderr works' "$tmp"; then
+        echo "❌ stderr capture failed"
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    # Verify file-based script execution (id=8)
+    if ! rg -q 'total_functions=' "$tmp"; then
+        echo "❌ File-based script (fixtures/test_analysis.py) output missing"
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    rm -f "$tmp"
+    echo "✅ Script test passed"
+
+# Run dyld_shared_cache (DSC) integration test
+# Handles both sync (pre-existing .i64) and async (background task) paths.
+test-dsc dsc_path:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{server_bin}}" ]; then
+        echo "Server binary not found: {{server_bin}}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq &>/dev/null; then
+        echo "jq is required for DSC test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running DSC integration test..."
+    echo "   DSC: {{dsc_path}}"
+
+    fifo_in="$(mktemp -u).fifo"
+    mkfifo "$fifo_in"
+    log="$(mktemp)"
+
+    # Start server with fifo as stdin
+    RUST_LOG="{{rust_log}}" "{{server_bin}}" < "$fifo_in" > "$log" 2>&1 &
+    server_pid=$!
+    # Open the write end of fifo (keeps it open so server doesn't see EOF)
+    exec 3>"$fifo_in"
+
+    cleanup() {
+        exec 3>&- 2>/dev/null || true
+        rm -f "$fifo_in"
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+
+    send() { echo "$1" >&3; }
+
+    # Wait for a JSON-RPC response with the given id.
+    # Reads from the log file, skipping log lines (which start with a timestamp).
+    wait_response() {
+        local target_id="$1"
+        local timeout="${2:-300}"
+        local elapsed=0
+        while [ "$elapsed" -lt "$timeout" ]; do
+            # Look for a JSON line with matching id
+            local line
+            line=$(grep -m1 "\"id\":${target_id}[,}]" "$log" 2>/dev/null | grep '"jsonrpc"' || true)
+            if [ -n "$line" ]; then
+                echo "$line"
+                return 0
+            fi
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        echo "Timeout waiting for response id=$target_id" >&2
+        return 1
+    }
+
+    # Phase 1: Initialize
+    send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"dsc-test","version":"0.1"},"capabilities":{}}}'
+    send '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+    wait_response 1 10 >/dev/null
+    echo "   Initialized"
+
+    # Phase 2: open_dsc
+    payload=$(sed "s|DSC_PATH|{{dsc_path}}|g" <<< '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_dsc","arguments":{"path":"DSC_PATH","arch":"arm64e","module":"/System/Library/PrivateFrameworks/LockdownMode.framework/LockdownMode"}}}')
+    send "$payload"
+    resp=$(wait_response 2 30)
+    echo "   open_dsc responded"
+
+    # Check if we got a task_id (async) or direct db_info (sync)
+    content_text=$(echo "$resp" | jq -r '.result.content[0].text // empty')
+    task_id=$(echo "$content_text" | jq -r '.task_id // empty')
+
+    if [ -n "$task_id" ]; then
+        echo "   Background task: $task_id — polling task_status..."
+        poll_id=10
+        while true; do
+            send "{\"jsonrpc\":\"2.0\",\"id\":${poll_id},\"method\":\"tools/call\",\"params\":{\"name\":\"task_status\",\"arguments\":{\"task_id\":\"${task_id}\"}}}"
+            poll_resp=$(wait_response "$poll_id" 30)
+            poll_text=$(echo "$poll_resp" | jq -r '.result.content[0].text // empty')
+            status=$(echo "$poll_text" | jq -r '.status // empty')
+            message=$(echo "$poll_text" | jq -r '.message // empty')
+            elapsed_s=$(echo "$poll_text" | jq -r '.elapsed_secs // empty')
+            echo "   [$elapsed_s s] status=$status message=$message"
+
+            if [ "$status" = "completed" ]; then
+                echo "   Task completed"
+                # Verify db_info is present in the result
+                fc=$(echo "$poll_text" | jq -r '.result.function_count // empty')
+                if [ -z "$fc" ] || [ "$fc" = "0" ]; then
+                    echo "❌ No function_count in completed task result"
+                    cat "$log"
+                    exit 1
+                fi
+                echo "   function_count=$fc"
+                break
+            elif [ "$status" = "failed" ]; then
+                echo "❌ Task failed: $message"
+                cat "$log"
+                exit 1
+            fi
+
+            poll_id=$((poll_id + 1))
+            sleep 5
+        done
+    else
+        # Sync path — check for isError
+        is_error=$(echo "$resp" | jq -r '.result.isError // false')
+        if [ "$is_error" = "true" ]; then
+            echo "❌ open_dsc returned error: $content_text"
+            cat "$log"
+            exit 1
+        fi
+        fc=$(echo "$content_text" | jq -r '.function_count // empty')
+        echo "   Opened synchronously, function_count=$fc"
+    fi
+
+    # Phase 3: list_functions to verify DB is usable
+    send '{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":5}}}'
+    lf_resp=$(wait_response 100 30)
+    lf_error=$(echo "$lf_resp" | jq -r '.result.isError // false')
+    if [ "$lf_error" = "true" ]; then
+        echo "❌ list_functions failed after open"
+        echo "$lf_resp" | jq .
+        cat "$log"
+        exit 1
+    fi
+    echo "   list_functions OK"
+
+    # Phase 4: close
+    send '{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+    wait_response 101 10 >/dev/null
+    echo "   close_idb OK"
+
+    echo "✅ DSC test passed"
 
 # Clean test artifacts
 clean:

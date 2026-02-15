@@ -76,6 +76,9 @@ pub fn handle_open(
     debug_info_path: Option<&str>,
     debug_info_verbose: bool,
     force: bool,
+    file_type: Option<&str>,
+    auto_analyse: bool,
+    extra_args: &[String],
 ) -> Result<DbInfo, ToolError> {
     let expanded = expand_path(path);
 
@@ -182,7 +185,14 @@ pub fn handle_open(
         );
         opened_path = out_path.clone();
         let mut opts = IDBOpenOptions::new();
-        opts.auto_analyse(true);
+        opts.auto_analyse(auto_analyse);
+        if let Some(ft) = file_type {
+            info!(file_type = ft, "Using file type selector (-T flag)");
+            opts.file_type(ft);
+        }
+        for arg in extra_args {
+            opts.arg(arg);
+        }
         opts.idb(out_path).save(true).open(&expanded)
     };
     done.store(true, Ordering::Relaxed);

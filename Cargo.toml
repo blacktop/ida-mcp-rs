@@ -11,7 +11,7 @@ categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3" }
-rmcp = { version = "0.13", features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "0.15", features = ["server", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }

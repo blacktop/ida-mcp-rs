@@ -183,14 +183,8 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn init_ida() -> anyhow::Result<()> {
-    // Initialize IDA library on main thread FIRST, before spawning any threads.
-    // Do NOT hold the idalib global mutex here; IDB::open_* will take it.
-    info!("Initializing IDA library on main thread");
-    idalib::init_library();
-    info!("IDA library initialized successfully");
-    Ok(())
-}
+// IDA library initialization is now deferred to the worker loop's first request.
+// This avoids license contention when open_dsc needs to run idat first.
 
 async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     #[cfg(unix)]
@@ -218,8 +212,6 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
 
 fn run_server() -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (server mode)");
-
-    init_ida()?;
 
     // Create channel for IDA requests
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
@@ -284,7 +276,7 @@ fn run_server() -> anyhow::Result<()> {
 
     // Run IDA worker loop on main thread (IDA is already initialized above)
     info!("Starting IDA worker loop");
-    ida::run_ida_loop_no_init(rx);
+    ida::run_ida_loop(rx);
     info!("IDA worker loop finished");
 
     // Wait for server thread to finish
@@ -298,8 +290,6 @@ fn run_server() -> anyhow::Result<()> {
 
 fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (streamable HTTP mode)");
-
-    init_ida()?;
 
     let bind_addr: SocketAddr = args
         .bind
@@ -398,7 +388,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     });
 
     info!("Starting IDA worker loop");
-    ida::run_ida_loop_no_init(rx);
+    ida::run_ida_loop(rx);
     info!("IDA worker loop finished");
 
     if let Err(e) = server_handle.join() {
@@ -414,7 +404,9 @@ fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
     if let Ok(idadir) = std::env::var("IDADIR") {
         info!("IDADIR={}", idadir);
     }
-    init_ida()?;
+    info!("Initializing IDA library on main thread");
+    idalib::init_library();
+    info!("IDA library initialized successfully");
     if let Ok(ver) = idalib::version() {
         info!(
             "IDA version {}.{}.{}",

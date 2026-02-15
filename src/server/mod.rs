@@ -1,6 +1,7 @@
 //! MCP server implementation with IDA Pro tools.
 
 mod requests;
+pub mod task;
 
 pub use requests::*;
 
@@ -15,7 +16,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 /// MCP server for IDA Pro analysis
 #[derive(Clone)]
@@ -23,6 +24,7 @@ pub struct IdaMcpServer {
     worker: Arc<IdaWorker>,
     tool_mux: ToolMux<IdaMcpServer>,
     mode: ServerMode,
+    task_registry: task::TaskRegistry,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +62,20 @@ where
         }
         tools
     }
+
+    fn get(&self, name: &str) -> Option<&Tool> {
+        self.call_router.map.get(name).map(|route| &route.attr)
+    }
+}
+
+/// Parameters for the background DSC loading task.
+struct DscBackgroundCtx {
+    idat: std::path::PathBuf,
+    idat_args: Vec<String>,
+    log_path: std::path::PathBuf,
+    out_i64: std::path::PathBuf,
+    module: String,
+    frameworks: Vec<String>,
 }
 
 impl IdaMcpServer {
@@ -70,6 +86,7 @@ impl IdaMcpServer {
             worker,
             tool_mux: ToolMux::new(call_router),
             mode,
+            task_registry: task::TaskRegistry::new(),
         }
     }
 
@@ -108,6 +125,7 @@ impl IdaMcpServer {
                  \n- metadata: segments, imports, exports \
                  \n- types: declare_type, apply_types (addr/stack), infer_types, local_types, stack_frame, declare_stack, delete_stack, structs (list/info/read) \
                 \n- editing: comments/rename/patch/patch_asm \
+                 \n- scripting: run_script (execute IDAPython code) \
                  \n\nTip: Use tool_catalog(query='what you want to do') to find the right tool. \
                  \nTip: If xrefs/decompile look incomplete, call analysis_status to check auto-analysis.",
             close_hint = self.close_hint()
@@ -289,6 +307,178 @@ impl IdaMcpServer {
             )),
         }
     }
+
+    /// Open an existing DSC .i64 synchronously and return db_info.
+    async fn open_dsc_i64(
+        &self,
+        out_i64: &std::path::Path,
+        module: &str,
+        frameworks: &[String],
+    ) -> Result<CallToolResult, McpError> {
+        info!(out_i64 = %out_i64.display(), "Opening existing DSC .i64");
+
+        let i64_str = out_i64.display().to_string();
+        let open_result = self
+            .worker
+            .open(&i64_str, false, None, false, false, None, true, Vec::new())
+            .await;
+
+        let db_info = match open_result {
+            Ok(info) => info,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        let close_token = if matches!(self.mode, ServerMode::Http) {
+            self.worker.issue_close_token()
+        } else {
+            None
+        };
+
+        let mut value = match serde_json::to_value(&db_info) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "{db_info:?}"
+                ))]))
+            }
+        };
+        if let Value::Object(map) = &mut value {
+            map.insert("module".to_string(), json!(module));
+            if !frameworks.is_empty() {
+                map.insert("frameworks_loaded".to_string(), json!(frameworks));
+            }
+            map.insert("close_hint".to_string(), json!(self.close_hint()));
+            if let Some(token) = close_token {
+                map.insert("close_token".to_string(), json!(token));
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{value:?}")),
+        )]))
+    }
+
+    /// Background task: run idat, then open the resulting .i64 with idalib.
+    async fn run_dsc_background(
+        task_id: String,
+        registry: task::TaskRegistry,
+        worker: Arc<IdaWorker>,
+        mode: ServerMode,
+        ctx: DscBackgroundCtx,
+    ) {
+        let DscBackgroundCtx {
+            idat,
+            idat_args,
+            log_path,
+            out_i64,
+            module,
+            frameworks,
+        } = ctx;
+
+        // Phase 1: run idat subprocess
+        info!(task_id = %task_id, "Background: running idat");
+        registry.update_message(&task_id, "Running idat to create .i64...");
+
+        let idat_bin = idat;
+        let module_env = module.clone();
+        let out_i64_clone = out_i64.clone();
+        let log_path_clone = log_path.clone();
+
+        let spawn_result = tokio::task::spawn_blocking(move || {
+            let mut cmd = std::process::Command::new(&idat_bin);
+            cmd.args(&idat_args);
+            // Remove env vars that cause license conflicts when our
+            // process links idalib and also spawns idat.
+            cmd.env_remove("IDADIR");
+            cmd.env_remove("DYLD_LIBRARY_PATH");
+            cmd.env("IDA_DYLD_CACHE_MODULE", &module_env);
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+
+            let output = cmd.output();
+
+            match output {
+                Ok(out) => {
+                    let code = out.status.code().unwrap_or(-1);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    (code, stderr.to_string(), out_i64_clone, log_path_clone)
+                }
+                Err(e) => (
+                    -1,
+                    format!("Failed to spawn idat: {e}"),
+                    out_i64_clone,
+                    log_path_clone,
+                ),
+            }
+        })
+        .await;
+
+        let (exit_code, stderr, out_path, log_out) = match spawn_result {
+            Ok(tuple) => tuple,
+            Err(e) => {
+                registry.fail(&task_id, &format!("idat task panicked: {e}"));
+                return;
+            }
+        };
+
+        if exit_code != 0 || !out_path.exists() {
+            let log_tail = std::fs::read_to_string(&log_out)
+                .ok()
+                .map(|s| {
+                    let lines: Vec<&str> = s.lines().collect();
+                    let start = lines.len().saturating_sub(20);
+                    lines[start..].join("\n")
+                })
+                .unwrap_or_default();
+
+            let msg = format!(
+                "idat exited with code {exit_code}.\n\
+                 stderr: {stderr}\n\
+                 log (last 20 lines):\n{log_tail}"
+            );
+            warn!(exit_code, task_id = %task_id, "idat failed");
+            registry.fail(&task_id, &msg);
+            return;
+        }
+
+        info!(task_id = %task_id, "idat completed, opening .i64");
+        registry.update_message(&task_id, "Opening database with idalib...");
+
+        // Phase 2: open the .i64 with idalib
+        let i64_str = out_i64.display().to_string();
+        let open_result = worker
+            .open(&i64_str, false, None, false, false, None, true, Vec::new())
+            .await;
+
+        let db_info = match open_result {
+            Ok(info) => info,
+            Err(e) => {
+                registry.fail(&task_id, &e.to_string());
+                return;
+            }
+        };
+
+        let close_token = if matches!(mode, ServerMode::Http) {
+            worker.issue_close_token()
+        } else {
+            None
+        };
+
+        let mut value = serde_json::to_value(&db_info)
+            .unwrap_or_else(|_| json!({"info": format!("{db_info:?}")}));
+        if let Value::Object(map) = &mut value {
+            map.insert("module".to_string(), json!(module));
+            if !frameworks.is_empty() {
+                map.insert("frameworks_loaded".to_string(), json!(frameworks));
+            }
+            if let Some(token) = close_token {
+                map.insert("close_token".to_string(), json!(token));
+            }
+        }
+
+        info!(task_id = %task_id, "DSC background task completed");
+        registry.complete(&task_id, value);
+    }
 }
 
 // Tool implementations using the #[tool_router] attribute
@@ -327,6 +517,9 @@ impl IdaMcpServer {
                 req.debug_info_path.clone(),
                 req.debug_info_verbose.unwrap_or(false),
                 req.force.unwrap_or(false),
+                req.file_type.clone(),
+                true,
+                Vec::new(),
             )
             .await
         {
@@ -2259,6 +2452,230 @@ impl IdaMcpServer {
             Err(e) => Ok(e.to_tool_result()),
         }
     }
+
+    #[tool(
+        description = "Open a dyld_shared_cache file and load a single module (dylib) for analysis. \
+        If the .i64 database already exists, opens it immediately and returns db_info. \
+        If the .i64 must be created (first time), spawns idat in the background and returns \
+        a task_id immediately. Poll task_status(task_id) to check progress — when completed, \
+        the database is already open and ready for analysis tools. \
+        Use this instead of open_idb when working with Apple's dyld_shared_cache files. \
+        The module parameter specifies which dylib to extract (e.g. '/usr/lib/libobjc.A.dylib'). \
+        Additional frameworks can be loaded to resolve cross-module references."
+    )]
+    #[instrument(skip(self), fields(path = %req.path, arch = %req.arch, module = %req.module))]
+    async fn open_dsc(
+        &self,
+        Parameters(req): Parameters<OpenDscRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: open_dsc");
+
+        if !Self::validate_path(&req.path) {
+            return Ok(ToolError::InvalidPath(req.path).to_tool_result());
+        }
+
+        let ida_version = req.ida_version.unwrap_or(9);
+        if ida_version != 8 && ida_version != 9 {
+            return Ok(
+                ToolError::InvalidParams("ida_version must be 8 or 9".into()).to_tool_result(),
+            );
+        }
+
+        let file_type = crate::dsc::dsc_file_type(&req.arch, ida_version);
+        let frameworks = req.frameworks.unwrap_or_default();
+        let dsc_path = std::path::Path::new(&req.path);
+        let out_i64 = dsc_path.with_extension("i64");
+
+        // If .i64 already exists, open synchronously (fast path).
+        if out_i64.exists() {
+            return self.open_dsc_i64(&out_i64, &req.module, &frameworks).await;
+        }
+
+        // .i64 doesn't exist — need to run idat, which takes minutes.
+        // Validate idat exists and write the load script before spawning.
+        let idat = match crate::dsc::find_idat() {
+            Ok(path) => path,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        let script = crate::dsc::dsc_load_script(&req.module, &frameworks);
+        let script_dir = dsc_path.parent().unwrap_or(std::path::Path::new("/tmp"));
+        let script_path = script_dir.join("ida_mcp_dsc_load.py");
+        if let Err(e) = std::fs::write(&script_path, &script) {
+            return Ok(
+                ToolError::InvalidParams(format!("Failed to write DSC load script: {e}"))
+                    .to_tool_result(),
+            );
+        }
+
+        let log_path = script_dir.join("ida_mcp_dsc.log");
+        let idat_args = crate::dsc::idat_dsc_args(
+            dsc_path,
+            &out_i64,
+            &script_path,
+            &file_type,
+            Some(&log_path),
+        );
+
+        // Create a background task and return immediately.
+        // Use the .i64 path as dedup key to prevent concurrent idat
+        // processes writing the same output file.
+        let dedup_key = out_i64.display().to_string();
+        let task_id = match self
+            .task_registry
+            .create_keyed(&dedup_key, "Running idat to create .i64 from DSC...")
+        {
+            Ok(id) => id,
+            Err(existing_id) => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&json!({
+                        "status": "already_running",
+                        "task_id": existing_id,
+                        "message": "A DSC loading task for this path is already in progress. Poll task_status(task_id) for progress.",
+                    }))
+                    .unwrap_or_default(),
+                )]));
+            }
+        };
+
+        info!(
+            task_id = %task_id,
+            idat = %idat.display(),
+            module = %req.module,
+            "Spawning background idat for DSC loading"
+        );
+
+        let registry = self.task_registry.clone();
+        let worker = Arc::clone(&self.worker);
+        let mode = self.mode;
+        let module = req.module.clone();
+        let tid = task_id.clone();
+
+        let ctx = DscBackgroundCtx {
+            idat,
+            idat_args,
+            log_path,
+            out_i64,
+            module,
+            frameworks,
+        };
+
+        let handle = tokio::spawn(async move {
+            Self::run_dsc_background(tid, registry, worker, mode, ctx).await;
+        });
+        self.task_registry.set_handle(&task_id, handle);
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&json!({
+                "status": "started",
+                "task_id": task_id,
+                "message": "DSC loading started in background. Poll task_status(task_id) for progress.",
+            }))
+            .unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "Check the status of a background task (e.g. DSC loading). \
+        Returns the current status: 'running' (with a progress message), \
+        'completed' (with the result — database is already open), \
+        'failed' (with an error message), or 'cancelled'. \
+        Use the task_id returned by open_dsc."
+    )]
+    #[instrument(skip(self), fields(task_id = %req.task_id))]
+    async fn task_status(
+        &self,
+        Parameters(req): Parameters<TaskStatusRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: task_status");
+
+        let state = match self.task_registry.get(&req.task_id) {
+            Some(s) => s,
+            None => {
+                return Ok(
+                    ToolError::InvalidParams(format!("Unknown task_id: {}", req.task_id))
+                        .to_tool_result(),
+                );
+            }
+        };
+
+        let elapsed = state.created_at.elapsed().as_secs();
+        let status_str = match state.status {
+            task::TaskStatus::Running => "running",
+            task::TaskStatus::Completed => "completed",
+            task::TaskStatus::Failed => "failed",
+            task::TaskStatus::Cancelled => "cancelled",
+        };
+
+        let mut response = json!({
+            "task_id": state.id,
+            "status": status_str,
+            "message": state.message,
+            "elapsed_secs": elapsed,
+        });
+
+        if let Some(result) = &state.result {
+            if let Value::Object(map) = &mut response {
+                map.insert("result".to_string(), result.clone());
+            }
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&response).unwrap_or_default(),
+        )]))
+    }
+
+    #[tool(
+        description = "Execute a Python script via IDAPython in the open database. \
+        Has full access to all ida_* modules, idc, idautils. \
+        stdout and stderr are captured and returned. \
+        Provide either 'code' (inline Python) or 'file' (path to a .py file), not both. \
+        Use this for custom analysis that goes beyond the built-in tools. \
+        API reference: https://python.docs.hex-rays.com"
+    )]
+    #[instrument(skip(self))]
+    async fn run_script(
+        &self,
+        Parameters(req): Parameters<RunScriptRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let code = match (req.code, req.file) {
+            (Some(code), None) => code,
+            (None, Some(path)) => {
+                if !Self::validate_path(&path) {
+                    return Ok(ToolError::InvalidPath(path).to_tool_result());
+                }
+                match std::fs::read_to_string(&path) {
+                    Ok(contents) => contents,
+                    Err(e) => {
+                        return Ok(ToolError::InvalidPath(format!(
+                            "Failed to read script file '{}': {}",
+                            path, e
+                        ))
+                        .to_tool_result());
+                    }
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Ok(ToolError::InvalidParams(
+                    "Provide either 'code' or 'file', not both".into(),
+                )
+                .to_tool_result());
+            }
+            (None, None) => {
+                return Ok(ToolError::InvalidParams(
+                    "Provide either 'code' (inline Python) or 'file' (path to .py)".into(),
+                )
+                .to_tool_result());
+            }
+        };
+        let timeout = req.timeout_secs.map(|t| t.min(600));
+        match self.worker.run_script(&code, timeout).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
+            )])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
 }
 
 async fn get_int_values(
@@ -2341,6 +2758,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
     match name {
         // Core
         "open_idb" => Some(schema::<OpenIdbRequest>()),
+        "open_dsc" => Some(schema::<OpenDscRequest>()),
         "close_idb" => Some(schema::<CloseIdbRequest>()),
         "load_debug_info" => Some(schema::<LoadDebugInfoRequest>()),
         "analysis_status" => Some(schema::<EmptyParams>()),
@@ -2410,7 +2828,32 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "declare_stack" => Some(schema::<DeclareStackRequest>()),
         "delete_stack" => Some(schema::<DeleteStackRequest>()),
 
+        // Scripting
+        "run_script" => Some(schema::<RunScriptRequest>()),
+
         _ => None,
+    }
+}
+
+use rmcp::model::*;
+use rmcp::service::{RequestContext, RoleServer};
+
+/// Convert our internal `TaskState` to the rmcp `Task` model.
+fn task_state_to_mcp(state: &task::TaskState) -> rmcp::model::Task {
+    let status = match state.status {
+        task::TaskStatus::Running => rmcp::model::TaskStatus::Working,
+        task::TaskStatus::Completed => rmcp::model::TaskStatus::Completed,
+        task::TaskStatus::Failed => rmcp::model::TaskStatus::Failed,
+        task::TaskStatus::Cancelled => rmcp::model::TaskStatus::Cancelled,
+    };
+    rmcp::model::Task {
+        task_id: state.id.clone(),
+        status,
+        status_message: Some(state.message.clone()),
+        created_at: state.created_at_iso.clone(),
+        last_updated_at: None,
+        ttl: None,
+        poll_interval: Some(5000),
     }
 }
 
@@ -2418,15 +2861,134 @@ fn tool_params_schema(name: &str) -> Option<Value> {
 impl ServerHandler for IdaMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks_with(rmcp::model::TasksCapability::server_default())
+                .build(),
             instructions: Some(self.instructions()),
             ..Default::default()
         }
     }
-}
 
-use rmcp::model::*;
-use rmcp::service::{RequestContext, RoleServer};
+    async fn enqueue_task(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CreateTaskResult, McpError> {
+        // Delegate to the regular tool handler and wrap the result
+        // into the task protocol.  For most tools the call completes
+        // inline.  For `open_dsc`, the tool creates a background
+        // task and returns a task_id — we re-use that ID.
+        let result = self.call_tool(request, context).await?;
+
+        // Check if the result contains a task_id from open_dsc.
+        let task_id = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .and_then(|t| serde_json::from_str::<Value>(&t.text).ok())
+            .and_then(|v| v.get("task_id")?.as_str().map(String::from));
+
+        if let Some(tid) = task_id {
+            let state = self
+                .task_registry
+                .get(&tid)
+                .ok_or_else(|| McpError::internal_error(format!("Task {tid} disappeared"), None))?;
+            Ok(CreateTaskResult {
+                task: task_state_to_mcp(&state),
+            })
+        } else {
+            // Inline completion — no background work.
+            let now = task::iso_now();
+            let id = format!("inline-{now}");
+            Ok(CreateTaskResult {
+                task: rmcp::model::Task {
+                    task_id: id,
+                    status: rmcp::model::TaskStatus::Completed,
+                    status_message: Some("Completed".into()),
+                    created_at: now,
+                    last_updated_at: None,
+                    ttl: None,
+                    poll_interval: None,
+                },
+            })
+        }
+    }
+
+    async fn list_tasks(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListTasksResult, McpError> {
+        let tasks: Vec<rmcp::model::Task> = self
+            .task_registry
+            .list_all()
+            .iter()
+            .map(task_state_to_mcp)
+            .collect();
+        Ok(ListTasksResult {
+            tasks,
+            next_cursor: None,
+            total: None,
+        })
+    }
+
+    async fn get_task_info(
+        &self,
+        request: GetTaskInfoParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskInfoResult, McpError> {
+        let task = self
+            .task_registry
+            .get(&request.task_id)
+            .map(|s| task_state_to_mcp(&s));
+        Ok(GetTaskInfoResult { task })
+    }
+
+    async fn get_task_result(
+        &self,
+        request: GetTaskResultParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::TaskResult, McpError> {
+        let state = self.task_registry.get(&request.task_id);
+        match state {
+            Some(s) if s.status == task::TaskStatus::Completed => Ok(rmcp::model::TaskResult {
+                content_type: "application/json".into(),
+                value: s.result.unwrap_or(Value::Null),
+                summary: Some("DSC loading completed".into()),
+            }),
+            Some(s) if s.status == task::TaskStatus::Failed => {
+                Err(McpError::internal_error(s.message, None))
+            }
+            Some(s) if s.status == task::TaskStatus::Cancelled => {
+                Err(McpError::internal_error("Task was cancelled", None))
+            }
+            Some(_) => Err(McpError::internal_error(
+                "Task is still running; poll tasks/get first",
+                None,
+            )),
+            None => Err(McpError::invalid_params(
+                "Unknown task_id",
+                Some(json!({ "task_id": request.task_id })),
+            )),
+        }
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        if self.task_registry.cancel(&request.task_id) {
+            Ok(())
+        } else {
+            Err(McpError::invalid_params(
+                "Task not found or not running",
+                Some(json!({ "task_id": request.task_id })),
+            ))
+        }
+    }
+}
 
 /// Wrapper that sanitizes tool schemas by removing `$schema` fields.
 ///
@@ -2442,7 +3004,11 @@ impl<S> std::ops::Deref for SanitizedIdaServer<S> {
     }
 }
 
-/// Strips `$schema` keys from tool input schemas in place.
+/// Tools that support task-based invocation (SEP-1686).
+const TASK_CAPABLE_TOOLS: &[&str] = &["open_dsc"];
+
+/// Strips `$schema` keys from tool input schemas and annotates
+/// task-capable tools with `execution.taskSupport = "optional"`.
 fn sanitize_tool_schemas(result: &mut ListToolsResult) {
     for tool in &mut result.tools {
         let schema_arc = &mut tool.input_schema;
@@ -2453,13 +3019,30 @@ fn sanitize_tool_schemas(result: &mut ListToolsResult) {
             map.remove("$schema");
             *schema_arc = std::sync::Arc::new(map);
         }
+
+        if TASK_CAPABLE_TOOLS.contains(&&*tool.name) {
+            tool.execution = Some(
+                rmcp::model::ToolExecution::new()
+                    .with_task_support(rmcp::model::TaskSupport::Optional),
+            );
+        }
     }
+}
+
+/// Patch a single tool definition with task support if applicable.
+fn annotate_task_support(mut tool: Tool) -> Tool {
+    if TASK_CAPABLE_TOOLS.contains(&&*tool.name) {
+        tool.execution = Some(
+            rmcp::model::ToolExecution::new().with_task_support(rmcp::model::TaskSupport::Optional),
+        );
+    }
+    tool
 }
 
 impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
     async fn initialize(
         &self,
-        params: InitializeRequestParam,
+        params: InitializeRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
         self.0.initialize(params, ctx).await
@@ -2467,7 +3050,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
     async fn list_tools(
         &self,
-        params: Option<PaginatedRequestParam>,
+        params: Option<PaginatedRequestParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut result = self.0.list_tools(params, ctx).await?;
@@ -2477,7 +3060,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
     async fn call_tool(
         &self,
-        params: CallToolRequestParam,
+        params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         self.0.call_tool(params, ctx).await
@@ -2485,5 +3068,49 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
     fn get_info(&self) -> ServerInfo {
         self.0.get_info()
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.0.get_tool(name).map(annotate_task_support)
+    }
+
+    async fn enqueue_task(
+        &self,
+        request: CallToolRequestParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CreateTaskResult, McpError> {
+        self.0.enqueue_task(request, ctx).await
+    }
+
+    async fn list_tasks(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<ListTasksResult, McpError> {
+        self.0.list_tasks(request, ctx).await
+    }
+
+    async fn get_task_info(
+        &self,
+        request: GetTaskInfoParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<GetTaskInfoResult, McpError> {
+        self.0.get_task_info(request, ctx).await
+    }
+
+    async fn get_task_result(
+        &self,
+        request: GetTaskResultParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::TaskResult, McpError> {
+        self.0.get_task_result(request, ctx).await
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.0.cancel_task(request, ctx).await
     }
 }

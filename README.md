@@ -130,6 +130,48 @@ disasm_by_name(name: "main", count: 20)
 decompile(address: "0x100000f00")
 ```
 
+#### `dyld_shared_cache` analysis
+
+`open_dsc` opens a single module from Apple's dyld_shared_cache. On first use it runs `idat` in the background to create the `.i64` (this can take minutes). Subsequent opens are instant.
+
+```
+# Open a module from the DSC
+open_dsc(path: "/path/to/dyld_shared_cache_arm64e", arch: "arm64e",
+         module: "/usr/lib/libobjc.A.dylib")
+
+# If a background task was started, poll until done
+task_status(task_id: "dsc-1")
+
+# Load additional frameworks for cross-module references
+open_dsc(path: "/path/to/dyld_shared_cache_arm64e", arch: "arm64e",
+         module: "/usr/lib/libobjc.A.dylib",
+         frameworks: ["/System/Library/Frameworks/Foundation.framework/Foundation"])
+```
+
+Requirements:
+- `idat` binary (from IDA installation) must be available via `$IDADIR` or standard install paths
+- The DSC loader and `dscu` plugin (bundled with IDA 9.x)
+
+#### IDAPython scripting
+
+`run_script` executes Python code in the open database via IDA's IDAPython engine. stdout and stderr are captured.
+
+```
+# Inline script
+run_script(code: "import idautils\nfor f in idautils.Functions():\n    print(hex(f))")
+
+# Run a .py file from disk
+run_script(file: "/path/to/analysis_script.py")
+
+# With timeout (default 120s, max 600s)
+run_script(code: "import ida_bytes; print(ida_bytes.get_bytes(0x1000, 16).hex())",
+           timeout_secs: 30)
+```
+
+All `ida_*` modules, `idc`, and `idautils` are available. See the [IDAPython API reference](https://python.docs.hex-rays.com).
+
+---
+
 The default tool list includes all tools. Use `tool_catalog`/`tool_help` to discover capabilities and avoid dumping the full list into context.
 
 ## Docs

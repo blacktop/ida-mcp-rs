@@ -3,7 +3,7 @@
 use crate::ida::handlers::resolve_address;
 use crate::ida::handlers::{
     address, analysis, annotations, controlflow, database, disasm, functions, globals, imports,
-    memory, search, segments, strings, structs, types, xrefs,
+    memory, script, search, segments, strings, structs, types, xrefs,
 };
 use crate::ida::lock::release_mcp_lock;
 use crate::ida::request::IdaRequest;
@@ -25,13 +25,25 @@ macro_rules! log_result {
 
 /// Run the IDA worker loop on the current (main) thread.
 /// This function blocks until Shutdown is received.
-/// IDA must already be initialized via `idalib::init_library()` before calling this.
-pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
+///
+/// IDA library initialization is deferred until the first request
+/// that needs it. This allows `open_dsc` to run `idat` without
+/// license contention (idat needs its own license).
+pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
     let mut idb: Option<IDB> = None;
     let mut lock_file: Option<File> = None;
     let mut lock_path: Option<PathBuf> = None;
+    let mut lib_initialized = false;
 
     while let Ok(req) = rx.recv() {
+        // Lazily initialize the IDA library on first use.
+        // Must happen on the main thread (which this loop runs on).
+        if !lib_initialized {
+            info!("Initializing IDA library on main thread (deferred)");
+            idalib::init_library();
+            info!("IDA library initialized successfully");
+            lib_initialized = true;
+        }
         match req {
             IdaRequest::Open {
                 path,
@@ -39,9 +51,12 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                 debug_info_path,
                 debug_info_verbose,
                 force,
+                file_type,
+                auto_analyse,
+                extra_args,
                 resp,
             } => {
-                info!(path = %path, force, "Opening database");
+                info!(path = %path, force, file_type = ?file_type, auto_analyse, "Opening database");
                 let result = database::handle_open(
                     &mut idb,
                     &mut lock_file,
@@ -51,6 +66,9 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                     debug_info_path.as_deref(),
                     debug_info_verbose,
                     force,
+                    file_type.as_deref(),
+                    auto_analyse,
+                    &extra_args,
                 );
                 match &result {
                     Ok(info) => info!(
@@ -910,6 +928,12 @@ pub fn run_ida_loop_no_init(rx: mpsc::Receiver<IdaRequest>) {
                         warn!(address = format!("{:#x}", addr), error = %e, "Failed to get pseudocode")
                     }
                 }
+                let _ = resp.send(result);
+            }
+            IdaRequest::RunScript { code, resp } => {
+                debug!(code_len = code.len(), "Running script");
+                let result = script::handle_run_script(&idb, &code);
+                log_result!(result, "Script executed", "Failed to execute script");
                 let _ = resp.send(result);
             }
             IdaRequest::Shutdown => {

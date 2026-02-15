@@ -11,7 +11,7 @@ pub mod request;
 pub mod types;
 pub mod worker;
 
-pub use loop_impl::run_ida_loop_no_init;
+pub use loop_impl::run_ida_loop;
 pub use request::IdaRequest;
 pub use types::*;
 pub use worker::IdaWorker;

@@ -13,6 +13,9 @@ pub enum IdaRequest {
         debug_info_path: Option<String>,
         debug_info_verbose: bool,
         force: bool,
+        file_type: Option<String>,
+        auto_analyse: bool,
+        extra_args: Vec<String>,
         resp: oneshot::Sender<Result<DbInfo, ToolError>>,
     },
     Close {
@@ -329,6 +332,10 @@ pub enum IdaRequest {
     PseudocodeAt {
         addr: u64,
         end_addr: Option<u64>,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    RunScript {
+        code: String,
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
     Shutdown,

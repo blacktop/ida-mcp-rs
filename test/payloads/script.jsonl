@@ -1,0 +1,10 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"script-test","version":"0.1"},"capabilities":{}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_idb","arguments":{"path":"fixtures/mini","load_debug_info":true}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import idautils\nfor f in idautils.Functions():\n    print(hex(f))"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import ida_funcs\nf = ida_funcs.get_func_qty()\nprint(f'function_count={f}')"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import ida_nalt\npath = ida_nalt.get_input_file_path()\nprint(f'input_file={path}')"}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"x = 1/0"}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import sys\nprint('stdout works')\nprint('stderr works', file=sys.stderr)"}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"run_script","arguments":{"file":"fixtures/test_analysis.py"}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}

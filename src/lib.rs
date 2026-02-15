@@ -8,7 +8,7 @@
 //!
 //! IDA **must** run on the main thread. The architecture is:
 //!
-//! - **Main thread**: Runs the IDA worker loop (`ida::run_ida_loop_no_init`).
+//! - **Main thread**: Runs the IDA worker loop (`ida::run_ida_loop`).
 //!   All idalib operations happen here.
 //!
 //! - **Background thread**: Runs the tokio runtime with the async MCP server.
@@ -79,6 +79,7 @@
 use std::path::PathBuf;
 
 pub mod disasm;
+pub mod dsc;
 pub mod error;
 pub mod ida;
 pub mod server;
@@ -86,10 +87,9 @@ pub mod tool_registry;
 
 pub use error::ToolError;
 pub use ida::{
-    run_ida_loop_no_init, AddressInfo, BasicBlockInfo, BytesResult, DbInfo, ExportInfo,
-    FunctionInfo, FunctionListResult, FunctionRangeInfo, IdaRequest, IdaWorker, ImportInfo,
-    SegmentInfo, StringInfo, StringListResult, StringXrefInfo, StringXrefsResult, SymbolInfo,
-    XRefInfo,
+    run_ida_loop, AddressInfo, BasicBlockInfo, BytesResult, DbInfo, ExportInfo, FunctionInfo,
+    FunctionListResult, FunctionRangeInfo, IdaRequest, IdaWorker, ImportInfo, SegmentInfo,
+    StringInfo, StringListResult, StringXrefInfo, StringXrefsResult, SymbolInfo, XRefInfo,
 };
 pub use server::{IdaMcpServer, ServerMode};
 pub use tool_registry::{ToolCategory, ToolInfo, TOOL_REGISTRY};

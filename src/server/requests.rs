@@ -28,6 +28,11 @@ pub struct OpenIdbRequest {
     )]
     #[serde(alias = "recover")]
     pub force: Option<bool>,
+    #[schemars(
+        description = "IDA file type selector (-T flag). Used to choose a specific loader, \
+        e.g. 'Apple DYLD cache for arm64e (single module(s))'. Only applies to raw binaries."
+    )]
+    pub file_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -644,4 +649,40 @@ pub struct ToolCatalogRequest {
 pub struct ToolHelpRequest {
     #[schemars(description = "Name of the tool to get help for")]
     pub name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunScriptRequest {
+    #[schemars(
+        description = "Python code to execute via IDAPython. Has full access to ida_* modules, \
+        idc, idautils. stdout/stderr are captured and returned. \
+        Provide either 'code' (inline) or 'file' (path to .py), not both."
+    )]
+    pub code: Option<String>,
+    #[schemars(description = "Path to a .py file to execute via IDAPython. \
+        Alternative to 'code' for longer scripts. The file is read server-side.")]
+    pub file: Option<String>,
+    #[schemars(description = "Execution timeout in seconds (default: 120, max: 600)")]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaskStatusRequest {
+    #[schemars(description = "Task ID returned by open_dsc (e.g. 'dsc-abc123')")]
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OpenDscRequest {
+    #[schemars(description = "Path to the dyld_shared_cache file")]
+    pub path: String,
+    #[schemars(description = "CPU architecture (e.g. 'arm64e', 'arm64', 'x86_64h')")]
+    pub arch: String,
+    #[schemars(description = "Primary dylib to load (e.g. '/usr/lib/libobjc.A.dylib')")]
+    pub module: String,
+    #[schemars(description = "Additional frameworks to load after opening \
+        (e.g. ['/System/Library/Frameworks/Foundation.framework/Foundation'])")]
+    pub frameworks: Option<Vec<String>>,
+    #[schemars(description = "IDA version: 8 or 9. Determines the -T format string. Default: 9")]
+    pub ida_version: Option<u8>,
 }

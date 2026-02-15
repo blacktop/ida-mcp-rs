@@ -10,6 +10,7 @@ pub mod functions;
 pub mod globals;
 pub mod imports;
 pub mod memory;
+pub mod script;
 pub mod search;
 pub mod segments;
 pub mod strings;

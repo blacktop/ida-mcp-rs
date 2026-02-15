@@ -1,0 +1,3 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"dsc-test","version":"0.1"},"capabilities":{}}}
+{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_dsc","arguments":{"path":"DSC_PATH","arch":"arm64e","module":"/System/Library/PrivateFrameworks/LockdownMode.framework/LockdownMode"}}}
