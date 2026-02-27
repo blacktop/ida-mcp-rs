@@ -168,16 +168,35 @@ impl IdaMcpServer {
     fn value_to_strings(value: &Value) -> Result<Vec<String>, ToolError> {
         match value {
             Value::String(s) => {
-                if s.contains(',') {
-                    Ok(s.split(',')
+                let trimmed = s.trim();
+                if trimmed.starts_with('[') {
+                    if let Ok(Value::Array(arr)) = serde_json::from_str(trimmed) {
+                        let mut out = Vec::with_capacity(arr.len());
+                        for v in &arr {
+                            match v {
+                                Value::String(s) => out.push(s.to_string()),
+                                Value::Number(n) => out.push(n.to_string()),
+                                _ => {
+                                    return Err(ToolError::IdaError(
+                                        "expected string or number".to_string(),
+                                    ))
+                                }
+                            }
+                        }
+                        return Ok(out);
+                    }
+                }
+                if trimmed.contains(',') {
+                    Ok(trimmed
+                        .split(',')
                         .map(|t| t.trim())
                         .filter(|t| !t.is_empty())
                         .map(|t| t.to_string())
                         .collect())
-                } else if s.trim().is_empty() {
+                } else if trimmed.is_empty() {
                     Err(ToolError::IdaError("empty string".to_string()))
                 } else {
-                    Ok(vec![s.to_string()])
+                    Ok(vec![trimmed.to_string()])
                 }
             }
             Value::Number(n) => Ok(vec![n.to_string()]),
