@@ -3,7 +3,7 @@
 use crate::error::ToolError;
 use crate::ida::handlers::parse_address_str;
 use crate::ida::types::{BasicBlockInfo, FunctionInfo};
-use idalib::xref::XRefQuery;
+use idalib::xref::{CodeRef, XRefQuery, XRefType};
 use idalib::IDB;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -79,17 +79,23 @@ pub fn handle_callees(idb: &Option<IDB>, addr: u64) -> Result<Vec<FunctionInfo>,
         if let Some(xref) = db.first_xref_from(current_addr, XRefQuery::ALL) {
             let mut xr = Some(xref);
             while let Some(x) = xr {
-                // Check if this is a call (code xref to a function)
-                if x.is_code() {
+                // Only follow NearCall / FarCall xrefs — skip Code(Flow) and data refs
+                let is_call = matches!(
+                    x.type_(),
+                    XRefType::Code(CodeRef::NearCall) | XRefType::Code(CodeRef::FarCall)
+                );
+                if is_call {
                     let target = x.to();
-                    if !seen.contains(&target) {
-                        if let Some(target_func) = db.function_at(target) {
-                            seen.insert(target);
+                    if let Some(target_func) = db.function_at(target) {
+                        // Deduplicate by function start address, not by xref target
+                        let callee_start = target_func.start_address();
+                        if !seen.contains(&callee_start) {
+                            seen.insert(callee_start);
                             callees.push(FunctionInfo {
-                                address: format!("{:#x}", target_func.start_address()),
+                                address: format!("{:#x}", callee_start),
                                 name: target_func
                                     .name()
-                                    .unwrap_or_else(|| format!("sub_{:x}", target)),
+                                    .unwrap_or_else(|| format!("sub_{:x}", callee_start)),
                                 size: target_func.len(),
                             });
                         }

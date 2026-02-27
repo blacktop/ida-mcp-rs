@@ -3,6 +3,7 @@
 use crate::error::ToolError;
 use crate::ida::types::{ExportInfo, ImportInfo};
 use idalib::IDB;
+use std::collections::HashSet;
 
 pub fn handle_imports(
     idb: &Option<IDB>,
@@ -75,7 +76,16 @@ pub fn handle_exports(
 pub fn handle_entrypoints(idb: &Option<IDB>) -> Result<Vec<String>, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
-    let entrypoints: Vec<String> = db.entries().map(|addr| format!("{:#x}", addr)).collect();
+    // idalib's EntryPointIter has a bug: index is not incremented on success,
+    // causing infinite iteration. Break as soon as a duplicate address is seen.
+    let mut seen = HashSet::new();
+    let mut entrypoints = Vec::new();
+    for addr in db.entries() {
+        if !seen.insert(addr) {
+            break;
+        }
+        entrypoints.push(format!("{:#x}", addr));
+    }
 
     Ok(entrypoints)
 }
