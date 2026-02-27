@@ -133,7 +133,11 @@ pub fn handle_callers(idb: &Option<IDB>, addr: u64) -> Result<Vec<FunctionInfo>,
     let mut current = db.first_xref_to(func.start_address(), XRefQuery::ALL);
 
     while let Some(xref) = current {
-        if xref.is_code() {
+        let is_call = matches!(
+            xref.type_(),
+            XRefType::Code(CodeRef::NearCall) | XRefType::Code(CodeRef::FarCall)
+        );
+        if is_call {
             let from_addr = xref.from();
             if let Some(caller_func) = db.function_at(from_addr) {
                 let caller_start = caller_func.start_address();
