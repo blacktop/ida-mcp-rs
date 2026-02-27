@@ -142,10 +142,12 @@ test-script: fixture
     rm -f "$tmp"
     echo "✅ Script test passed"
 
+dsc_test_path := env_var_or_default("DSC_TEST_PATH", "")
+
 # Run dyld_shared_cache (DSC) integration test
 
 # Handles both sync (pre-existing .i64) and async (background task) paths.
-test-dsc dsc_path:
+test-dsc dsc_path=dsc_test_path:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -x "{{ server_bin }}" ]; then
@@ -261,21 +263,86 @@ test-dsc dsc_path:
         echo "   Opened synchronously, function_count=$fc"
     fi
 
-    # Phase 3: list_functions to verify DB is usable
-    send '{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":5}}}'
-    lf_resp=$(wait_response 100 30)
-    lf_error=$(echo "$lf_resp" | jq -r '.result.isError // false')
-    if [ "$lf_error" = "true" ]; then
-        echo "❌ list_functions failed after open"
-        echo "$lf_resp" | jq .
+    # Phase 3: Snapshot function count and segments before adding dylib
+    send '{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"idb_meta","arguments":{}}}'
+    meta_resp=$(wait_response 100 30)
+    meta_error=$(echo "$meta_resp" | jq -r '.result.isError // false')
+    if [ "$meta_error" = "true" ]; then
+        echo "❌ idb_meta failed after open"
+        echo "$meta_resp" | jq .
         cat "$log"
         exit 1
     fi
-    echo "   list_functions OK"
+    meta_text=$(echo "$meta_resp" | jq -r '.result.content[0].text // empty')
+    fc_before=$(echo "$meta_text" | jq -r '.function_count // 0')
+    echo "   idb_meta OK — function_count=$fc_before"
 
-    # Phase 4: close
-    send '{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
-    wait_response 101 10 >/dev/null
+    send '{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"segments","arguments":{}}}'
+    seg_resp=$(wait_response 101 30)
+    seg_error=$(echo "$seg_resp" | jq -r '.result.isError // false')
+    if [ "$seg_error" = "true" ]; then
+        echo "❌ segments failed after open"
+        echo "$seg_resp" | jq .
+        cat "$log"
+        exit 1
+    fi
+    seg_text=$(echo "$seg_resp" | jq -r '.result.content[0].text // empty')
+    seg_before=$(echo "$seg_text" | jq -r 'if type == "array" then length else .segments | length end // 0')
+    echo "   segments OK — count=$seg_before"
+
+    # Phase 4: dsc_add_dylib — load an additional framework
+    send '{"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"dsc_add_dylib","arguments":{"module":"/usr/lib/libSystem.B.dylib","timeout_secs":300}}}'
+    add_resp=$(wait_response 102 300)
+    add_error=$(echo "$add_resp" | jq -r '.result.isError // false')
+    if [ "$add_error" = "true" ]; then
+        echo "⚠️  dsc_add_dylib returned error (dscu plugin may not be available):"
+        echo "$add_resp" | jq -r '.result.content[0].text // empty'
+    else
+        add_text=$(echo "$add_resp" | jq -r '.result.content[0].text // empty')
+        add_ok=$(echo "$add_text" | jq -r '.success // false')
+        if [ "$add_ok" = "true" ]; then
+            echo "   dsc_add_dylib OK"
+        else
+            echo "⚠️  dsc_add_dylib did not report success: $add_text"
+        fi
+    fi
+
+    # Phase 5: Verify DB state changed after add
+    send '{"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"idb_meta","arguments":{}}}'
+    meta2_resp=$(wait_response 103 30)
+    meta2_text=$(echo "$meta2_resp" | jq -r '.result.content[0].text // empty')
+    fc_after=$(echo "$meta2_text" | jq -r '.function_count // 0')
+    echo "   After add: function_count=$fc_after (was $fc_before)"
+    if [ "$fc_after" -gt "$fc_before" ]; then
+        echo "   ✓ Function count increased by $((fc_after - fc_before))"
+    else
+        echo "⚠️  Function count did not increase (before=$fc_before, after=$fc_after)"
+    fi
+
+    send '{"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"segments","arguments":{}}}'
+    seg2_resp=$(wait_response 104 30)
+    seg2_text=$(echo "$seg2_resp" | jq -r '.result.content[0].text // empty')
+    seg_after=$(echo "$seg2_text" | jq -r 'if type == "array" then length else .segments | length end // 0')
+    echo "   After add: segments=$seg_after (was $seg_before)"
+    if [ "$seg_after" -gt "$seg_before" ]; then
+        echo "   ✓ Segment count increased by $((seg_after - seg_before))"
+    else
+        echo "⚠️  Segment count did not increase (before=$seg_before, after=$seg_after)"
+    fi
+
+    # Phase 6: analysis_status sanity check
+    send '{"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"analysis_status","arguments":{}}}'
+    as_resp=$(wait_response 105 30)
+    as_error=$(echo "$as_resp" | jq -r '.result.isError // false')
+    if [ "$as_error" = "true" ]; then
+        echo "❌ analysis_status failed after add"
+        exit 1
+    fi
+    echo "   analysis_status OK"
+
+    # Phase 7: close
+    send '{"jsonrpc":"2.0","id":200,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+    wait_response 200 10 >/dev/null
     echo "   close_idb OK"
 
     echo "✅ DSC test passed"

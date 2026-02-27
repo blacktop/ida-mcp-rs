@@ -689,3 +689,17 @@ pub struct OpenDscRequest {
         If omitted, no log is created. Useful for debugging DSC loading failures.")]
     pub log_path: Option<String>,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DscAddDylibRequest {
+    #[schemars(
+        description = "DSC-internal dylib path to load (e.g. '/usr/lib/libSystem.B.dylib'). \
+        Must be an absolute path inside the dyld_shared_cache."
+    )]
+    pub module: String,
+    #[schemars(
+        description = "Execution timeout in seconds (default: 300, max: 600). \
+        Large frameworks may need more time."
+    )]
+    pub timeout_secs: Option<u64>,
+}

@@ -5,7 +5,7 @@
 
 ## Discovery Workflow
 
-- `tools/list` returns the full tool set (currently 68 tools)
+- `tools/list` returns the full tool set (currently 69 tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns full documentation and schema
 - Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires close_token from open_idb)
@@ -22,6 +22,7 @@ Database open/close and discovery tools
 |------|-------------|
 | `analysis_status` | Report auto-analysis status |
 | `close_idb` | Close the current database (release locks) |
+| `dsc_add_dylib` | Load an additional dylib into an open DSC database |
 | `idb_meta` | Get database metadata and summary |
 | `load_debug_info` | Load external debug info (e.g., dSYM/DWARF) |
 | `open_dsc` | Open a dyld_shared_cache and load a single module |

@@ -18,7 +18,7 @@ use crate::error::ToolError;
 ///
 /// Prevents code injection when embedding user-supplied module/framework
 /// paths into generated IDAPython scripts.
-fn escape_python_string(s: &str) -> String {
+pub(crate) fn escape_python_string(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
@@ -190,9 +190,44 @@ print(\"[ida-mcp] DSC module loading complete\")
     script
 }
 
+/// Build an IDAPython script that incrementally loads a single dylib
+/// into an already-open DSC database via the dscu plugin.
+///
+/// Unlike [`dsc_load_script`], this script intentionally omits the
+/// global `auto_mark_range(0, BADADDR, AU_FINAL)` + `auto_wait()` pass
+/// so that incremental adds stay fast and avoid multi-minute timeouts.
+pub fn dsc_add_dylib_script(module: &str) -> String {
+    let escaped = escape_python_string(module);
+    format!(
+        "\
+import idaapi
+from idc import *
+
+def dscu_load_module(module):
+    node = idaapi.netnode()
+    node.create(\"$ dscu\")
+    node.supset(2, module)
+    load_and_run_plugin(\"dscu\", 1)
+
+print(\"[ida-mcp] loading additional dylib: {escaped}\")
+dscu_load_module(\"{escaped}\")
+
+# ObjC type analysis (lightweight, no full auto-analysis)
+print(\"[ida-mcp] analyzing objc types\")
+load_and_run_plugin(\"objc\", 1)
+print(\"[ida-mcp] analyzing NSConcreteGlobalBlock objects\")
+load_and_run_plugin(\"objc\", 4)
+
+print(\"[ida-mcp] dsc_add_dylib complete for: {escaped}\")
+"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::dsc::{dsc_file_type, dsc_load_script, idat_dsc_args};
+    use crate::dsc::{
+        dsc_add_dylib_script, dsc_file_type, dsc_load_script, escape_python_string, idat_dsc_args,
+    };
     use std::path::Path;
 
     #[test]
@@ -262,7 +297,6 @@ mod tests {
 
     #[test]
     fn escape_python_string_basic() {
-        use super::escape_python_string;
         assert_eq!(escape_python_string("normal/path"), "normal/path");
         assert_eq!(escape_python_string(r#"a"b"#), r#"a\"b"#);
         assert_eq!(escape_python_string("a\\b"), "a\\\\b");
@@ -272,7 +306,6 @@ mod tests {
 
     #[test]
     fn script_injection_escaped() {
-        use super::escape_python_string;
         let malicious = r#""); import os; os.system("rm -rf /"); print(""#;
         let escaped = escape_python_string(malicious);
         // Every `"` in the escaped string must be preceded by `\`.
@@ -288,5 +321,43 @@ mod tests {
         // The escaped form appears in the generated script
         let script = dsc_load_script(malicious, &[]);
         assert!(script.contains(&escaped));
+    }
+
+    #[test]
+    fn add_dylib_script_content() {
+        let script = dsc_add_dylib_script("/usr/lib/libSystem.B.dylib");
+        assert!(script.contains("dscu_load_module(\"/usr/lib/libSystem.B.dylib\")"));
+        assert!(script.contains("load_and_run_plugin(\"objc\", 1)"));
+        assert!(script.contains("dsc_add_dylib complete"));
+    }
+
+    #[test]
+    fn add_dylib_script_omits_full_auto_analysis() {
+        let script = dsc_add_dylib_script("/usr/lib/libSystem.B.dylib");
+        assert!(
+            !script.contains("auto_mark_range"),
+            "add-dylib script must not contain auto_mark_range"
+        );
+        assert!(
+            !script.contains("auto_wait"),
+            "add-dylib script must not contain auto_wait"
+        );
+    }
+
+    #[test]
+    fn add_dylib_script_injection_escaped() {
+        let malicious = r#""); import os; os.system("rm -rf /"); print(""#;
+        let script = dsc_add_dylib_script(malicious);
+        let escaped = escape_python_string(malicious);
+        assert!(script.contains(&escaped));
+        // No unescaped quotes
+        for (i, ch) in escaped.char_indices() {
+            if ch == '"' {
+                assert!(
+                    i > 0 && escaped.as_bytes()[i - 1] == b'\\',
+                    "unescaped quote at index {i} in: {escaped}"
+                );
+            }
+        }
     }
 }

@@ -2609,6 +2609,68 @@ impl IdaMcpServer {
     }
 
     #[tool(
+        description = "Load an additional dylib into an already-open DSC database. \
+        Requires a database previously opened via open_dsc. \
+        Uses the dscu plugin to incrementally add one module at a time. \
+        Runs ObjC type analysis on the newly loaded module but skips \
+        full auto-analysis to keep the operation fast. \
+        Example: after open_dsc loaded libobjc, use this to add Foundation."
+    )]
+    #[instrument(skip(self), fields(module = %req.module))]
+    async fn dsc_add_dylib(
+        &self,
+        Parameters(req): Parameters<DscAddDylibRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: dsc_add_dylib");
+
+        let module = req.module.trim().to_string();
+        if module.is_empty() {
+            return Ok(ToolError::InvalidParams("module must not be empty".into()).to_tool_result());
+        }
+        if !module.starts_with('/') {
+            return Ok(ToolError::InvalidParams(
+                "module must be an absolute path (start with '/')".into(),
+            )
+            .to_tool_result());
+        }
+        if module.contains("..") {
+            return Ok(ToolError::InvalidParams(
+                "module must not contain '..' path traversal".into(),
+            )
+            .to_tool_result());
+        }
+
+        let timeout = Some(req.timeout_secs.unwrap_or(300).min(600));
+        let script = crate::dsc::dsc_add_dylib_script(&module);
+
+        match self.worker.run_script(&script, timeout).await {
+            Ok(result) => {
+                if !run_script_succeeded(&result) {
+                    let message = run_script_failure_message(&result);
+                    warn!(module = %module, error = %message, "dsc_add_dylib failed");
+                    return Ok(ToolError::IdaError(message).to_tool_result());
+                }
+                let stdout = run_script_field(&result, "stdout").unwrap_or_default();
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&json!({
+                        "success": true,
+                        "module": module,
+                        "message": format!("Successfully loaded {module} into the database"),
+                        "stdout": stdout,
+                    }))
+                    .unwrap_or_default(),
+                )]))
+            }
+            Err(ToolError::Timeout(secs)) => {
+                let message = run_script_timeout_message(secs, &script);
+                warn!(module = %module, timeout_secs = secs, "dsc_add_dylib timed out");
+                Ok(ToolError::IdaError(message).to_tool_result())
+            }
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
+    #[tool(
         description = "Check the status of a background task (e.g. DSC loading). \
         Returns the current status: 'running' (with a progress message), \
         'completed' (with the result — database is already open), \
@@ -2922,6 +2984,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         // Core
         "open_idb" => Some(schema::<OpenIdbRequest>()),
         "open_dsc" => Some(schema::<OpenDscRequest>()),
+        "dsc_add_dylib" => Some(schema::<DscAddDylibRequest>()),
         "close_idb" => Some(schema::<CloseIdbRequest>()),
         "load_debug_info" => Some(schema::<LoadDebugInfoRequest>()),
         "analysis_status" => Some(schema::<EmptyParams>()),

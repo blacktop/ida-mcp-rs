@@ -177,6 +177,19 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["open", "dsc", "dyld", "shared", "cache", "dylib", "module", "apple", "macos", "ios"],
     },
     ToolInfo {
+        name: "dsc_add_dylib",
+        category: ToolCategory::Core,
+        short_desc: "Load an additional dylib into an open DSC database",
+        full_desc: "Incrementally load a single dylib into a database previously opened via open_dsc. \
+                    Uses the dscu plugin to add the module, then runs ObjC type analysis. \
+                    Skips full auto-analysis to keep the operation fast. \
+                    Call once per module; use list_functions or analysis_status to verify after loading. \
+                    Requires: database opened via open_dsc.",
+        example: r#"{"module": "/System/Library/Frameworks/Foundation.framework/Foundation", "timeout_secs": 300}"#,
+        default: false,
+        keywords: &["dsc", "dyld", "dylib", "module", "load", "add", "framework", "cache"],
+    },
+    ToolInfo {
         name: "load_debug_info",
         category: ToolCategory::Core,
         short_desc: "Load external debug info (e.g., dSYM/DWARF)",
