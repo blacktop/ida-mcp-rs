@@ -166,12 +166,13 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "open_dsc",
         category: ToolCategory::Core,
-        short_desc: "Open a dyld_shared_cache and load a single module",
+        short_desc: "Open a dyld_shared_cache and load one module; use dsc_add_dylib for more",
         full_desc: "Open an Apple dyld_shared_cache file and extract a single dylib for analysis. \
                     Handles DSC-specific loader selection and dscu plugin orchestration automatically. \
                     After opening, runs ObjC type and block analysis on the loaded module. \
                     Use this instead of open_idb when working with dyld_shared_cache files. \
-                    Optionally load additional frameworks to resolve cross-module references.",
+                    Optionally load additional frameworks to resolve cross-module references. \
+                    To load more dylibs after the initial open, call dsc_add_dylib.",
         example: r#"{"path": "/path/to/dyld_shared_cache_arm64e", "arch": "arm64e", "module": "/usr/lib/libobjc.A.dylib", "frameworks": ["/System/Library/Frameworks/Foundation.framework/Foundation"]}"#,
         default: false,
         keywords: &["open", "dsc", "dyld", "shared", "cache", "dylib", "module", "apple", "macos", "ios"],

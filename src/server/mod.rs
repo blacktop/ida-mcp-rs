@@ -2485,7 +2485,8 @@ impl IdaMcpServer {
         the database is already open and ready for analysis tools. \
         Use this instead of open_idb when working with Apple's dyld_shared_cache files. \
         The module parameter specifies which dylib to extract (e.g. '/usr/lib/libobjc.A.dylib'). \
-        Additional frameworks can be loaded to resolve cross-module references."
+        Additional frameworks can be loaded to resolve cross-module references. \
+        To add more dylibs later, call dsc_add_dylib."
     )]
     #[instrument(skip(self), fields(path = %req.path, arch = %req.arch, module = %req.module))]
     async fn open_dsc(
