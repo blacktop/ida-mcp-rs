@@ -699,7 +699,23 @@ pub struct DscAddDylibRequest {
     pub module: String,
     #[schemars(
         description = "Execution timeout in seconds (default: 300, max: 600). \
-        Large frameworks may need more time."
+        Large frameworks may need more time. \
+        Note: this tool performs lightweight ObjC analysis only; it does not force full auto-analysis."
+    )]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DscAddRegionRequest {
+    #[schemars(
+        description = "Exactly one region address to load from the currently open DSC database (string/number). \
+        Accepts hex (e.g. '0x180116000') or decimal."
+    )]
+    #[serde(alias = "ea", alias = "addr")]
+    pub address: Value,
+    #[schemars(
+        description = "Execution timeout in seconds (default: 300, max: 600). \
+        Use this for loading data/GOT/stub regions on-demand from DSC."
     )]
     pub timeout_secs: Option<u64>,
 }

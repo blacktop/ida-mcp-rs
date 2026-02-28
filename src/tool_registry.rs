@@ -166,29 +166,58 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "open_dsc",
         category: ToolCategory::Core,
-        short_desc: "Open a dyld_shared_cache and load one module; use dsc_add_dylib for more",
+        short_desc: "Open a dyld_shared_cache and load one module; use dsc_add_dylib/dsc_add_region for more",
         full_desc: "Open an Apple dyld_shared_cache file and extract a single dylib for analysis. \
                     Handles DSC-specific loader selection and dscu plugin orchestration automatically. \
                     After opening, runs ObjC type and block analysis on the loaded module. \
                     Use this instead of open_idb when working with dyld_shared_cache files. \
                     Optionally load additional frameworks to resolve cross-module references. \
-                    To load more dylibs after the initial open, call dsc_add_dylib.",
+                    To load more code modules after the initial open, call dsc_add_dylib. \
+                    To load additional data/GOT/stub regions by address, call dsc_add_region.",
         example: r#"{"path": "/path/to/dyld_shared_cache_arm64e", "arch": "arm64e", "module": "/usr/lib/libobjc.A.dylib", "frameworks": ["/System/Library/Frameworks/Foundation.framework/Foundation"]}"#,
         default: false,
-        keywords: &["open", "dsc", "dyld", "shared", "cache", "dylib", "module", "apple", "macos", "ios"],
+        keywords: &[
+            "open", "dsc", "dyld", "shared", "cache", "dylib", "module", "region", "apple",
+            "macos", "ios",
+        ],
     },
     ToolInfo {
         name: "dsc_add_dylib",
         category: ToolCategory::Core,
-        short_desc: "Load an additional dylib into an open DSC database",
+        short_desc: "Load an additional dylib into an open DSC database (light analysis only)",
         full_desc: "Incrementally load a single dylib into a database previously opened via open_dsc. \
                     Uses the dscu plugin to add the module, then runs ObjC type analysis. \
                     Skips full auto-analysis to keep the operation fast. \
-                    Call once per module; use list_functions or analysis_status to verify after loading. \
+                    Call once per module; then check analysis_status. \
+                    If auto_is_ok is false, run analyze_funcs before relying on xrefs/decompile. \
                     Requires: database opened via open_dsc.",
         example: r#"{"module": "/System/Library/Frameworks/Foundation.framework/Foundation", "timeout_secs": 300}"#,
         default: false,
         keywords: &["dsc", "dyld", "dylib", "module", "load", "add", "framework", "cache"],
+    },
+    ToolInfo {
+        name: "dsc_add_region",
+        category: ToolCategory::Core,
+        short_desc: "Load a DSC memory region by address (data/GOT/stubs)",
+        full_desc: "Incrementally load a specific region from the currently open DSC database by address. \
+                    Accepts exactly one address per call. \
+                    Uses the dscu plugin region mode for on-demand data/GOT/stub loading. \
+                    This does not force full auto-analysis; check analysis_status and run analyze_funcs \
+                    when deeper cross-reference/decompile fidelity is required after loading. \
+                    Requires: database opened via open_dsc.",
+        example: r#"{"address": "0x180116000", "timeout_secs": 300}"#,
+        default: false,
+        keywords: &[
+            "dsc",
+            "dyld",
+            "region",
+            "memory",
+            "address",
+            "got",
+            "stubs",
+            "data",
+            "load",
+        ],
     },
     ToolInfo {
         name: "load_debug_info",

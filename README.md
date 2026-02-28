@@ -146,6 +146,15 @@ task_status(task_id: "dsc-1")
 open_dsc(path: "/path/to/dyld_shared_cache_arm64e", arch: "arm64e",
          module: "/usr/lib/libobjc.A.dylib",
          frameworks: ["/System/Library/Frameworks/Foundation.framework/Foundation"])
+
+# Incrementally load another DSC dylib into an already-open database
+dsc_add_dylib(module: "/usr/lib/libSystem.B.dylib")
+
+# Incrementally load a DSC data/GOT/stub region by address
+dsc_add_region(address: "0x180116000")
+
+# After dsc_add_dylib/dsc_add_region, confirm analysis readiness
+analysis_status()
 ```
 
 Requirements:
