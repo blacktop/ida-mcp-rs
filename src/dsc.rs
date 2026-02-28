@@ -203,20 +203,33 @@ pub fn dsc_add_dylib_script(module: &str) -> String {
 import idaapi
 from idc import *
 
+def run_plugin_checked(name, arg, context, strict_nonzero=False):
+    def plugin_failed():
+        raise RuntimeError(f\"{{name}} plugin failed during {{context}} (return={{rc!r}})\")
+
+    rc = load_and_run_plugin(name, arg)
+    if rc is None:
+        plugin_failed()
+    if strict_nonzero and (rc is False or (isinstance(rc, int) and rc <= 0)):
+        plugin_failed()
+    if isinstance(rc, int) and rc < 0:
+        plugin_failed()
+    return rc
+
 def dscu_load_module(module):
     node = idaapi.netnode()
     node.create(\"$ dscu\")
     node.supset(2, module)
-    load_and_run_plugin(\"dscu\", 1)
+    run_plugin_checked(\"dscu\", 1, f\"loading module {{module}}\", True)
 
 print(\"[ida-mcp] loading additional dylib: {escaped}\")
 dscu_load_module(\"{escaped}\")
 
 # ObjC type analysis (lightweight, no full auto-analysis)
 print(\"[ida-mcp] analyzing objc types\")
-load_and_run_plugin(\"objc\", 1)
+run_plugin_checked(\"objc\", 1, \"objc type analysis\", False)
 print(\"[ida-mcp] analyzing NSConcreteGlobalBlock objects\")
-load_and_run_plugin(\"objc\", 4)
+run_plugin_checked(\"objc\", 4, \"objc global block analysis\", False)
 
 print(\"[ida-mcp] dsc_add_dylib complete for: {escaped}\")
 "
@@ -327,7 +340,12 @@ mod tests {
     fn add_dylib_script_content() {
         let script = dsc_add_dylib_script("/usr/lib/libSystem.B.dylib");
         assert!(script.contains("dscu_load_module(\"/usr/lib/libSystem.B.dylib\")"));
-        assert!(script.contains("load_and_run_plugin(\"objc\", 1)"));
+        assert!(script.contains("def run_plugin_checked(name, arg, context, strict_nonzero=False)"));
+        assert!(script.contains("run_plugin_checked(\"dscu\", 1"));
+        assert!(script.contains("loading module {module}\", True)"));
+        assert!(script.contains("raise RuntimeError"));
+        assert!(script.contains("run_plugin_checked(\"objc\", 1"));
+        assert!(script.contains("run_plugin_checked(\"objc\", 4"));
         assert!(script.contains("dsc_add_dylib complete"));
     }
 

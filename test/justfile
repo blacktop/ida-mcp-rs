@@ -142,7 +142,7 @@ test-script: fixture
     rm -f "$tmp"
     echo "✅ Script test passed"
 
-dsc_test_path := env_var_or_default("DSC_TEST_PATH", "")
+dsc_test_path := env_var_or_default("DSC_TEST_PATH", "/tmp/ios_sys_mount/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e")
 
 # Run dyld_shared_cache (DSC) integration test
 

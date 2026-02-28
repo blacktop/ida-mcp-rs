@@ -66,6 +66,9 @@ struct ServeHttpArgs {
     /// Use stateless mode (POST only; no sessions)
     #[arg(long)]
     stateless: bool,
+    /// Return application/json in stateless mode instead of SSE framing.
+    #[arg(long)]
+    json_response: bool,
     /// Allowed Origin values (comma-separated). Defaults to localhost only.
     #[arg(
         long,
@@ -290,6 +293,9 @@ fn run_server() -> anyhow::Result<()> {
 
 fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (streamable HTTP mode)");
+    if args.json_response && !args.stateless {
+        info!("--json-response is ignored unless --stateless is also set");
+    }
 
     let bind_addr: SocketAddr = args
         .bind
@@ -319,6 +325,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 },
                 sse_retry: None,
                 stateful_mode: !args.stateless,
+                json_response: args.json_response && args.stateless,
                 cancellation_token: cancel_for_config,
             };
 

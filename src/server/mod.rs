@@ -3077,9 +3077,40 @@ fn task_state_to_mcp(state: &task::TaskState) -> rmcp::model::Task {
         status,
         status_message: Some(state.message.clone()),
         created_at: state.created_at_iso.clone(),
-        last_updated_at: None,
-        ttl: None,
+        last_updated_at: state.updated_at_iso.clone(),
+        // Terminal tasks are retained on a best-effort basis and can be
+        // evicted once the in-memory cap is exceeded.
+        ttl: Some(task::TASK_RETENTION_TTL_MS),
         poll_interval: Some(5000),
+    }
+}
+
+fn call_tool_result_to_value(result: &CallToolResult) -> Value {
+    serde_json::to_value(result).unwrap_or_else(|_| {
+        json!({
+            "content": [{
+                "type": "text",
+                "text": "Failed to serialize CallToolResult"
+            }],
+            "isError": true
+        })
+    })
+}
+
+fn looks_like_call_tool_result(value: &Value) -> bool {
+    serde_json::from_value::<CallToolResult>(value.clone()).is_ok()
+}
+
+fn wrap_as_call_tool_result(value: &Value) -> Value {
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| format!("{value:?}"));
+    call_tool_result_to_value(&CallToolResult::success(vec![Content::text(text)]))
+}
+
+fn task_payload_result_value(result: Option<Value>) -> Value {
+    match result {
+        Some(value) if looks_like_call_tool_result(&value) => value,
+        Some(value) => wrap_as_call_tool_result(&value),
+        None => wrap_as_call_tool_result(&Value::Null),
     }
 }
 
@@ -3124,19 +3155,16 @@ impl ServerHandler for IdaMcpServer {
                 task: task_state_to_mcp(&state),
             })
         } else {
-            // Inline completion — no background work.
-            let now = task::iso_now();
-            let id = format!("inline-{now}");
+            // Inline completion — no background work, but still register a completed
+            // task so tasks/get and tasks/result remain resolvable for this task_id.
+            let payload = call_tool_result_to_value(&result);
+            let id = self.task_registry.create_completed("Completed", payload);
+            let state = self
+                .task_registry
+                .get(&id)
+                .ok_or_else(|| McpError::internal_error(format!("Task {id} disappeared"), None))?;
             Ok(CreateTaskResult {
-                task: rmcp::model::Task {
-                    task_id: id,
-                    status: rmcp::model::TaskStatus::Completed,
-                    status_message: Some("Completed".into()),
-                    created_at: now,
-                    last_updated_at: None,
-                    ttl: None,
-                    poll_interval: None,
-                },
+                task: task_state_to_mcp(&state),
             })
         }
     }
@@ -3163,26 +3191,29 @@ impl ServerHandler for IdaMcpServer {
         &self,
         request: GetTaskInfoParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetTaskInfoResult, McpError> {
-        let task = self
-            .task_registry
-            .get(&request.task_id)
-            .map(|s| task_state_to_mcp(&s));
-        Ok(GetTaskInfoResult { task })
+    ) -> Result<GetTaskResult, McpError> {
+        let state = self.task_registry.get(&request.task_id).ok_or_else(|| {
+            McpError::invalid_params(
+                "Unknown task_id",
+                Some(json!({ "task_id": request.task_id })),
+            )
+        })?;
+        Ok(GetTaskResult {
+            meta: None,
+            task: task_state_to_mcp(&state),
+        })
     }
 
     async fn get_task_result(
         &self,
         request: GetTaskResultParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::TaskResult, McpError> {
+    ) -> Result<GetTaskPayloadResult, McpError> {
         let state = self.task_registry.get(&request.task_id);
         match state {
-            Some(s) if s.status == task::TaskStatus::Completed => Ok(rmcp::model::TaskResult {
-                content_type: "application/json".into(),
-                value: s.result.unwrap_or(Value::Null),
-                summary: Some("DSC loading completed".into()),
-            }),
+            Some(s) if s.status == task::TaskStatus::Completed => {
+                Ok(GetTaskPayloadResult(task_payload_result_value(s.result)))
+            }
             Some(s) if s.status == task::TaskStatus::Failed => {
                 Err(McpError::internal_error(s.message, None))
             }
@@ -3204,9 +3235,18 @@ impl ServerHandler for IdaMcpServer {
         &self,
         request: CancelTaskParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<(), McpError> {
+    ) -> Result<CancelTaskResult, McpError> {
         if self.task_registry.cancel(&request.task_id) {
-            Ok(())
+            let state = self.task_registry.get(&request.task_id).ok_or_else(|| {
+                McpError::internal_error(
+                    format!("Task {} disappeared after cancellation", request.task_id),
+                    None,
+                )
+            })?;
+            Ok(CancelTaskResult {
+                meta: None,
+                task: task_state_to_mcp(&state),
+            })
         } else {
             Err(McpError::invalid_params(
                 "Task not found or not running",
@@ -3320,7 +3360,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         &self,
         request: GetTaskInfoParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<GetTaskInfoResult, McpError> {
+    ) -> Result<GetTaskResult, McpError> {
         self.0.get_task_info(request, ctx).await
     }
 
@@ -3328,7 +3368,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         &self,
         request: GetTaskResultParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<rmcp::model::TaskResult, McpError> {
+    ) -> Result<GetTaskPayloadResult, McpError> {
         self.0.get_task_result(request, ctx).await
     }
 
@@ -3336,17 +3376,18 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         &self,
         request: CancelTaskParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<(), McpError> {
+    ) -> Result<CancelTaskResult, McpError> {
         self.0.cancel_task(request, ctx).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
+    use crate::server::{
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
-        run_script_truncate_chars,
+        run_script_truncate_chars, task_payload_result_value,
     };
+    use rmcp::model::CallToolResult;
     use serde_json::json;
 
     #[test]
@@ -3384,5 +3425,30 @@ mod tests {
         assert_eq!(truncated, "abc...");
         let unchanged = run_script_truncate_chars("abc", 10);
         assert_eq!(unchanged, "abc");
+    }
+
+    #[test]
+    fn task_payload_preserves_valid_call_tool_result() {
+        let result = CallToolResult::success(vec![rmcp::model::Content::text("ok")]);
+        let as_value = serde_json::to_value(&result).expect("serialize CallToolResult");
+        assert_eq!(task_payload_result_value(Some(as_value.clone())), as_value);
+    }
+
+    #[test]
+    fn task_payload_wraps_content_array_shape_that_is_not_call_tool_result() {
+        let input = json!({ "content": [1, 2, 3] });
+        let wrapped = task_payload_result_value(Some(input.clone()));
+        assert_ne!(wrapped, input);
+
+        let parsed: CallToolResult =
+            serde_json::from_value(wrapped).expect("wrapped payload should be CallToolResult");
+        assert_eq!(parsed.is_error, Some(false));
+        let wrapped_text = parsed
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .unwrap_or_default();
+        assert!(wrapped_text.contains("\"content\""));
     }
 }
