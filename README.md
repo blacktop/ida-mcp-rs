@@ -1,4 +1,4 @@
-# ida-mcp
+# ida-mcp-rs
 
 Headless IDA Pro MCP server for AI-powered reverse engineering.
 
