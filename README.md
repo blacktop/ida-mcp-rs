@@ -2,9 +2,20 @@
 
 Headless IDA Pro MCP server for AI-powered reverse engineering.
 
+## Version Compatibility
+
+**ida-mcp versions mirror IDA Pro versions.** Install the version that matches your IDA:
+
+| IDA Version | ida-mcp Version | Install |
+|-------------|----------------|---------|
+| IDA 9.3     | `v9.3.x`       | `brew install blacktop/tap/ida-mcp` |
+| IDA 9.2     | `v9.2.x`       | `brew install blacktop/tap/ida-mcp@9.2` |
+
+Running a mismatched version will produce a clear error message at startup.
+
 ## Prerequisites
 
-- IDA 9.3+ (or 9.2) with valid license
+- IDA Pro with valid license (9.2 or 9.3)
 
 ## Getting Started
 
@@ -12,12 +23,16 @@ Headless IDA Pro MCP server for AI-powered reverse engineering.
 
 **macOS** (via [Homebrew](https://brew.sh))
 ```bash
+# Latest (IDA 9.3)
 brew install blacktop/tap/ida-mcp
+
+# IDA 9.2
+brew install blacktop/tap/ida-mcp@9.2
 ```
 
 **Linux / Windows**
 
-Download the latest binary for your platform from [GitHub Releases](https://github.com/blacktop/ida-mcp-rs/releases).
+Download the release matching your IDA version from [GitHub Releases](https://github.com/blacktop/ida-mcp-rs/releases).
 
 **Build from source**
 
