@@ -62,6 +62,9 @@ pub enum ToolError {
 
     #[error("Worker channel closed")]
     WorkerClosed,
+
+    #[error("SDK version mismatch: {0}")]
+    SdkVersionMismatch(String),
 }
 
 impl ToolError {

@@ -1,5 +1,13 @@
 //! Main IDA worker loop.
 
+use std::fs::File;
+use std::path::PathBuf;
+use std::sync::mpsc;
+
+use idalib::IDB;
+use tracing::{debug, error, info, warn};
+
+use crate::error::ToolError;
 use crate::ida::handlers::resolve_address;
 use crate::ida::handlers::{
     address, analysis, annotations, controlflow, database, disasm, functions, globals, imports,
@@ -7,11 +15,6 @@ use crate::ida::handlers::{
 };
 use crate::ida::lock::release_mcp_lock;
 use crate::ida::request::IdaRequest;
-use idalib::IDB;
-use std::fs::File;
-use std::path::PathBuf;
-use std::sync::mpsc;
-use tracing::{debug, error, info, warn};
 
 /// Log result with debug on success and warn on error.
 macro_rules! log_result {
@@ -35,14 +38,55 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
     let mut lock_path: Option<PathBuf> = None;
     let mut lib_initialized = false;
 
+    let mut version_mismatch: Option<String> = None;
+
     while let Ok(req) = rx.recv() {
         // Lazily initialize the IDA library on first use.
         // Must happen on the main thread (which this loop runs on).
         if !lib_initialized {
             info!("Initializing IDA library on main thread (deferred)");
             idalib::init_library();
-            info!("IDA library initialized successfully");
             lib_initialized = true;
+
+            // Check runtime IDA version against the SDK we compiled with.
+            // A mismatch causes segfaults in complex APIs (struct layout
+            // differences), so we refuse to proceed.
+            let (sdk_major, sdk_minor) = idalib::SDK_VERSION;
+            match idalib::version() {
+                Ok(v) => {
+                    info!("IDA runtime version: {v}");
+                    if v.major() != sdk_major || v.minor() != sdk_minor {
+                        let msg = format!(
+                            "IDA SDK version mismatch: ida-mcp was compiled \
+                             for IDA {sdk_major}.{sdk_minor} but the runtime \
+                             IDA library is {v}. Install the matching IDA \
+                             version or use the ida-mcp release built for \
+                             your IDA version.",
+                        );
+                        error!("{msg}");
+                        version_mismatch = Some(msg);
+                    }
+                }
+                Err(e) => {
+                    warn!("Could not query IDA runtime version: {e}");
+                }
+            }
+        }
+
+        // If there is a version mismatch, reject every request with a
+        // clear error instead of segfaulting deep inside IDA.
+        if let Some(ref mismatch_msg) = version_mismatch {
+            match req {
+                IdaRequest::Shutdown => {
+                    info!("Worker shutting down after SDK version mismatch");
+                    shutdown_cleanup(&mut idb, &mut lock_file, &mut lock_path);
+                    break;
+                }
+                other => {
+                    reject_with_version_error(other, mismatch_msg);
+                    continue;
+                }
+            }
         }
         match req {
             IdaRequest::Open {
@@ -966,14 +1010,99 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
             }
             IdaRequest::Shutdown => {
                 info!("Worker shutting down");
-                // Explicitly close database to ensure IDA packs it before exit
-                if idb.is_some() {
-                    info!("Closing database before shutdown");
-                    drop(idb.take());
-                }
-                release_mcp_lock(&mut lock_file, &mut lock_path);
+                shutdown_cleanup(&mut idb, &mut lock_file, &mut lock_path);
                 break;
             }
         }
+    }
+}
+
+fn shutdown_cleanup(
+    idb: &mut Option<IDB>,
+    lock_file: &mut Option<File>,
+    lock_path: &mut Option<PathBuf>,
+) {
+    // Explicitly close database to ensure IDA packs it before exit.
+    if idb.take().is_some() {
+        info!("Closing database before shutdown");
+    }
+    release_mcp_lock(lock_file, lock_path);
+}
+
+/// Send a version-mismatch error for every request variant so the
+/// agent gets a clear message instead of a segfault.
+fn reject_with_version_error(req: IdaRequest, msg: &str) {
+    let err = ToolError::SdkVersionMismatch(msg.to_owned());
+
+    /// Helper: send `Err(err)` on a `oneshot::Sender<Result<T, ToolError>>`.
+    macro_rules! reject {
+        ($resp:expr, $err:expr) => {{
+            let _ = $resp.send(Err($err));
+        }};
+    }
+
+    match req {
+        IdaRequest::Shutdown => {} // always honour shutdown
+        IdaRequest::Close { resp } => {
+            let _ = resp.send(());
+        }
+        IdaRequest::Open { resp, .. } => reject!(resp, err),
+        IdaRequest::LoadDebugInfo { resp, .. } => reject!(resp, err),
+        IdaRequest::AnalysisStatus { resp, .. } => reject!(resp, err),
+        IdaRequest::ListFunctions { resp, .. } => reject!(resp, err),
+        IdaRequest::ResolveFunction { resp, .. } => reject!(resp, err),
+        IdaRequest::DisasmByName { resp, .. } => reject!(resp, err),
+        IdaRequest::Disasm { resp, .. } => reject!(resp, err),
+        IdaRequest::Decompile { resp, .. } => reject!(resp, err),
+        IdaRequest::Segments { resp, .. } => reject!(resp, err),
+        IdaRequest::Strings { resp, .. } => reject!(resp, err),
+        IdaRequest::LocalTypes { resp, .. } => reject!(resp, err),
+        IdaRequest::DeclareType { resp, .. } => reject!(resp, err),
+        IdaRequest::ApplyTypes { resp, .. } => reject!(resp, err),
+        IdaRequest::InferTypes { resp, .. } => reject!(resp, err),
+        IdaRequest::AddrInfo { resp, .. } => reject!(resp, err),
+        IdaRequest::FunctionAt { resp, .. } => reject!(resp, err),
+        IdaRequest::DisasmFunctionAt { resp, .. } => reject!(resp, err),
+        IdaRequest::DeclareStack { resp, .. } => reject!(resp, err),
+        IdaRequest::DeleteStack { resp, .. } => reject!(resp, err),
+        IdaRequest::StackFrame { resp, .. } => reject!(resp, err),
+        IdaRequest::Structs { resp, .. } => reject!(resp, err),
+        IdaRequest::StructInfo { resp, .. } => reject!(resp, err),
+        IdaRequest::ReadStruct { resp, .. } => reject!(resp, err),
+        IdaRequest::XRefsTo { resp, .. } => reject!(resp, err),
+        IdaRequest::XRefsFrom { resp, .. } => reject!(resp, err),
+        IdaRequest::XRefsToField { resp, .. } => reject!(resp, err),
+        IdaRequest::Imports { resp, .. } => reject!(resp, err),
+        IdaRequest::Exports { resp, .. } => reject!(resp, err),
+        IdaRequest::Entrypoints { resp, .. } => reject!(resp, err),
+        IdaRequest::GetBytes { resp, .. } => reject!(resp, err),
+        IdaRequest::SetComments { resp, .. } => reject!(resp, err),
+        IdaRequest::Rename { resp, .. } => reject!(resp, err),
+        IdaRequest::PatchBytes { resp, .. } => reject!(resp, err),
+        IdaRequest::PatchAsm { resp, .. } => reject!(resp, err),
+        IdaRequest::BasicBlocks { resp, .. } => reject!(resp, err),
+        IdaRequest::Callees { resp, .. } => reject!(resp, err),
+        IdaRequest::Callers { resp, .. } => reject!(resp, err),
+        IdaRequest::IdbMeta { resp, .. } => reject!(resp, err),
+        IdaRequest::LookupFunctions { resp, .. } => reject!(resp, err),
+        IdaRequest::ListGlobals { resp, .. } => reject!(resp, err),
+        IdaRequest::AnalyzeStrings { resp, .. } => reject!(resp, err),
+        IdaRequest::FindString { resp, .. } => reject!(resp, err),
+        IdaRequest::XrefsToString { resp, .. } => reject!(resp, err),
+        IdaRequest::AnalyzeFuncs { resp, .. } => reject!(resp, err),
+        IdaRequest::FindBytes { resp, .. } => reject!(resp, err),
+        IdaRequest::SearchText { resp, .. } => reject!(resp, err),
+        IdaRequest::SearchImm { resp, .. } => reject!(resp, err),
+        IdaRequest::FindInsns { resp, .. } => reject!(resp, err),
+        IdaRequest::FindInsnOperands { resp, .. } => reject!(resp, err),
+        IdaRequest::ReadInt { resp, .. } => reject!(resp, err),
+        IdaRequest::GetString { resp, .. } => reject!(resp, err),
+        IdaRequest::GetGlobalValue { resp, .. } => reject!(resp, err),
+        IdaRequest::FindPaths { resp, .. } => reject!(resp, err),
+        IdaRequest::CallGraph { resp, .. } => reject!(resp, err),
+        IdaRequest::XrefMatrix { resp, .. } => reject!(resp, err),
+        IdaRequest::ExportFuncs { resp, .. } => reject!(resp, err),
+        IdaRequest::PseudocodeAt { resp, .. } => reject!(resp, err),
+        IdaRequest::RunScript { resp, .. } => reject!(resp, err),
     }
 }
