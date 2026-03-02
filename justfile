@@ -84,18 +84,20 @@ update-beta-cask ida_version="9.4":
     git push
     echo "Pushed beta cask to homebrew-tap"
 
-# Update homebrew stable cask in tap (run after GitHub release is created)
-
-# Pass revision="" (default) for a fresh version, or revision="1" etc. for rebuilds.
+# Update homebrew stable cask in tap (run after GitHub release is created).
+# This generates the unversioned "latest" cask (currently IDA 9.3).
 update-cask revision="":
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    IDA_VERSION="${VERSION%.*}"  # e.g. 9.3.0 -> 9.3
     REVISION="{{ revision }}"
     if [[ -n "$REVISION" ]]; then
         CASK_VERSION="${VERSION},${REVISION}"
+        URL_VERSION='#{version.before_comma}'
     else
         CASK_VERSION="${VERSION}"
+        URL_VERSION='#{version}'
     fi
     TAP_DIR="${HOME}/Developer/Mine/blacktop/homebrew-tap"
     TARBALL_URL="https://github.com/blacktop/ida-mcp-rs/releases/download/v${VERSION}/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
@@ -105,22 +107,12 @@ update-cask revision="":
         exit 1
     fi
 
-    # Download tarball to get SHA256
     echo "Downloading release tarball..."
     mkdir -p dist
     curl -sL "$TARBALL_URL" -o "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
     SHA256=$(shasum -a 256 "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" | awk '{print $1}')
 
-    # When using a comma-separated version (e.g. "0.9.3,1"), Homebrew
-    # interpolates #{version} as "0.9.3,1". Use version.before_comma
-    # in the URL so only the base version appears in the download path.
-    if [[ -n "$REVISION" ]]; then
-        URL_VERSION='#{version.before_comma}'
-    else
-        URL_VERSION='#{version}'
-    fi
-
-    cat > "$TAP_DIR/Casks/ida-mcp.rb" << EOF
+    cat > "$TAP_DIR/Casks/ida-mcp.rb" << CASK
     # This file is auto-generated. DO NOT EDIT.
     cask "ida-mcp" do
       version "${CASK_VERSION}"
@@ -128,7 +120,7 @@ update-cask revision="":
 
       url "https://github.com/blacktop/ida-mcp-rs/releases/download/v${URL_VERSION}/ida-mcp_${URL_VERSION}_Darwin_arm64.tar.gz"
       name "ida-mcp"
-      desc "Headless IDA Pro MCP Server for AI-powered binary analysis"
+      desc "Headless IDA Pro MCP Server for AI-powered binary analysis (IDA ${IDA_VERSION})"
       homepage "https://github.com/blacktop/ida-mcp-rs"
 
       conflicts_with cask: "ida-mcp@beta"
@@ -143,7 +135,8 @@ update-cask revision="":
 
       caveats do
         <<~EOS
-          ida-mcp requires IDA Pro 9.2+ to be installed.
+          ida-mcp requires IDA Pro ${IDA_VERSION} to be installed.
+          For other IDA versions: brew install blacktop/tap/ida-mcp@<version>
 
           Standard IDA installations work automatically:
             claude mcp add ida -- ida-mcp
@@ -153,14 +146,85 @@ update-cask revision="":
         EOS
       end
     end
-    EOF
+    CASK
 
-    echo "Generated $TAP_DIR/Casks/ida-mcp.rb (version: ${CASK_VERSION})"
+    echo "Generated $TAP_DIR/Casks/ida-mcp.rb (version: ${CASK_VERSION}, IDA ${IDA_VERSION})"
     cd "$TAP_DIR"
     git add "Casks/ida-mcp.rb"
-    git commit -m "Update ida-mcp to ${CASK_VERSION}"
+    git commit -m "Update ida-mcp to ${CASK_VERSION} (IDA ${IDA_VERSION})"
     git push
     echo "Pushed stable cask to homebrew-tap"
+
+# Update homebrew versioned cask for a specific IDA version.
+# Usage: just update-versioned-cask 9.2
+# Generates Casks/ida-mcp@9.2.rb pointing to the matching GitHub release.
+update-versioned-cask ida_version revision="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    IDA_VERSION="{{ ida_version }}"
+    VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    REVISION="{{ revision }}"
+    if [[ -n "$REVISION" ]]; then
+        CASK_VERSION="${VERSION},${REVISION}"
+        URL_VERSION='#{version.before_comma}'
+    else
+        CASK_VERSION="${VERSION}"
+        URL_VERSION='#{version}'
+    fi
+    TAP_DIR="${HOME}/Developer/Mine/blacktop/homebrew-tap"
+    TARBALL_URL="https://github.com/blacktop/ida-mcp-rs/releases/download/v${VERSION}/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
+
+    if [[ ! -d "$TAP_DIR" ]]; then
+        echo "Error: homebrew-tap not found at $TAP_DIR"
+        exit 1
+    fi
+
+    echo "Downloading v${VERSION} release tarball..."
+    mkdir -p dist
+    curl -sL "$TARBALL_URL" -o "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
+    SHA256=$(shasum -a 256 "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" | awk '{print $1}')
+
+    CASK_FILE="$TAP_DIR/Casks/ida-mcp@${IDA_VERSION}.rb"
+
+    cat > "$CASK_FILE" << CASK
+    # This file is auto-generated. DO NOT EDIT.
+    cask "ida-mcp@${IDA_VERSION}" do
+      version "${CASK_VERSION}"
+      sha256 "${SHA256}"
+
+      url "https://github.com/blacktop/ida-mcp-rs/releases/download/v${URL_VERSION}/ida-mcp_${URL_VERSION}_Darwin_arm64.tar.gz"
+      name "ida-mcp (IDA ${IDA_VERSION})"
+      desc "Headless IDA Pro MCP Server for AI-powered binary analysis (IDA ${IDA_VERSION})"
+      homepage "https://github.com/blacktop/ida-mcp-rs"
+
+      binary "ida-mcp"
+
+      postflight do
+        Dir.glob("#{staged_path}/**/ida-mcp").each do |f|
+          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", f]
+        end
+      end
+
+      caveats do
+        <<~EOS
+          ida-mcp@${IDA_VERSION} requires IDA Pro ${IDA_VERSION} to be installed.
+
+          Standard IDA installations work automatically:
+            claude mcp add ida -- ida-mcp
+
+          If using a non-standard path, set DYLD_LIBRARY_PATH:
+            claude mcp add ida -e DYLD_LIBRARY_PATH='/path/to/ida/Contents/MacOS' -- ida-mcp
+        EOS
+      end
+    end
+    CASK
+
+    echo "Generated $CASK_FILE (version: ${CASK_VERSION}, IDA ${IDA_VERSION})"
+    cd "$TAP_DIR"
+    git add "Casks/ida-mcp@${IDA_VERSION}.rb"
+    git commit -m "Update ida-mcp@${IDA_VERSION} to ${CASK_VERSION}"
+    git push
+    echo "Pushed ida-mcp@${IDA_VERSION} cask to homebrew-tap"
 
 # Run integration test (debug)
 test: build
