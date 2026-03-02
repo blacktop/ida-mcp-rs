@@ -1,6 +1,6 @@
 [package]
 name = "ida-mcp"
-version = "9.3.0"
+version = "9.2.0"
 edition = "2021"
 description = "Headless IDA Pro MCP Server"
 license = "MIT"
@@ -10,7 +10,7 @@ keywords = ["ida", "mcp", "reverse-engineering", "disassembly", "decompiler"]
 categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
-idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3" }
+idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.2" }
 rmcp = { version = "0.17", features = ["server", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal"] }
 tokio-util = "0.7"
@@ -31,4 +31,4 @@ http-body-util = "0.1"
 tower-service = "0.3"
 
 [build-dependencies]
-idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3", package = "idalib-build" }
+idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.2", package = "idalib-build" }

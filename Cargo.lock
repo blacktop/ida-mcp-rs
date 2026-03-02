@@ -56,7 +56,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -67,7 +67,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -531,7 +531,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -835,7 +835,7 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
 name = "ida-mcp"
-version = "9.3.0"
+version = "9.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -861,8 +861,8 @@ dependencies = [
 
 [[package]]
 name = "idalib"
-version = "0.7.3+9.3.260213"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.3#f86a5318a364f426a8bcd496bfda56f2e29a163d"
+version = "0.7.2+9.2.250908"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.2#512e6dd0acbfd0b8254704c56c70c63a61dbeff6"
 dependencies = [
  "anyhow",
  "autocxx",
@@ -875,8 +875,8 @@ dependencies = [
 
 [[package]]
 name = "idalib-build"
-version = "0.7.3+9.3.260213"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.3#f86a5318a364f426a8bcd496bfda56f2e29a163d"
+version = "0.7.2+9.2.250908"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.2#512e6dd0acbfd0b8254704c56c70c63a61dbeff6"
 dependencies = [
  "anyhow",
  "idalib-sys",
@@ -884,8 +884,8 @@ dependencies = [
 
 [[package]]
 name = "idalib-sys"
-version = "0.7.3+9.3.260213"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.3#f86a5318a364f426a8bcd496bfda56f2e29a163d"
+version = "0.7.2+9.2.250908"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.2#512e6dd0acbfd0b8254704c56c70c63a61dbeff6"
 dependencies = [
  "anyhow",
  "autocxx",
@@ -1122,7 +1122,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1357,7 +1357,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1556,7 +1556,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1913,7 +1913,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
