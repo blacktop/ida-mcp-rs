@@ -1,6 +1,6 @@
 [package]
 name = "ida-mcp"
-version = "0.9.3"
+version = "9.3.0"
 edition = "2021"
 description = "Headless IDA Pro MCP Server"
 license = "MIT"
