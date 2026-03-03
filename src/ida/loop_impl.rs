@@ -48,21 +48,16 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>) {
             idalib::init_library();
             lib_initialized = true;
 
-            // Check runtime IDA version against the SDK we compiled with.
-            // A mismatch causes segfaults in complex APIs (struct layout
-            // differences), so we refuse to proceed.
-            let (sdk_major, sdk_minor) = idalib::SDK_VERSION;
+            // Check runtime IDA major version against the SDK we compiled
+            // with. Only the major version is compared because IDA's
+            // get_library_version() returns the product version (e.g.
+            // 9.0.260213) whose minor field does NOT match the SDK minor
+            // version (e.g. IDA_SDK_VERSION=930 → 9.3). See issue #9.
+            let (sdk_major, _sdk_minor) = idalib::SDK_VERSION;
             match idalib::version() {
                 Ok(v) => {
-                    info!("IDA runtime version: {v}");
-                    if v.major() != sdk_major || v.minor() != sdk_minor {
-                        let msg = format!(
-                            "IDA SDK version mismatch: ida-mcp was compiled \
-                             for IDA {sdk_major}.{sdk_minor} but the runtime \
-                             IDA library is {v}. Install the matching IDA \
-                             version or use the ida-mcp release built for \
-                             your IDA version.",
-                        );
+                    info!("IDA runtime version: {v} (compiled for SDK {sdk_major}.{_sdk_minor})");
+                    if let Some(msg) = check_version_mismatch(sdk_major, v.major()) {
                         error!("{msg}");
                         version_mismatch = Some(msg);
                     }
@@ -1104,5 +1099,50 @@ fn reject_with_version_error(req: IdaRequest, msg: &str) {
         IdaRequest::ExportFuncs { resp, .. } => reject!(resp, err),
         IdaRequest::PseudocodeAt { resp, .. } => reject!(resp, err),
         IdaRequest::RunScript { resp, .. } => reject!(resp, err),
+    }
+}
+
+/// Compare compile-time SDK major version against runtime major version.
+/// Returns an error message on mismatch, `None` if they match.
+fn check_version_mismatch(sdk_major: i32, runtime_major: i32) -> Option<String> {
+    if runtime_major != sdk_major {
+        Some(format!(
+            "IDA major version mismatch: ida-mcp was compiled \
+             for IDA {sdk_major}.x but the runtime IDA library \
+             reports major version {runtime_major}. Install the \
+             matching IDA version or use the ida-mcp release \
+             built for your IDA version.",
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ida::loop_impl::check_version_mismatch;
+
+    #[test]
+    fn matching_major_version_passes() {
+        assert!(check_version_mismatch(9, 9).is_none());
+    }
+
+    #[test]
+    fn mismatched_major_version_returns_error() {
+        let msg = check_version_mismatch(9, 8);
+        assert!(msg.is_some());
+        let msg = msg.unwrap();
+        assert!(msg.contains("major version 8"), "{msg}");
+        assert!(msg.contains("IDA 9.x"), "{msg}");
+    }
+
+    /// IDA 9.3 returns product version 9.0.260213 — the minor=0 must
+    /// NOT trigger a mismatch when SDK_VERSION is (9, 3). Issue #9.
+    #[test]
+    fn product_minor_zero_does_not_mismatch_sdk_minor_three() {
+        // sdk_major=9 (from SDK_VERSION=(9,3)), runtime major=9
+        // (from get_library_version returning 9.0.260213).
+        // The minor versions differ (3 vs 0) but we only compare major.
+        assert!(check_version_mismatch(9, 9).is_none());
     }
 }
