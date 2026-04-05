@@ -2,6 +2,8 @@
 
 Headless IDA Pro MCP server for AI-powered reverse engineering.
 
+Release archives are published for `x86_64` and `arm64` on macOS, Linux, and Windows.
+
 ## Prerequisites
 
 - IDA Pro 9.2+ with valid license
@@ -10,21 +12,35 @@ Headless IDA Pro MCP server for AI-powered reverse engineering.
 
 ### Install
 
-**macOS** (via [Homebrew](https://brew.sh))
+**macOS / Linux** (via [Homebrew](https://brew.sh))
 ```bash
-brew install blacktop/tap/ida-mcp        # LATEST (IDA 9.3)
+brew install blacktop/tap/ida-mcp        # Latest (IDA 9.3)
 brew install blacktop/tap/ida-mcp@9.2    # IDA 9.2
 ```
 
-**Linux / Windows**
+**Windows** (via [Scoop](https://scoop.sh))
+```powershell
+scoop bucket add blacktop https://github.com/blacktop/scoop-bucket
+scoop install blacktop/ida-mcp
+```
 
-Download the release matching your IDA version from [GitHub Releases](https://github.com/blacktop/ida-mcp-rs/releases).
+Or via [winget](https://learn.microsoft.com/en-us/windows/package-manager/winget/) *(pending [initial upstream review](https://github.com/microsoft/winget-pkgs))*:
+```powershell
+winget install blacktop.ida-mcp
+```
 
-> ida-mcp versions mirror IDA Pro versions (`v9.3.x` for IDA 9.3, `v9.2.x` for IDA 9.2). A version mismatch is detected at startup with a clear error message.
+**Nix**
+```bash
+nix shell github:blacktop/nur#ida-mcp
+```
 
 **Build from source**
 
 See [docs/BUILDING.md](docs/BUILDING.md).
+
+> ida-mcp versions mirror IDA Pro versions (`v9.3.x` for IDA 9.3, `v9.2.x` for IDA 9.2). A version mismatch is detected at startup with a clear error message. Scoop, winget, and NUR publish the latest version; for older IDA versions use the matching [GitHub Release](https://github.com/blacktop/ida-mcp-rs/releases) or versioned Homebrew cask.
+
+For maintainers: CI now stops at building and publishing the GitHub release. After the release is live, update Scoop, NUR, and winget locally with `just release-sync <version>`.
 
 ### Platform Setup
 

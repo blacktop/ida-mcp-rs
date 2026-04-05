@@ -13,7 +13,15 @@ env:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -32,11 +40,19 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: ida-mcp-linux-x86_64
+          name: ida-mcp-linux-${{ matrix.arch }}
           path: target/release/ida-mcp
 
   build-macos:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
@@ -53,11 +69,19 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: ida-mcp-macos-arm64
+          name: ida-mcp-macos-${{ matrix.arch }}
           path: target/release/ida-mcp
 
   build-windows:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2025
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Install LLVM
         uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0  # v2
@@ -83,7 +107,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
-          name: ida-mcp-windows-x86_64
+          name: ida-mcp-windows-${{ matrix.arch }}
           path: target/release/ida-mcp.exe
 
   release:
@@ -103,26 +127,10 @@ jobs:
           path: artifacts
 
       - name: Package artifacts
-        run: |
-          cd artifacts
+        run: just ci-package-artifacts
 
-          # Linux
-          chmod +x ida-mcp-linux-x86_64/ida-mcp
-          tar -czvf ida-mcp_${GITHUB_REF_NAME#v}_Linux_x86_64.tar.gz \
-            -C ida-mcp-linux-x86_64 ida-mcp \
-            -C ${{ github.workspace }} README.md LICENSE
-
-          # macOS
-          chmod +x ida-mcp-macos-arm64/ida-mcp
-          tar -czvf ida-mcp_${GITHUB_REF_NAME#v}_Darwin_arm64.tar.gz \
-            -C ida-mcp-macos-arm64 ida-mcp \
-            -C ${{ github.workspace }} README.md LICENSE
-
-          # Windows
-          zip ida-mcp_${GITHUB_REF_NAME#v}_Windows_x86_64.zip \
-            ida-mcp-windows-x86_64/ida-mcp.exe \
-            -j ${{ github.workspace }}/README.md \
-            -j ${{ github.workspace }}/LICENSE
+      - name: Generate checksums
+        run: just ci-generate-checksums
 
       - name: Create Release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b  # v2
@@ -130,5 +138,6 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.zip
+            artifacts/checksums.txt
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'rc') }}

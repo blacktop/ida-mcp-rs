@@ -32,199 +32,95 @@ update-beta-cask ida_version="9.4":
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-    TARBALL="dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
-    SHA256=$(shasum -a 256 "$TARBALL" | awk '{print $1}')
-    TAP_DIR="${HOME}/Developer/Mine/blacktop/homebrew-tap"
-
-    if [[ ! -d "$TAP_DIR" ]]; then
-        echo "Error: homebrew-tap not found at $TAP_DIR"
-        exit 1
-    fi
-
-    cat > "$TAP_DIR/Casks/ida-mcp@beta.rb" << EOF
-    # This file is auto-generated. DO NOT EDIT.
-    cask "ida-mcp@beta" do
-      version "${VERSION}"
-      sha256 "${SHA256}"
-
-      url "https://github.com/blacktop/ida-mcp-rs/releases/download/v#{version}/ida-mcp_#{version}_Darwin_arm64.tar.gz"
-      name "ida-mcp (beta)"
-      desc "Headless IDA Pro MCP Server for AI-powered binary analysis (beta)"
-      homepage "https://github.com/blacktop/ida-mcp-rs"
-
-      conflicts_with cask: "ida-mcp"
-
-      binary "ida-mcp"
-
-      postflight do
-        Dir.glob("#{staged_path}/**/ida-mcp").each do |f|
-          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", f]
-        end
-      end
-
-      caveats do
-        <<~EOS
-          ida-mcp@beta requires IDA Pro {{ ida_version }}+ to be installed.
-          This is a prerelease version for testing.
-
-          Standard IDA installations work automatically:
-            claude mcp add ida -- ida-mcp
-
-          If using a non-standard path, set DYLD_LIBRARY_PATH:
-            claude mcp add ida -e DYLD_LIBRARY_PATH='/path/to/ida/Contents/MacOS' -- ida-mcp
-        EOS
-      end
-    end
-    EOF
-
-    echo "Generated $TAP_DIR/Casks/ida-mcp@beta.rb"
-    cd "$TAP_DIR"
-    git add "Casks/ida-mcp@beta.rb"
-    git commit -m "Update ida-mcp@beta to ${VERSION}"
-    git push
-    echo "Pushed beta cask to homebrew-tap"
+    just --justfile "{{ justfile_directory() }}/ci.just" publish-beta-cask "$VERSION" "{{ ida_version }}"
 
 # Update homebrew stable cask in tap (run after GitHub release is created).
-# This generates the unversioned "latest" cask (currently IDA 9.3).
+# Supports macOS (arm64, x86_64) and Linux (x86_64, arm64).
 update-cask revision="":
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-    IDA_VERSION="${VERSION%.*}"  # e.g. 9.3.0 -> 9.3
-    REVISION="{{ revision }}"
-    if [[ -n "$REVISION" ]]; then
-        CASK_VERSION="${VERSION},${REVISION}"
-        URL_VERSION='#{version.before_comma}'
-    else
-        CASK_VERSION="${VERSION}"
-        URL_VERSION='#{version}'
-    fi
-    TAP_DIR="${HOME}/Developer/Mine/blacktop/homebrew-tap"
-    TARBALL_URL="https://github.com/blacktop/ida-mcp-rs/releases/download/v${VERSION}/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
-
-    if [[ ! -d "$TAP_DIR" ]]; then
-        echo "Error: homebrew-tap not found at $TAP_DIR"
-        exit 1
-    fi
-
-    echo "Downloading release tarball..."
-    mkdir -p dist
-    curl -sL "$TARBALL_URL" -o "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
-    SHA256=$(shasum -a 256 "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" | awk '{print $1}')
-
-    cat > "$TAP_DIR/Casks/ida-mcp.rb" << CASK
-    # This file is auto-generated. DO NOT EDIT.
-    cask "ida-mcp" do
-      version "${CASK_VERSION}"
-      sha256 "${SHA256}"
-
-      url "https://github.com/blacktop/ida-mcp-rs/releases/download/v${URL_VERSION}/ida-mcp_${URL_VERSION}_Darwin_arm64.tar.gz"
-      name "ida-mcp"
-      desc "Headless IDA Pro MCP Server for AI-powered binary analysis (IDA ${IDA_VERSION})"
-      homepage "https://github.com/blacktop/ida-mcp-rs"
-
-      conflicts_with cask: "ida-mcp@beta"
-
-      binary "ida-mcp"
-
-      postflight do
-        Dir.glob("#{staged_path}/**/ida-mcp").each do |f|
-          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", f]
-        end
-      end
-
-      caveats do
-        <<~EOS
-          ida-mcp requires IDA Pro ${IDA_VERSION} to be installed.
-          For other IDA versions: brew install blacktop/tap/ida-mcp@<version>
-
-          Standard IDA installations work automatically:
-            claude mcp add ida -- ida-mcp
-
-          If using a non-standard path, set DYLD_LIBRARY_PATH:
-            claude mcp add ida -e DYLD_LIBRARY_PATH='/path/to/ida/Contents/MacOS' -- ida-mcp
-        EOS
-      end
-    end
-    CASK
-
-    echo "Generated $TAP_DIR/Casks/ida-mcp.rb (version: ${CASK_VERSION}, IDA ${IDA_VERSION})"
-    cd "$TAP_DIR"
-    git add "Casks/ida-mcp.rb"
-    git commit -m "Update ida-mcp to ${CASK_VERSION} (IDA ${IDA_VERSION})"
-    git push
-    echo "Pushed stable cask to homebrew-tap"
+    just release-fetch-checksums "$VERSION"
+    just --justfile "{{ justfile_directory() }}/ci.just" publish-cask "$VERSION" "{{ revision }}"
 
 # Update homebrew versioned cask for a specific IDA version.
 # Usage: just update-versioned-cask 9.2
-# Generates Casks/ida-mcp@9.2.rb pointing to the matching GitHub release.
-update-versioned-cask ida_version revision="":
+# Resolves the latest release tag for that IDA line automatically.
+update-versioned-cask ida_version release_version="":
     #!/usr/bin/env bash
     set -euo pipefail
     IDA_VERSION="{{ ida_version }}"
-    VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-    REVISION="{{ revision }}"
-    if [[ -n "$REVISION" ]]; then
-        CASK_VERSION="${VERSION},${REVISION}"
-        URL_VERSION='#{version.before_comma}'
-    else
-        CASK_VERSION="${VERSION}"
-        URL_VERSION='#{version}'
+    VERSION="{{ release_version }}"
+    if [[ -z "$VERSION" ]]; then
+        VERSION=$(git tag --list "v${IDA_VERSION}.*" --sort=-version:refname | head -1 | sed 's/^v//')
     fi
-    TAP_DIR="${HOME}/Developer/Mine/blacktop/homebrew-tap"
-    TARBALL_URL="https://github.com/blacktop/ida-mcp-rs/releases/download/v${VERSION}/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
-
-    if [[ ! -d "$TAP_DIR" ]]; then
-        echo "Error: homebrew-tap not found at $TAP_DIR"
+    if [[ -z "$VERSION" ]]; then
+        echo "Error: no release tag found for IDA ${IDA_VERSION}"
         exit 1
     fi
+    just --justfile "{{ justfile_directory() }}/ci.just" publish-versioned-cask "$VERSION" "{{ ida_version }}"
 
-    echo "Downloading v${VERSION} release tarball..."
-    mkdir -p dist
-    curl -sL "$TARBALL_URL" -o "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
-    SHA256=$(shasum -a 256 "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" | awk '{print $1}')
+# CI helper wrappers. The implementation lives in ci.just so workflow shell logic
+# stays centralized and easier to audit.
+ci-package-artifacts:
+    just --justfile "{{ justfile_directory() }}/ci.just" package-artifacts
 
-    CASK_FILE="$TAP_DIR/Casks/ida-mcp@${IDA_VERSION}.rb"
+ci-generate-checksums:
+    just --justfile "{{ justfile_directory() }}/ci.just" generate-checksums
 
-    cat > "$CASK_FILE" << CASK
-    # This file is auto-generated. DO NOT EDIT.
-    cask "ida-mcp@${IDA_VERSION}" do
-      version "${CASK_VERSION}"
-      sha256 "${SHA256}"
+# Local post-release publishing. These use your local `gh` auth and the live
+# GitHub release assets/checksums rather than CI secrets or ephemeral artifacts.
+release-fetch-checksums version="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VERSION="{{ version }}"
+    if [[ -z "$VERSION" ]]; then
+        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    fi
+    just --justfile "{{ justfile_directory() }}/ci.just" download-checksums "$VERSION"
 
-      url "https://github.com/blacktop/ida-mcp-rs/releases/download/v${URL_VERSION}/ida-mcp_${URL_VERSION}_Darwin_arm64.tar.gz"
-      name "ida-mcp (IDA ${IDA_VERSION})"
-      desc "Headless IDA Pro MCP Server for AI-powered binary analysis (IDA ${IDA_VERSION})"
-      homepage "https://github.com/blacktop/ida-mcp-rs"
+release-sync-scoop version="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VERSION="{{ version }}"
+    if [[ -z "$VERSION" ]]; then
+        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    fi
+    just release-fetch-checksums "$VERSION"
+    just --justfile "{{ justfile_directory() }}/ci.just" publish-scoop "$VERSION"
 
-      binary "ida-mcp"
+release-sync-nur version="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VERSION="{{ version }}"
+    if [[ -z "$VERSION" ]]; then
+        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    fi
+    just release-fetch-checksums "$VERSION"
+    just --justfile "{{ justfile_directory() }}/ci.just" publish-nur "$VERSION"
 
-      postflight do
-        Dir.glob("#{staged_path}/**/ida-mcp").each do |f|
-          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", f]
-        end
-      end
+release-sync-winget version="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VERSION="{{ version }}"
+    if [[ -z "$VERSION" ]]; then
+        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    fi
+    just release-fetch-checksums "$VERSION"
+    just --justfile "{{ justfile_directory() }}/ci.just" publish-winget "$VERSION"
 
-      caveats do
-        <<~EOS
-          ida-mcp@${IDA_VERSION} requires IDA Pro ${IDA_VERSION} to be installed.
-
-          Standard IDA installations work automatically:
-            claude mcp add ida -- ida-mcp
-
-          If using a non-standard path, set DYLD_LIBRARY_PATH:
-            claude mcp add ida -e DYLD_LIBRARY_PATH='/path/to/ida/Contents/MacOS' -- ida-mcp
-        EOS
-      end
-    end
-    CASK
-
-    echo "Generated $CASK_FILE (version: ${CASK_VERSION}, IDA ${IDA_VERSION})"
-    cd "$TAP_DIR"
-    git add "Casks/ida-mcp@${IDA_VERSION}.rb"
-    git commit -m "Update ida-mcp@${IDA_VERSION} to ${CASK_VERSION}"
-    git push
-    echo "Pushed ida-mcp@${IDA_VERSION} cask to homebrew-tap"
+release-sync version="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VERSION="{{ version }}"
+    if [[ -z "$VERSION" ]]; then
+        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    fi
+    just release-fetch-checksums "$VERSION"
+    just --justfile "{{ justfile_directory() }}/ci.just" publish-cask "$VERSION"
+    just --justfile "{{ justfile_directory() }}/ci.just" publish-scoop "$VERSION"
+    just --justfile "{{ justfile_directory() }}/ci.just" publish-nur "$VERSION"
+    just --justfile "{{ justfile_directory() }}/ci.just" publish-winget "$VERSION"
 
 # Run integration test (debug)
 test: build
