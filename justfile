@@ -181,10 +181,20 @@ clean:
     cargo clean
     rm -rf dist/
 
-# Bump version and push tag
+# Bump version, update Cargo.toml + Cargo.lock, commit, tag, and push
 bump:
     #!/usr/bin/env bash
     set -euo pipefail
-    VERSION="$(svu patch)"
-    git tag -a "$VERSION" -m "$VERSION"
-    git push origin "$VERSION"
+    TAG="$(svu patch)"
+    VERSION="${TAG#v}"
+    CURRENT="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
+    if [[ "$VERSION" == "$CURRENT" ]]; then
+        echo "Cargo.toml already at ${VERSION}"
+    else
+        sed -i '' "s/^version = \"${CURRENT}\"/version = \"${VERSION}\"/" Cargo.toml
+        cargo update -p ida-mcp
+        git add Cargo.toml Cargo.lock
+        git commit -m "chore: release ${VERSION}"
+    fi
+    git tag -a "$TAG" -m "Release $TAG"
+    git push && git push --tags
