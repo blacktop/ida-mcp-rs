@@ -1,5 +1,7 @@
 # ida-mcp-rs
 
+[![SafeSkill 92/100](https://img.shields.io/badge/SafeSkill-92%2F100_Verified%20Safe-brightgreen)](https://safeskill.dev/scan/blacktop-ida-mcp-rs)
+
 Headless IDA Pro MCP server for AI-powered reverse engineering.
 
 Release archives are published for `x86_64` and `arm64` on macOS, Linux, and Windows.
