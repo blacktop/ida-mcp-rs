@@ -61,26 +61,22 @@ fn check_ida_version() -> Option<String> {
     }
 }
 
-/// Initialize IDA on the main thread **before** the MCP transport starts.
-///
-/// On Windows stdio mode this must run before `rmcp::stdio()` captures
-/// stdin, because `init_library()` may probe console handles during
-/// startup — if stdin is already owned by the MCP framing layer the
-/// process deadlocks.
-pub fn init_ida_library() -> IdaInitState {
+/// Initialize IDA on the main thread and record the version state.
+pub fn init_ida_library() -> Result<IdaInitState, String> {
     info!("Initializing IDA library on main thread (eager)");
-    idalib::init_library();
-    idalib::enable_console_messages(false);
+    idalib::init_library().map_err(|e| format!("{e}"))?;
+    idalib::enable_console_messages(false)
+        .map_err(|e| format!("{e}"))?;
 
     let version_mismatch = check_ida_version();
     if let Some(ref msg) = version_mismatch {
         error!("{msg}");
     }
 
-    IdaInitState {
+    Ok(IdaInitState {
         library_initialized: true,
         version_mismatch,
-    }
+    })
 }
 
 /// Run the IDA worker loop on the current (main) thread.
@@ -109,13 +105,20 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 Some(OPEN_IDB_PROGRESS_TOTAL),
                 "Initializing IDA runtime on the main thread",
             );
-            idalib::init_library();
-            idalib::enable_console_messages(false);
-            lib_initialized = true;
-
-            if let Some(msg) = check_ida_version() {
-                error!("{msg}");
-                version_mismatch = Some(msg);
+            match init_ida_library() {
+                Ok(init_state) => {
+                    lib_initialized = init_state.library_initialized;
+                    version_mismatch = init_state.version_mismatch;
+                }
+                Err(err) => {
+                    reject_with_error(
+                        req,
+                        ToolError::IdaError(format!(
+                            "failed to initialize IDA on the main thread: {err}"
+                        )),
+                    );
+                    continue;
+                }
             }
         }
 

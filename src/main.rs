@@ -24,8 +24,6 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 use rmcp::ServiceExt;
-#[cfg(target_os = "windows")]
-use std::any::Any;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -212,35 +210,16 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-fn init_windows_stdio_ida() -> anyhow::Result<ida::IdaInitState> {
-    std::panic::catch_unwind(ida::init_ida_library).map_err(|panic_payload| {
-        anyhow::anyhow!(
-            "failed to initialize IDA before MCP stdio startup: {}",
-            panic_message(&panic_payload)
-        )
-    })
-}
-
-#[cfg(not(target_os = "windows"))]
-fn init_windows_stdio_ida() -> anyhow::Result<ida::IdaInitState> {
-    Ok(ida::IdaInitState::deferred())
-}
-
-#[cfg(target_os = "windows")]
-fn panic_message(payload: &Box<dyn Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_string();
-    }
-    "non-string panic payload".to_string()
+fn init_stdio_ida_state() -> ida::IdaInitState {
+    // Defer IDA initialization to the worker loop's first request.
+    // The worker loop runs on the main thread and handles init errors
+    // gracefully, surfacing them as request-level errors.
+    ida::IdaInitState::deferred()
 }
 
 fn run_server() -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (server mode)");
-    let init_state = init_windows_stdio_ida()?;
+    let init_state = init_stdio_ida_state();
 
     // Create channel for IDA requests
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
@@ -438,7 +417,8 @@ fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
         info!("IDADIR={}", idadir);
     }
     info!("Initializing IDA library on main thread");
-    idalib::init_library();
+    idalib::init_library()
+        .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))?;
     info!("IDA library initialized successfully");
     if let Ok(ver) = idalib::version() {
         info!(
@@ -449,7 +429,8 @@ fn run_probe(args: ProbeArgs) -> anyhow::Result<()> {
         );
     }
     if args.ida_console {
-        idalib::enable_console_messages(true);
+        idalib::enable_console_messages(true)
+            .map_err(|e| anyhow::anyhow!("failed to enable console messages: {e}"))?;
         info!("IDA console messages enabled");
     }
 
