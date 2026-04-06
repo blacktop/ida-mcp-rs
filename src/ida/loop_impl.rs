@@ -65,8 +65,7 @@ fn check_ida_version() -> Option<String> {
 pub fn init_ida_library() -> Result<IdaInitState, String> {
     info!("Initializing IDA library on main thread (eager)");
     idalib::init_library().map_err(|e| format!("{e}"))?;
-    idalib::enable_console_messages(false)
-        .map_err(|e| format!("{e}"))?;
+    idalib::enable_console_messages(false).map_err(|e| format!("{e}"))?;
 
     let version_mismatch = check_ida_version();
     if let Some(ref msg) = version_mismatch {
