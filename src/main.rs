@@ -210,16 +210,25 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_stdio_ida_state() -> ida::IdaInitState {
-    // Defer IDA initialization to the worker loop's first request.
-    // The worker loop runs on the main thread and handles init errors
-    // gracefully, surfacing them as request-level errors.
-    ida::IdaInitState::deferred()
+fn init_stdio_ida_state() -> anyhow::Result<ida::IdaInitState> {
+    // On Windows, IDA's init_library() probes console handles during
+    // startup. In stdio mode the MCP transport captures stdin/stdout
+    // for JSON-RPC framing, so init must run *before* the transport
+    // starts — otherwise init_library() deadlocks on the owned handle.
+    #[cfg(target_os = "windows")]
+    {
+        ida::init_ida_library()
+            .map_err(|e| anyhow::anyhow!("IDA library initialization failed: {e}"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(ida::IdaInitState::deferred())
+    }
 }
 
 fn run_server() -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (server mode)");
-    let init_state = init_stdio_ida_state();
+    let init_state = init_stdio_ida_state()?;
 
     // Create channel for IDA requests
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);

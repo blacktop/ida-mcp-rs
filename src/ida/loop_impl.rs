@@ -63,7 +63,7 @@ fn check_ida_version() -> Option<String> {
 
 /// Initialize IDA on the main thread and record the version state.
 pub fn init_ida_library() -> Result<IdaInitState, String> {
-    info!("Initializing IDA library on main thread (eager)");
+    info!("Initializing IDA library");
     idalib::init_library().map_err(|e| format!("{e}"))?;
     idalib::enable_console_messages(false).map_err(|e| format!("{e}"))?;
 
