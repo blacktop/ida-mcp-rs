@@ -16,13 +16,13 @@ brew install blacktop/tap/ida-mcp        # Latest (IDA 9.3)
 brew install blacktop/tap/ida-mcp@9.2    # IDA 9.2
 ```
 
-**Windows** (via [Scoop](https://scoop.sh) or [winget](https://learn.microsoft.com/en-us/windows/package-manager/winget/))
+**Windows** (via [Scoop](https://scoop.sh))
 ```powershell
 scoop bucket add blacktop https://github.com/blacktop/scoop-bucket
 scoop install blacktop/ida-mcp
-# or (pending initial upstream review)
-winget install blacktop.ida-mcp
 ```
+
+> **Windows note:** See the [Windows platform setup](#windows) section below for DLL discovery options.
 
 **macOS / Linux** (via [Nix](https://nixos.org))
 ```bash
@@ -76,14 +76,33 @@ Supported paths (auto-detected):
 
 #### Windows
 
-Add your IDA directory to `PATH` (System Properties > Environment Variables):
+**Option A** — Install `ida-mcp.exe` into your IDA directory (simplest, no env setup needed):
 ```powershell
-$env:PATH = "C:\Program Files\IDA Professional 9.3;$env:PATH"
+# Copy the binary next to ida.dll / idalib.dll
+copy ida-mcp.exe "C:\Program Files\IDA Professional 9.3\"
+claude mcp add ida -- "C:\Program Files\IDA Professional 9.3\ida-mcp.exe"
+```
+
+**Option B** — Install via [Scoop](https://scoop.sh) (auto-detects IDA and sets `IDADIR`):
+```powershell
+scoop bucket add blacktop https://github.com/blacktop/scoop-bucket
+scoop install blacktop/ida-mcp
 claude mcp add ida -- ida-mcp
 ```
 
-Common Windows IDA paths:
+**Option C** — Set `IDADIR` manually:
+```powershell
+# Persistent (survives reboots)
+setx IDADIR "C:\Program Files\IDA Professional 9.3"
+# Then restart your terminal
+claude mcp add ida -- ida-mcp
+```
+
+Windows requires `ida.dll` and `idalib.dll` to be discoverable at startup. Placing `ida-mcp.exe` in the IDA directory is the easiest approach. Otherwise, the IDA directory must be on `PATH` or pointed to by `IDADIR`.
+
+Common IDA paths:
 - `C:\Program Files\IDA Professional 9.3`
+- `C:\Program Files\IDA Pro 9.3`
 - `C:\Program Files\IDA Home 9.3`
 
 ### Runtime Requirements
@@ -94,7 +113,7 @@ The binary links against IDA's libraries at runtime. Standard installation paths
 |----------|---------|------------------------|
 | macOS | `libida.dylib` | `DYLD_LIBRARY_PATH` |
 | Linux | `libida.so` | `IDADIR` or `LD_LIBRARY_PATH` |
-| Windows | `ida.dll` | Add IDA dir to `PATH` |
+| Windows | `ida.dll` | Place exe in IDA dir, set `IDADIR`, or add IDA dir to `PATH` |
 
 ### Configure your AI agent
 
