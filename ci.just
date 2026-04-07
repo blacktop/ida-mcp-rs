@@ -59,21 +59,53 @@ publish-scoop version:
 
     hash_for() { grep "$1" "${CHECKSUMS_FILE}" | awk '{print $1}'; }
     WIN_X86_64_HASH=$(hash_for "Windows_x86_64.zip")
-    cat > "${WORKDIR}/ida-mcp.json" <<EOF
+    cat > "${WORKDIR}/ida-mcp.json" <<'TEMPLATE'
     {
-      "version": "${VERSION}",
+      "version": "VERSION_PLACEHOLDER",
       "architecture": {
         "64bit": {
-          "url": "https://github.com/blacktop/ida-mcp-rs/releases/download/v${VERSION}/ida-mcp_${VERSION}_Windows_x86_64.zip",
+          "url": "URL_PLACEHOLDER",
           "bin": ["ida-mcp.exe"],
-          "hash": "${WIN_X86_64_HASH}"
+          "hash": "HASH_PLACEHOLDER"
         }
       },
       "homepage": "https://github.com/blacktop/ida-mcp-rs",
       "license": "MIT",
-      "description": "Headless IDA Pro MCP Server for AI-powered binary analysis"
+      "description": "Headless IDA Pro MCP Server for AI-powered binary analysis",
+      "post_install": [
+        "$idaPaths = @(",
+        "  'C:\\Program Files\\IDA Professional 9.3',",
+        "  'C:\\Program Files\\IDA Pro 9.3',",
+        "  'C:\\Program Files\\IDA Home 9.3',",
+        "  'C:\\Program Files\\IDA Essential 9.3',",
+        "  'C:\\Program Files\\IDA Professional 9.2',",
+        "  'C:\\Program Files\\IDA Pro 9.2'",
+        ")",
+        "$found = $idaPaths | Where-Object { Test-Path \"$_\\idalib.dll\" } | Select-Object -First 1",
+        "if ($found -and -not $env:IDADIR) {",
+        "  [Environment]::SetEnvironmentVariable('IDADIR', $found, 'User')",
+        "  $env:IDADIR = $found",
+        "  Write-Host \"IDADIR set to $found\"",
+        "} elseif (-not $found) {",
+        "  Write-Host 'IDA Pro not found in standard locations. Set IDADIR manually or add IDA to PATH.'",
+        "}"
+      ],
+      "post_uninstall": [
+        "$current = [Environment]::GetEnvironmentVariable('IDADIR', 'User')",
+        "if ($current) {",
+        "  [Environment]::SetEnvironmentVariable('IDADIR', $null, 'User')",
+        "  Write-Host 'Removed IDADIR environment variable'",
+        "}"
+      ],
+      "env_add_path": [],
+      "notes": "Requires IDA Pro 9.x with a valid license. IDADIR is auto-detected from standard install paths."
     }
-    EOF
+TEMPLATE
+    # Replace placeholders with actual values (avoids heredoc variable expansion issues)
+    sed -i'' -e "s|VERSION_PLACEHOLDER|${VERSION}|g" \
+             -e "s|URL_PLACEHOLDER|https://github.com/blacktop/ida-mcp-rs/releases/download/v${VERSION}/ida-mcp_${VERSION}_Windows_x86_64.zip|g" \
+             -e "s|HASH_PLACEHOLDER|${WIN_X86_64_HASH}|g" \
+             "${WORKDIR}/ida-mcp.json"
 
     TMPDIR="$(mktemp -d)"
     git clone "https://x-access-token:${GH_AUTH_TOKEN}@github.com/blacktop/scoop-bucket.git" "${TMPDIR}"
