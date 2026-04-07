@@ -91,13 +91,20 @@ publish-scoop version:
         "}"
       ],
       "post_uninstall": [
+        "$idaPaths = @(",
+        "  'C:\\Program Files\\IDA Professional 9.3',",
+        "  'C:\\Program Files\\IDA Pro 9.3',",
+        "  'C:\\Program Files\\IDA Home 9.3',",
+        "  'C:\\Program Files\\IDA Essential 9.3',",
+        "  'C:\\Program Files\\IDA Professional 9.2',",
+        "  'C:\\Program Files\\IDA Pro 9.2'",
+        ")",
         "$current = [Environment]::GetEnvironmentVariable('IDADIR', 'User')",
-        "if ($current) {",
+        "if ($current -and ($idaPaths -contains $current)) {",
         "  [Environment]::SetEnvironmentVariable('IDADIR', $null, 'User')",
         "  Write-Host 'Removed IDADIR environment variable'",
         "}"
       ],
-      "env_add_path": [],
       "notes": "Requires IDA Pro 9.x with a valid license. IDADIR is auto-detected from standard install paths."
     }
 TEMPLATE
@@ -276,6 +283,10 @@ publish-winget version:
     License: MIT
     LicenseUrl: https://github.com/blacktop/ida-mcp-rs/blob/main/LICENSE
     ShortDescription: Headless IDA Pro MCP Server for AI-powered binary analysis
+    InstallationNotes: |
+      ida-mcp requires IDA Pro 9.x. Set the IDADIR environment variable to your IDA
+      installation path (e.g. setx IDADIR "C:\Program Files\IDA Professional 9.3"),
+      or add the IDA directory to your PATH.
     Tags:
       - ida
       - mcp
