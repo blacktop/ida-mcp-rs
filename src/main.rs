@@ -7,13 +7,11 @@
 //! - Main thread: Runs IDA worker loop (IDA requires main thread)
 //! - Background thread: Runs tokio runtime with async MCP server
 
+use axum::Router;
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
+use http::{header::ORIGIN, Request, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
-use hyper::http::{header::ORIGIN, Request, Response, StatusCode};
-use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
-use hyper_util::service::TowerToHyperService;
 use ida_mcp::{
     disasm::generate_disasm_line, expand_path, ida, DbInfo, FunctionInfo, IdaMcpServer, IdaWorker,
     ServerMode,
@@ -362,6 +360,7 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
             let allowed_origins = Arc::new(allowed_origins);
             let service = OriginCheckService::new(service, allowed_origins);
 
+            let router = Router::new().route_service("/", service);
             let listener = tokio::net::TcpListener::bind(bind_addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
@@ -378,29 +377,14 @@ fn run_server_http(args: ServeHttpArgs) -> anyhow::Result<()> {
                 }
             });
 
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        info!("HTTP server shutting down");
-                        break;
-                    }
-                    res = listener.accept() => {
-                        let (stream, _) = res.map_err(|e| anyhow::anyhow!("accept failed: {e}"))?;
-                        let svc = service.clone();
-                        tokio::spawn(async move {
-                            let io = TokioIo::new(stream);
-                            let conn = http1::Builder::new().serve_connection(
-                                io,
-                                TowerToHyperService::new(svc),
-                            );
-                            if let Err(err) = conn.await {
-                                tracing::error!("http connection error: {err}");
-                            }
-                        });
-                    }
-                }
-            }
-            #[allow(unreachable_code)]
+            let cancel_for_serve = cancel.clone();
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    cancel_for_serve.cancelled().await;
+                    info!("HTTP server shutting down");
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("serve failed: {e}"))?;
             Ok::<_, anyhow::Error>(())
         });
         if let Err(err) = result {

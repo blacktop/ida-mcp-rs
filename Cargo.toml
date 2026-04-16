@@ -10,6 +10,7 @@ keywords = ["ida", "mcp", "reverse-engineering", "disassembly", "decompiler"]
 categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3.1" }
 rmcp = { version = "1.5", features = ["server", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal"] }
@@ -23,9 +24,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "service"] }
 bytes = "1"
+http = "1"
 http-body = "1"
 http-body-util = "0.1"
 tower-service = "0.3"
