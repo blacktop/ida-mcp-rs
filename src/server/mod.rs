@@ -10,7 +10,7 @@ pub use requests::*;
 
 use crate::error::ToolError;
 use crate::ida::observability::{ProgressReceiver, ProgressSender};
-use crate::ida::worker::MAX_TIMEOUT_SECS;
+use crate::ida::worker::{CloseAuthorization, CloseTokenGrant, MAX_TIMEOUT_SECS};
 use crate::ida::IdaWorker;
 use crate::server::operation::{
     next_operation_id, OperationRegistry, OperationSnapshot, RecentOperations,
@@ -92,6 +92,7 @@ struct DscBackgroundCtx {
     out_i64: std::path::PathBuf,
     module: String,
     frameworks: Vec<String>,
+    owner_session_id: Option<String>,
 }
 
 /// Inputs above this size automatically route `open_idb(auto_analyse=true)`
@@ -137,7 +138,53 @@ impl IdaMcpServer {
                 "Call close_idb when done to release locks for other sessions."
             }
             ServerMode::Http => {
-                "In multi-client (HTTP/SSE) mode, close_idb requires the close_token returned by open_idb; only the opener should close."
+                "In multi-client (HTTP/SSE) mode, close_idb accepts the close_token returned by open_idb. The owning session can also close without re-sending the token, and close_idb(force=true) can recover from a lost session."
+            }
+        }
+    }
+
+    fn http_close_grant(&self) -> Option<Result<CloseTokenGrant, String>> {
+        matches!(self.mode, ServerMode::Http)
+            .then(|| self.worker.issue_close_token_for_session(&self.session_id))
+    }
+
+    fn apply_close_metadata(
+        &self,
+        map: &mut serde_json::Map<String, Value>,
+        grant: Option<Result<CloseTokenGrant, String>>,
+    ) {
+        match grant {
+            Some(Ok(grant)) => {
+                map.insert("close_hint".to_string(), json!(self.close_hint()));
+                map.insert(
+                    "close_owner_session_id".to_string(),
+                    json!(grant.owner_session_id),
+                );
+                map.insert("close_token".to_string(), json!(grant.token));
+                if grant.reused {
+                    map.insert("close_token_reused".to_string(), json!(true));
+                }
+            }
+            Some(Err(owner_session_id)) => {
+                map.insert(
+                    "close_hint".to_string(),
+                    json!(format!(
+                        "The open database is currently owned by HTTP session {owner_session_id}. Reuse that session to call close_idb, or call close_idb(force=true) to recover if the owning session was lost."
+                    )),
+                );
+                map.insert(
+                    "close_owner_session_id".to_string(),
+                    json!(owner_session_id),
+                );
+                map.insert(
+                    "close_recovery_hint".to_string(),
+                    json!(
+                        "If the original MCP HTTP session was lost, call close_idb(force=true) from a trusted recovery session."
+                    ),
+                );
+            }
+            None => {
+                map.insert("close_hint".to_string(), json!(self.close_hint()));
             }
         }
     }
@@ -596,11 +643,7 @@ impl IdaMcpServer {
             Err(e) => return Ok(e.to_tool_result()),
         };
 
-        let close_token = if matches!(self.mode, ServerMode::Http) {
-            self.worker.issue_close_token()
-        } else {
-            None
-        };
+        let close_token = self.http_close_grant();
 
         let mut value = match serde_json::to_value(&db_info) {
             Ok(v) => v,
@@ -615,10 +658,7 @@ impl IdaMcpServer {
             if !frameworks.is_empty() {
                 map.insert("frameworks_loaded".to_string(), json!(frameworks));
             }
-            map.insert("close_hint".to_string(), json!(self.close_hint()));
-            if let Some(token) = close_token {
-                map.insert("close_token".to_string(), json!(token));
-            }
+            self.apply_close_metadata(map, close_token);
         }
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -642,6 +682,7 @@ impl IdaMcpServer {
             out_i64,
             module,
             frameworks,
+            owner_session_id,
         } = ctx;
 
         // Phase 1: run idat subprocess
@@ -730,10 +771,11 @@ impl IdaMcpServer {
             }
         };
 
-        let close_token = if matches!(mode, ServerMode::Http) {
-            worker.issue_close_token()
-        } else {
-            None
+        let close_token = match (mode, owner_session_id.as_deref()) {
+            (ServerMode::Http, Some(owner_session_id)) => {
+                Some(worker.issue_close_token_for_session(owner_session_id))
+            }
+            _ => None,
         };
 
         let mut value = serde_json::to_value(&db_info)
@@ -743,8 +785,30 @@ impl IdaMcpServer {
             if !frameworks.is_empty() {
                 map.insert("frameworks_loaded".to_string(), json!(frameworks));
             }
-            if let Some(token) = close_token {
-                map.insert("close_token".to_string(), json!(token));
+            match close_token {
+                Some(Ok(grant)) => {
+                    map.insert(
+                        "close_owner_session_id".to_string(),
+                        json!(grant.owner_session_id),
+                    );
+                    map.insert("close_token".to_string(), json!(grant.token));
+                    if grant.reused {
+                        map.insert("close_token_reused".to_string(), json!(true));
+                    }
+                }
+                Some(Err(owner_session_id)) => {
+                    map.insert(
+                        "close_owner_session_id".to_string(),
+                        json!(owner_session_id),
+                    );
+                    map.insert(
+                        "close_recovery_hint".to_string(),
+                        json!(
+                            "If the original MCP HTTP session was lost, call close_idb(force=true) from a trusted recovery session."
+                        ),
+                    );
+                }
+                None => {}
             }
         }
 
@@ -836,11 +900,7 @@ impl IdaMcpServer {
             .await
         {
             Ok(info) => {
-                let close_token = if matches!(self.mode, ServerMode::Http) {
-                    self.worker.issue_close_token()
-                } else {
-                    None
-                };
+                let close_token = self.http_close_grant();
                 let analysis_task = if route_to_background && !info.analysis_status.auto_is_ok {
                     Some(match self.spawn_analyze_funcs_task() {
                         Ok(task_id) => (task_id, "started"),
@@ -872,10 +932,7 @@ impl IdaMcpServer {
                     }
                     map.insert("quick_tools".to_string(), json!(quick_tools));
                     map.insert("session_id".to_string(), json!(self.session_id));
-                    map.insert("close_hint".to_string(), json!(self.close_hint()));
-                    if let Some(token) = close_token {
-                        map.insert("close_token".to_string(), json!(token));
-                    }
+                    self.apply_close_metadata(map, close_token);
                     if let Some((task_id, status)) = analysis_task {
                         let reason = format!(
                             "Input size exceeded {} MiB; auto-analysis routed to a background task. Poll task_status(task_id) for progress.",
@@ -1065,7 +1122,8 @@ impl IdaMcpServer {
 
     #[tool(description = "Close the currently open IDA database. \
         Call this when you're done analyzing to free resources. \
-        In HTTP/SSE mode, provide the close_token returned by open_idb. \
+        In HTTP/SSE mode, the owning session can close directly, provide the close_token returned by open_idb, \
+        or set force=true to recover from a lost owner session. \
         The database can also be left open for the duration of the session.")]
     #[instrument(skip(self))]
     async fn close_idb(
@@ -1073,13 +1131,34 @@ impl IdaMcpServer {
         Parameters(req): Parameters<CloseIdbRequest>,
     ) -> Result<CallToolResult, McpError> {
         info!("Tool call: close_idb received");
-        if matches!(self.mode, ServerMode::Http)
-            && !self.worker.close_token_matches(req.token.as_deref())
-        {
-            info!("close_idb ignored: owner token required");
-            return Ok(CallToolResult::success(vec![Content::text(
-                "close_idb ignored: owner token required",
-            )]));
+        if matches!(self.mode, ServerMode::Http) {
+            match self.worker.authorize_close(
+                &self.session_id,
+                req.token.as_deref(),
+                req.force.unwrap_or(false),
+            ) {
+                CloseAuthorization::Granted => {}
+                CloseAuthorization::GrantedByOverride {
+                    previous_owner_session_id,
+                } => {
+                    info!(
+                        previous_owner_session_id = ?previous_owner_session_id,
+                        "close_idb overriding previous HTTP owner session"
+                    );
+                }
+                CloseAuthorization::Denied { owner_session_id } => {
+                    info!(owner_session_id = ?owner_session_id, "close_idb ignored: owner token required");
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        serde_json::to_string_pretty(&json!({
+                            "closed": false,
+                            "reason": "owner token required",
+                            "owner_session_id": owner_session_id,
+                            "hint": "Reuse the owning HTTP session to call close_idb, provide the close_token from open_idb, or call close_idb(force=true) to recover if that session was lost."
+                        }))
+                        .unwrap_or_else(|_| "close_idb ignored: owner token required".to_string()),
+                    )]));
+                }
+            }
         }
         match self.worker.close().await {
             Ok(()) => {
@@ -3144,6 +3223,8 @@ impl IdaMcpServer {
             out_i64,
             module,
             frameworks,
+            owner_session_id: matches!(self.mode, ServerMode::Http)
+                .then(|| self.session_id.clone()),
         };
 
         let handle = tokio::spawn(async move {

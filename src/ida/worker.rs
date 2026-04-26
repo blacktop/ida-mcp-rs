@@ -22,10 +22,34 @@ const CLOSE_SEND_TIMEOUT_SECS: u64 = 5;
 /// Backoff between control enqueue retries (milliseconds).
 const CONTROL_SEND_BACKOFF_MS: u64 = 25;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloseTokenLease {
+    token: String,
+    owner_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CloseTokenGrant {
+    pub token: String,
+    pub reused: bool,
+    pub owner_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CloseAuthorization {
+    Granted,
+    GrantedByOverride {
+        previous_owner_session_id: Option<String>,
+    },
+    Denied {
+        owner_session_id: Option<String>,
+    },
+}
+
 /// Internal state for close token ownership.
 #[derive(Debug)]
 struct CloseTokenState {
-    token: Mutex<Option<String>>,
+    token: Mutex<Option<CloseTokenLease>>,
     nonce: AtomicU64,
 }
 
@@ -37,7 +61,7 @@ impl CloseTokenState {
         }
     }
 
-    fn lock_token(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+    fn lock_token(&self) -> std::sync::MutexGuard<'_, Option<CloseTokenLease>> {
         match self.token.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -54,21 +78,53 @@ impl CloseTokenState {
         format!("{now:x}-{pid:x}-{nonce:x}")
     }
 
-    fn issue_if_none(&self) -> Option<String> {
+    fn issue_for_session(&self, session_id: &str) -> Result<CloseTokenGrant, String> {
         let mut guard = self.lock_token();
-        if guard.is_some() {
-            return None;
+        if let Some(lease) = guard.as_ref() {
+            if lease.owner_session_id == session_id {
+                return Ok(CloseTokenGrant {
+                    token: lease.token.clone(),
+                    reused: true,
+                    owner_session_id: lease.owner_session_id.clone(),
+                });
+            }
+            return Err(lease.owner_session_id.clone());
         }
+
         let token = self.generate_token();
-        *guard = Some(token.clone());
-        Some(token)
+        let lease = CloseTokenLease {
+            token: token.clone(),
+            owner_session_id: session_id.to_string(),
+        };
+        *guard = Some(lease.clone());
+        Ok(CloseTokenGrant {
+            token,
+            reused: false,
+            owner_session_id: lease.owner_session_id,
+        })
     }
 
-    fn matches(&self, token: Option<&str>) -> bool {
+    fn authorize_close(
+        &self,
+        session_id: &str,
+        token: Option<&str>,
+        force: bool,
+    ) -> CloseAuthorization {
         let guard = self.lock_token();
-        match (guard.as_deref(), token) {
-            (Some(expected), Some(provided)) => expected == provided,
-            _ => false,
+        let Some(lease) = guard.as_ref() else {
+            return CloseAuthorization::Granted;
+        };
+
+        if token == Some(lease.token.as_str()) || lease.owner_session_id == session_id {
+            CloseAuthorization::Granted
+        } else if force {
+            CloseAuthorization::GrantedByOverride {
+                previous_owner_session_id: Some(lease.owner_session_id.clone()),
+            }
+        } else {
+            CloseAuthorization::Denied {
+                owner_session_id: Some(lease.owner_session_id.clone()),
+            }
         }
     }
 
@@ -94,12 +150,20 @@ impl IdaWorker {
         }
     }
 
-    pub(crate) fn issue_close_token(&self) -> Option<String> {
-        self.close_token.issue_if_none()
+    pub(crate) fn issue_close_token_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<CloseTokenGrant, String> {
+        self.close_token.issue_for_session(session_id)
     }
 
-    pub(crate) fn close_token_matches(&self, token: Option<&str>) -> bool {
-        self.close_token.matches(token)
+    pub(crate) fn authorize_close(
+        &self,
+        session_id: &str,
+        token: Option<&str>,
+        force: bool,
+    ) -> CloseAuthorization {
+        self.close_token.authorize_close(session_id, token, force)
     }
 
     pub(crate) fn clear_close_token(&self) {
@@ -1107,5 +1171,72 @@ impl IdaWorker {
             resp: tx,
         })?;
         rx.await?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CloseAuthorization, IdaWorker};
+    use std::sync::mpsc;
+
+    fn test_worker() -> IdaWorker {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        IdaWorker::new(tx)
+    }
+
+    #[test]
+    fn close_token_is_reused_for_same_session() {
+        let worker = test_worker();
+        let first = worker
+            .issue_close_token_for_session("session-a")
+            .expect("first issue should succeed");
+        let second = worker
+            .issue_close_token_for_session("session-a")
+            .expect("same session should reuse token");
+
+        assert_eq!(first.token, second.token);
+        assert!(!first.reused);
+        assert!(second.reused);
+    }
+
+    #[test]
+    fn close_token_is_denied_for_different_session() {
+        let worker = test_worker();
+        worker
+            .issue_close_token_for_session("session-a")
+            .expect("first issue should succeed");
+
+        let denied = worker
+            .issue_close_token_for_session("session-b")
+            .expect_err("different session should be denied");
+        assert_eq!(denied, "session-a");
+    }
+
+    #[test]
+    fn owner_session_can_close_without_token() {
+        let worker = test_worker();
+        worker
+            .issue_close_token_for_session("session-a")
+            .expect("first issue should succeed");
+
+        assert_eq!(
+            worker.authorize_close("session-a", None, false),
+            CloseAuthorization::Granted
+        );
+    }
+
+    #[test]
+    fn force_close_can_override_other_session() {
+        let worker = test_worker();
+        worker
+            .issue_close_token_for_session("session-a")
+            .expect("first issue should succeed");
+
+        assert_eq!(
+            worker.authorize_close("session-b", None, true),
+            CloseAuthorization::GrantedByOverride {
+                previous_owner_session_id: Some("session-a".to_string()),
+            }
+        );
     }
 }

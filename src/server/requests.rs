@@ -67,6 +67,11 @@ pub struct CloseIdbRequest {
     #[schemars(description = "Ownership token returned by open_idb (required for HTTP/SSE).")]
     #[serde(alias = "close_token", alias = "owner_token")]
     pub token: Option<String>,
+    #[schemars(
+        description = "Force-close the database even if the original HTTP owner session or token was lost. Use only for recovery."
+    )]
+    #[serde(alias = "recover", alias = "override_owner")]
+    pub force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
