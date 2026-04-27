@@ -126,20 +126,6 @@ if ! grep -q 'function_count' "$open_resp_file"; then
   exit 1
 fi
 
-if ! grep -q 'progressToken' "$open_resp_file"; then
-  echo "no progress token observed in open_idb response stream" >&2
-  cat "$open_resp_file" >&2
-  [[ -s "$server_log" ]] && cat "$server_log" >&2
-  exit 1
-fi
-
-if ! grep -q 'notifications/progress' "$open_resp_file"; then
-  echo "no progress notification observed in open_idb response stream" >&2
-  cat "$open_resp_file" >&2
-  [[ -s "$server_log" ]] && cat "$server_log" >&2
-  exit 1
-fi
-
 close_token="$(sed -n 's/.*\\\"close_token\\\"[[:space:]]*:[[:space:]]*\\\"\\([^\\\"]*\\)\\\".*/\\1/p' "$open_resp_file")"
 if [[ -n "$close_token" ]]; then
   close_args="{\"close_token\":\"$close_token\"}"

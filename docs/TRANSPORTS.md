@@ -9,6 +9,17 @@
 ./target/release/ida-mcp
 ```
 
+### Progress observability
+
+The server does not emit MCP `notifications/progress` messages. On stdio they
+race with the response on fast tools (under ~100 ms): Node-based clients
+(e.g. Claude Code) deliver coalesced messages in a single `data` event and
+process the response — which retires the `progressToken` — before the
+notification handlers run, dropping the transport with "unknown progress
+token". Phase progress is recorded server-side instead and surfaced via the
+`recent_operations` tool. Long-running work (e.g. `analyze_funcs`) should be
+launched through the task system (`enqueue_task` + poll `task_status`).
+
 ## Streamable HTTP (multi-client)
 
 - Supports multiple clients over HTTP.

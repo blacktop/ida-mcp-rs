@@ -17,10 +17,7 @@ use crate::server::operation::{
 use crate::tool_registry::{self, ToolCategory};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
-    model::{
-        CallToolResult, Content, ProgressNotificationParam, ServerCapabilities, ServerInfo, Tool,
-        ToolAnnotations,
-    },
+    model::{CallToolResult, Content, ServerCapabilities, ServerInfo, Tool, ToolAnnotations},
     schemars::{schema_for, JsonSchema},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
@@ -376,34 +373,6 @@ impl IdaMcpServer {
         next_operation_id(self.operation_nonce.as_ref())
     }
 
-    fn spawn_progress_bridge(
-        &self,
-        op_id: String,
-        ctx: &RequestContext<RoleServer>,
-        mut progress_rx: ProgressReceiver,
-    ) -> tokio::task::JoinHandle<()> {
-        let peer = ctx.peer.clone();
-        let progress_token = ctx.meta.get_progress_token();
-        let registry = self.operation_registry.clone();
-        tokio::spawn(async move {
-            while let Some(update) = progress_rx.recv().await {
-                registry.record_progress(&op_id, update.phase, update.message.clone());
-                if let Some(token) = progress_token.clone() {
-                    let mut notification = ProgressNotificationParam::new(token, update.progress);
-                    if let Some(total) = update.total {
-                        notification = notification.with_total(total);
-                    }
-                    if !update.message.is_empty() {
-                        notification = notification.with_message(update.message.clone());
-                    }
-                    if let Err(err) = peer.notify_progress(notification).await {
-                        warn!(op_id = %op_id, error = %err, "failed to send progress notification");
-                    }
-                }
-            }
-        })
-    }
-
     async fn run_foreground_operation<T, F, Fut>(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -427,8 +396,21 @@ impl IdaMcpServer {
         self.operation_registry
             .start(op_id.clone(), tool_name, target_summary);
 
-        let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
-        let progress_task = self.spawn_progress_bridge(op_id.clone(), ctx, progress_rx);
+        let (progress_tx, mut progress_rx): (ProgressSender, ProgressReceiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        // No `notifications/progress` are emitted: on stdio they race with the
+        // response when fast tools coalesce into a single Node stdin `data`
+        // event, dropping the Claude Code transport with "unknown progress
+        // token". Phases remain observable via `recent_operations`.
+        let drain_task = tokio::spawn({
+            let registry = self.operation_registry.clone();
+            let op_id = op_id.clone();
+            async move {
+                while let Some(update) = progress_rx.recv().await {
+                    registry.record_progress(&op_id, update.phase, update.message);
+                }
+            }
+        });
         let worker_cancel = tokio_util::sync::CancellationToken::new();
         let timeout = timeout_secs
             .unwrap_or(default_timeout_secs)
@@ -453,7 +435,7 @@ impl IdaMcpServer {
 
         match outcome {
             Outcome::Finished(result) => {
-                let _ = progress_task.await;
+                let _ = drain_task.await;
                 match result {
                     Ok(value) => {
                         let _ = self.operation_registry.finish_completed(
@@ -487,8 +469,8 @@ impl IdaMcpServer {
                 }
             }
             Outcome::TimedOut(timeout_secs) => {
-                progress_task.abort();
-                let _ = progress_task.await;
+                drain_task.abort();
+                let _ = drain_task.await;
                 let snapshot = self
                     .operation_registry
                     .finish_timed_out(
@@ -511,8 +493,8 @@ impl IdaMcpServer {
                 })
             }
             Outcome::Cancelled => {
-                progress_task.abort();
-                let _ = progress_task.await;
+                drain_task.abort();
+                let _ = drain_task.await;
                 let snapshot = self
                     .operation_registry
                     .finish_cancelled(&op_id, format!("{tool_name} cancelled by client"))
@@ -771,8 +753,8 @@ impl IdaMcpServer {
         its DWARF debug info is loaded automatically. \
         Set load_debug_info=true to force loading external debug info after open \
         (optionally specify debug_info_path). \
-        open_idb accepts timeout_secs (default 300s, max 600s) and emits progress \
-        notifications when the client requested a progress token. \
+        open_idb accepts timeout_secs (default 300s, max 600s). \
+        Phase transitions are observable via recent_operations. \
         Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
         In HTTP/SSE mode, open_idb returns a close_token that must be provided to close_idb. \
         For raw binaries, the database opens quickly but auto-analysis does NOT run by default — \
@@ -2714,7 +2696,7 @@ impl IdaMcpServer {
     #[tool(description = "Run IDA auto-analysis and wait for completion. \
         Set background=true for large binaries to return a task_id immediately and poll \
         task_status — the IDA worker thread runs auto_wait() while task_status stays responsive. \
-        Emits progress notifications when the client requested a progress token (foreground only).")]
+        Phase transitions are observable via recent_operations.")]
     async fn analyze_funcs(
         &self,
         ctx: RequestContext<RoleServer>,
@@ -3249,7 +3231,7 @@ impl IdaMcpServer {
         Has full access to all ida_* modules, idc, idautils. \
         stdout and stderr are captured and returned. \
         Provide either 'code' (inline Python) or 'file' (path to a .py file), not both. \
-        run_script emits progress notifications when the client requested a progress token. \
+        Phase transitions are observable via recent_operations. \
         Use this for custom analysis that goes beyond the built-in tools. \
         API reference: https://python.docs.hex-rays.com"
     )]
