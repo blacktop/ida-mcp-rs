@@ -69,6 +69,12 @@ fn unpacked_id0_path(path: &Path) -> Option<PathBuf> {
     None
 }
 
+fn idb_path_for_raw_binary(path: &Path) -> PathBuf {
+    let mut raw_idb = OsString::from(path.as_os_str());
+    raw_idb.push(".i64");
+    PathBuf::from(raw_idb)
+}
+
 fn base_input_path_for_database(path: &Path) -> PathBuf {
     let mut base = path.to_path_buf();
     if let Some(ext) = base.extension().and_then(|e| e.to_str()) {
@@ -153,7 +159,7 @@ pub fn handle_open(
     let mut dsym_path = None;
     let mut should_load_dsym = false;
     if !is_idb {
-        let out_path = expanded.with_extension("i64");
+        let out_path = idb_path_for_raw_binary(&expanded);
         should_load_dsym = !out_path.exists();
         if should_load_dsym {
             dsym_path = dsym_path_for_binary(&expanded);
@@ -416,7 +422,8 @@ mod tests {
     use std::path::Path;
 
     use crate::ida::handlers::database::{
-        base_input_path_for_database, database_paths_match, init_database_args,
+        base_input_path_for_database, database_paths_match, idb_path_for_raw_binary,
+        init_database_args,
     };
 
     #[test]
@@ -439,6 +446,22 @@ mod tests {
         assert!(database_paths_match(unpacked, legacy));
         assert!(database_paths_match(packed_upper, unpacked));
         assert!(!database_paths_match(packed, legacy));
+    }
+
+    #[test]
+    fn idb_path_for_raw_binary_appends_i64_to_full_path() {
+        assert_eq!(
+            idb_path_for_raw_binary(Path::new("/tmp/sample")),
+            Path::new("/tmp/sample.i64")
+        );
+        assert_eq!(
+            idb_path_for_raw_binary(Path::new("/tmp/com.apple.driver.AppleDAPF")),
+            Path::new("/tmp/com.apple.driver.AppleDAPF.i64")
+        );
+        assert_eq!(
+            idb_path_for_raw_binary(Path::new("/tmp/kernelcache.release.iphone")),
+            Path::new("/tmp/kernelcache.release.iphone.i64")
+        );
     }
 
     #[test]

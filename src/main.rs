@@ -21,8 +21,9 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpService,
 };
 use rmcp::ServiceExt;
+use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -491,7 +492,7 @@ fn open_db_for_probe(path: &PathBuf, args: &ProbeArgs) -> Result<IDB, idalib::ID
         let out_path = if let Some(out) = args.idb_out.as_deref() {
             PathBuf::from(out)
         } else {
-            path.with_extension("i64")
+            idb_path_for_raw_binary(path)
         };
         info!(
             "Opening raw binary with auto-analysis (idb_out={})",
@@ -502,6 +503,12 @@ fn open_db_for_probe(path: &PathBuf, args: &ProbeArgs) -> Result<IDB, idalib::ID
         }
         opts.idb(&out_path).save(true).open(path)
     }
+}
+
+fn idb_path_for_raw_binary(path: &Path) -> PathBuf {
+    let mut raw_idb = OsString::from(path.as_os_str());
+    raw_idb.push(".i64");
+    PathBuf::from(raw_idb)
 }
 
 fn probe_init_database_args() -> Vec<String> {
