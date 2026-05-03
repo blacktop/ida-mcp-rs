@@ -26,6 +26,7 @@ pub struct HttpServerOptions {
 /// sessions when HTTP connections drop silently (e.g. HTTP/2 `RST_STREAM`),
 /// so prefer a generous positive value over disabling.
 pub fn build_session_manager(session_keep_alive_secs: u64) -> Arc<LocalSessionManager> {
+    // rmcp 1.5 exposes no builder for SessionConfig; mutate the public field.
     let mut manager = LocalSessionManager::default();
     manager.session_config.keep_alive = if session_keep_alive_secs == 0 {
         None
