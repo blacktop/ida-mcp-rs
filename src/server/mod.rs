@@ -133,14 +133,7 @@ impl IdaMcpServer {
     }
 
     fn close_hint(&self) -> &'static str {
-        match self.mode {
-            ServerMode::Stdio => {
-                "Call close_idb when done to release locks for other sessions."
-            }
-            ServerMode::Http => {
-                "In multi-client (HTTP/SSE) mode, close_idb accepts the close_token returned by open_idb. The owning session can also close without re-sending the token, and close_idb(force=true) can recover from a lost session."
-            }
-        }
+        close_hint_for(self.mode)
     }
 
     fn http_close_grant(&self) -> Option<Result<CloseTokenGrant, String>> {
@@ -153,40 +146,7 @@ impl IdaMcpServer {
         map: &mut serde_json::Map<String, Value>,
         grant: Option<Result<CloseTokenGrant, String>>,
     ) {
-        match grant {
-            Some(Ok(grant)) => {
-                map.insert("close_hint".to_string(), json!(self.close_hint()));
-                map.insert(
-                    "close_owner_session_id".to_string(),
-                    json!(grant.owner_session_id),
-                );
-                map.insert("close_token".to_string(), json!(grant.token));
-                if grant.reused {
-                    map.insert("close_token_reused".to_string(), json!(true));
-                }
-            }
-            Some(Err(owner_session_id)) => {
-                map.insert(
-                    "close_hint".to_string(),
-                    json!(format!(
-                        "The open database is currently owned by HTTP session {owner_session_id}. Reuse that session to call close_idb, or call close_idb(force=true) to recover if the owning session was lost."
-                    )),
-                );
-                map.insert(
-                    "close_owner_session_id".to_string(),
-                    json!(owner_session_id),
-                );
-                map.insert(
-                    "close_recovery_hint".to_string(),
-                    json!(
-                        "If the original MCP HTTP session was lost, call close_idb(force=true) from a trusted recovery session."
-                    ),
-                );
-            }
-            None => {
-                map.insert("close_hint".to_string(), json!(self.close_hint()));
-            }
-        }
+        apply_close_metadata(map, grant, self.close_hint());
     }
 
     fn instructions(&self) -> String {
@@ -785,35 +745,62 @@ impl IdaMcpServer {
             if !frameworks.is_empty() {
                 map.insert("frameworks_loaded".to_string(), json!(frameworks));
             }
-            match close_token {
-                Some(Ok(grant)) => {
-                    map.insert(
-                        "close_owner_session_id".to_string(),
-                        json!(grant.owner_session_id),
-                    );
-                    map.insert("close_token".to_string(), json!(grant.token));
-                    if grant.reused {
-                        map.insert("close_token_reused".to_string(), json!(true));
-                    }
-                }
-                Some(Err(owner_session_id)) => {
-                    map.insert(
-                        "close_owner_session_id".to_string(),
-                        json!(owner_session_id),
-                    );
-                    map.insert(
-                        "close_recovery_hint".to_string(),
-                        json!(
-                            "If the original MCP HTTP session was lost, call close_idb(force=true) from a trusted recovery session."
-                        ),
-                    );
-                }
-                None => {}
-            }
+            apply_close_metadata(map, close_token, close_hint_for(mode));
         }
 
         info!(task_id = %task_id, "DSC background task completed");
         registry.complete(&task_id, value);
+    }
+}
+
+fn close_hint_for(mode: ServerMode) -> &'static str {
+    match mode {
+        ServerMode::Stdio => "Call close_idb when done to release locks for other sessions.",
+        ServerMode::Http => "In multi-client (HTTP/SSE) mode, close_idb accepts the close_token returned by open_idb. The owning session can also close without re-sending the token, and close_idb(force=true) can recover from a lost session.",
+    }
+}
+
+/// Insert close-ownership metadata onto a tool result, identical for foreground
+/// `open_idb` and the DSC background task so clients see one shape via both
+/// paths.
+fn apply_close_metadata(
+    map: &mut serde_json::Map<String, Value>,
+    grant: Option<Result<CloseTokenGrant, String>>,
+    close_hint: &str,
+) {
+    match grant {
+        Some(Ok(grant)) => {
+            map.insert("close_hint".to_string(), json!(close_hint));
+            map.insert(
+                "close_owner_session_id".to_string(),
+                json!(grant.owner_session_id),
+            );
+            map.insert("close_token".to_string(), json!(grant.token));
+            if grant.reused {
+                map.insert("close_token_reused".to_string(), json!(true));
+            }
+        }
+        Some(Err(owner_session_id)) => {
+            map.insert(
+                "close_hint".to_string(),
+                json!(format!(
+                    "The open database is currently owned by HTTP session {owner_session_id}. Reuse that session to call close_idb, or call close_idb(force=true) to recover if the owning session was lost."
+                )),
+            );
+            map.insert(
+                "close_owner_session_id".to_string(),
+                json!(owner_session_id),
+            );
+            map.insert(
+                "close_recovery_hint".to_string(),
+                json!(
+                    "If the original MCP HTTP session was lost, call close_idb(force=true) from a trusted recovery session."
+                ),
+            );
+        }
+        None => {
+            map.insert("close_hint".to_string(), json!(close_hint));
+        }
     }
 }
 

@@ -38,12 +38,8 @@ pub(crate) struct CloseTokenGrant {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CloseAuthorization {
     Granted,
-    GrantedByOverride {
-        previous_owner_session_id: Option<String>,
-    },
-    Denied {
-        owner_session_id: Option<String>,
-    },
+    GrantedByOverride { previous_owner_session_id: String },
+    Denied { owner_session_id: String },
 }
 
 /// Internal state for close token ownership.
@@ -119,11 +115,11 @@ impl CloseTokenState {
             CloseAuthorization::Granted
         } else if force {
             CloseAuthorization::GrantedByOverride {
-                previous_owner_session_id: Some(lease.owner_session_id.clone()),
+                previous_owner_session_id: lease.owner_session_id.clone(),
             }
         } else {
             CloseAuthorization::Denied {
-                owner_session_id: Some(lease.owner_session_id.clone()),
+                owner_session_id: lease.owner_session_id.clone(),
             }
         }
     }
@@ -1235,8 +1231,30 @@ mod tests {
         assert_eq!(
             worker.authorize_close("session-b", None, true),
             CloseAuthorization::GrantedByOverride {
-                previous_owner_session_id: Some("session-a".to_string()),
+                previous_owner_session_id: "session-a".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn token_grants_close_from_any_session() {
+        let worker = test_worker();
+        let grant = worker
+            .issue_close_token_for_session("session-a")
+            .expect("first issue should succeed");
+
+        assert_eq!(
+            worker.authorize_close("session-b", Some(&grant.token), false),
+            CloseAuthorization::Granted
+        );
+    }
+
+    #[test]
+    fn close_is_granted_when_no_lease_exists() {
+        let worker = test_worker();
+        assert_eq!(
+            worker.authorize_close("session-x", None, false),
+            CloseAuthorization::Granted
         );
     }
 }
