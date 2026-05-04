@@ -3,6 +3,7 @@
 use crate::error::ToolError;
 use crate::ida::handlers::parse_address_str;
 use crate::ida::types::{BasicBlockInfo, FunctionInfo};
+use idalib::insn::OperandType;
 use idalib::xref::{CodeRef, XRefQuery, XRefType};
 use idalib::{Address, IDB};
 use serde_json::{json, Value};
@@ -83,13 +84,29 @@ fn add_callee(db: &IDB, callees: &mut Vec<FunctionInfo>, seen: &mut HashSet<u64>
     }
 }
 
+/// Returns true for operand kinds that encode a direct branch target
+/// (e.g. `call sub_xxx`). `Mem` and `Displ` also expose an `address()`
+/// but represent indirect calls (`call qword ptr [rip+...]`,
+/// `call qword ptr [reg+disp]`); their `address()` is a load site, not
+/// a callee, so we must not treat them as direct targets.
+fn is_direct_branch_operand(kind: OperandType) -> bool {
+    matches!(kind, OperandType::Near | OperandType::Far)
+}
+
 fn direct_call_target(db: &IDB, addr: Address) -> Option<Address> {
     let insn = db.insn_at(addr)?;
     if !insn.is_call() {
         return None;
     }
 
-    (0..insn.operand_count()).find_map(|idx| insn.operand(idx).and_then(|op| op.address()))
+    (0..insn.operand_count()).find_map(|idx| {
+        let op = insn.operand(idx)?;
+        if is_direct_branch_operand(op.type_()) {
+            op.address()
+        } else {
+            None
+        }
+    })
 }
 
 pub fn handle_callees(idb: &Option<IDB>, addr: u64) -> Result<Vec<FunctionInfo>, ToolError> {
@@ -355,4 +372,33 @@ pub fn handle_callgraph(
         .collect();
 
     Ok(json!({ "nodes": nodes_vec, "edges": edges_vec }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_direct_branch_operand;
+    use idalib::insn::OperandType;
+
+    #[test]
+    fn direct_branch_operands_accept_near_and_far_only() {
+        assert!(is_direct_branch_operand(OperandType::Near));
+        assert!(is_direct_branch_operand(OperandType::Far));
+    }
+
+    #[test]
+    fn indirect_call_operands_are_rejected() {
+        // Mem  -> call qword ptr [abs_addr]
+        // Displ -> call qword ptr [reg+disp] (e.g. RIP-relative on x86-64)
+        // Phrase -> call qword ptr [reg]
+        // These all have an address() but it's a load site, not a callee.
+        assert!(!is_direct_branch_operand(OperandType::Mem));
+        assert!(!is_direct_branch_operand(OperandType::Displ));
+        assert!(!is_direct_branch_operand(OperandType::Phrase));
+    }
+
+    #[test]
+    fn non_address_operands_are_rejected() {
+        assert!(!is_direct_branch_operand(OperandType::Reg));
+        assert!(!is_direct_branch_operand(OperandType::Imm));
+    }
 }
