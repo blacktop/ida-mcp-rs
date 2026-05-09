@@ -144,6 +144,30 @@ if echo "$names" | grep -q '^run_script$'; then
 fi
 echo "   ✓ env vars mirror flags"
 
+# --- Phase B2: env-var mirror also applies to the default stdio command ---
+# Most installed-client configs run `ida-mcp` directly, relying on the default
+# stdio server path instead of spelling out `ida-mcp serve`.
+echo "── Phase B2: env-var mirror on default command (no explicit serve) ──"
+cleanup_stale_pid
+pid=
+rm -f "$fifo"
+mkfifo "$fifo"
+: > "$log"
+IDA_MCP_TOOLSETS=decompile "$BIN" < "$fifo" > "$log" 2>&1 &
+pid=$!
+exec 3>"$fifo"
+initialize
+send '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+list_resp=$(wait_response 2 10)
+names=$(echo "$list_resp" | jq -r '.result.tools[].name' | sort)
+echo "$names" | grep -q '^decompile$' || { echo "FAIL: default-command env should expose decompile"; exit 1; }
+echo "$names" | grep -q '^pseudocode_at$' || { echo "FAIL: default-command env should expose pseudocode_at"; exit 1; }
+if echo "$names" | grep -q '^open_idb$'; then
+  echo "FAIL: default-command IDA_MCP_TOOLSETS=decompile should not expose open_idb" >&2
+  exit 1
+fi
+echo "   ✓ env vars apply when running ida-mcp without explicit serve"
+
 # --- Phase C: flags override env vars ---
 # Env says 'core' (12 tools); flag forces 'decompile' (smaller set).
 # The decompile category should win and core tools should NOT appear.

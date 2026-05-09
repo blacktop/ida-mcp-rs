@@ -1216,7 +1216,7 @@ impl IdaMcpServer {
 
         // If query specified, search for matching tools
         if let Some(query) = &req.query {
-            let results = tool_registry::search_tools(query, limit.saturating_mul(2));
+            let results = tool_registry::search_tools(query, tool_registry::all_tools().count());
             let tools: Vec<_> = results
                 .iter()
                 .filter(|(t, _)| filter.is_enabled(t.name))
@@ -1260,9 +1260,15 @@ impl IdaMcpServer {
             })
             .collect();
 
+        let hint = if filtering_active {
+            "Use tool_catalog(category='...') to list enabled tools in a category, or tool_catalog(query='...') to search enabled tools. tools/list includes only tools enabled by the current filter."
+        } else {
+            "Use tool_catalog(category='...') to list tools in a category, or tool_catalog(query='...') to search. tools/list already includes all tools."
+        };
+
         let mut payload = json!({
             "categories": categories,
-            "hint": "Use tool_catalog(category='...') to list tools in a category, or tool_catalog(query='...') to search. tools/list already includes all tools."
+            "hint": hint
         });
         if filtering_active {
             payload["filtering_active"] = json!(true);

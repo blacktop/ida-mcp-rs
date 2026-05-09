@@ -81,6 +81,15 @@ struct ToolFilterArgs {
 }
 
 impl ToolFilterArgs {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            toolsets: env_csv("IDA_MCP_TOOLSETS")?,
+            tools: env_csv("IDA_MCP_TOOLS")?,
+            exclude_tools: env_csv("IDA_MCP_EXCLUDE_TOOLS")?,
+            read_only: env_bool("IDA_MCP_READ_ONLY")?,
+        })
+    }
+
     fn build(&self) -> Result<ToolFilter, String> {
         ToolFilter::from_inputs(
             &self.toolsets,
@@ -89,6 +98,35 @@ impl ToolFilterArgs {
             self.read_only,
         )
         .map_err(|e| e.to_string())
+    }
+}
+
+fn env_csv(name: &str) -> Result<Vec<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()),
+        Err(std::env::VarError::NotPresent) => Ok(Vec::new()),
+        Err(err) => Err(format!("failed to read {name}: {err}")),
+    }
+}
+
+fn env_bool(name: &str) -> Result<bool, String> {
+    let value = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(false),
+        Err(err) => return Err(format!("failed to read {name}: {err}")),
+    };
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        _ => Err(format!(
+            "{name} must be boolean (true/false/1/0), got '{value}'"
+        )),
     }
 }
 
@@ -175,7 +213,14 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Serve(ServeArgs::default())) {
+    let command = match cli.command {
+        Some(command) => command,
+        None => Command::Serve(ServeArgs {
+            filter: ToolFilterArgs::from_env()
+                .map_err(|e| anyhow::anyhow!("invalid tool filter env: {e}"))?,
+        }),
+    };
+    match command {
         Command::Serve(args) => run_server(args),
         Command::ServeHttp(args) => run_server_http(args),
         Command::Probe(args) => run_probe(args),
