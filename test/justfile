@@ -254,6 +254,24 @@ test-callees-indirect:
         bash ./stdio_callees_indirect.sh
     echo "✅ callees-indirect test passed"
 
+# Verify server-side tool filtering at the protocol level (Phase 2a)
+test-tool-filter:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running stdio tool-filter test..."
+    MCP_STDIO_BIN="{{ server_bin }}" RUST_LOG="{{ rust_log }}" \
+        bash ./stdio_tool_filter.sh
+    echo "✅ tool-filter test passed"
+
 # Measure tools/list payload size; useful for regression-watching
 # tool description bloat (issue: #11364). Set FAIL_OVER_CHARS=N to fail
 # the recipe when the total exceeds N (CI guard); leave unset to just print.

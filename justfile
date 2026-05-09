@@ -172,6 +172,10 @@ test-callees-indirect: build
 measure-tools: build
     cd test && SERVER_BIN=../target/debug/ida-mcp just measure-tools
 
+# Verify server-side tool filtering (--toolsets / --tools / --exclude-tools / --read-only + env mirrors)
+test-tool-filter: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-tool-filter
+
 # Run cargo unit tests
 cargo-test:
     RUST_BACKTRACE=1 cargo test

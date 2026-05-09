@@ -5,6 +5,7 @@ pub mod http_config;
 mod operation;
 mod requests;
 pub mod task;
+pub mod tool_filter;
 
 pub use requests::*;
 
@@ -40,6 +41,9 @@ pub struct IdaMcpServer {
     /// Unique ID for this server instance. Changes on restart, making silent
     /// auto-restarts (e.g. after a Hex-Rays C++ crash) visible to agents.
     session_id: String,
+    /// Server-side tool filter (applied to tools/list, tools/call, and
+    /// surfaced via tool_catalog / tool_help).
+    filter: Arc<tool_filter::ToolFilter>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -118,8 +122,25 @@ enum ForegroundOperationError {
 
 impl IdaMcpServer {
     pub fn new(worker: Arc<IdaWorker>, mode: ServerMode) -> Self {
+        Self::with_filter(
+            worker,
+            mode,
+            Arc::new(tool_filter::ToolFilter::unrestricted()),
+        )
+    }
+
+    pub fn with_filter(
+        worker: Arc<IdaWorker>,
+        mode: ServerMode,
+        filter: Arc<tool_filter::ToolFilter>,
+    ) -> Self {
         let session_id = uuid::Uuid::new_v4().to_string();
-        info!(session_id = %session_id, "Creating IDA MCP server");
+        info!(
+            session_id = %session_id,
+            tool_filter_active = filter.is_active(),
+            enabled_tools = filter.enabled_count(),
+            "Creating IDA MCP server"
+        );
         let call_router = Self::tool_router();
         Self {
             worker,
@@ -129,7 +150,12 @@ impl IdaMcpServer {
             operation_registry: OperationRegistry::new(),
             operation_nonce: Arc::new(AtomicU64::new(0)),
             session_id,
+            filter,
         }
+    }
+
+    pub fn filter(&self) -> &Arc<tool_filter::ToolFilter> {
+        &self.filter
     }
 
     fn close_hint(&self) -> &'static str {
@@ -1155,11 +1181,14 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: tool_catalog");
         let limit = req.limit.unwrap_or(7).min(15);
+        let filter = self.filter.clone();
+        let filtering_active = filter.is_active();
 
         // If category specified, list tools in that category
         if let Some(cat_str) = &req.category {
             if let Ok(cat) = cat_str.parse::<ToolCategory>() {
                 let tools: Vec<_> = tool_registry::tools_by_category(cat)
+                    .filter(|t| filter.is_enabled(t.name))
                     .take(limit)
                     .map(|t| {
                         json!({
@@ -1170,23 +1199,28 @@ impl IdaMcpServer {
                     })
                     .collect();
 
+                let mut payload = json!({
+                    "category": cat.as_str(),
+                    "category_description": cat.description(),
+                    "tools": tools,
+                    "hint": "Use tool_help(name) for full documentation and examples"
+                });
+                if filtering_active {
+                    payload["filtering_active"] = json!(true);
+                }
                 return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&json!({
-                        "category": cat.as_str(),
-                        "category_description": cat.description(),
-                        "tools": tools,
-                        "hint": "Use tool_help(name) for full documentation and examples"
-                    }))
-                    .unwrap(),
+                    serde_json::to_string_pretty(&payload).unwrap(),
                 )]));
             }
         }
 
         // If query specified, search for matching tools
         if let Some(query) = &req.query {
-            let results = tool_registry::search_tools(query, limit);
+            let results = tool_registry::search_tools(query, limit.saturating_mul(2));
             let tools: Vec<_> = results
                 .iter()
+                .filter(|(t, _)| filter.is_enabled(t.name))
+                .take(limit)
                 .map(|(t, keywords)| {
                     json!({
                         "name": t.name,
@@ -1197,21 +1231,27 @@ impl IdaMcpServer {
                 })
                 .collect();
 
+            let mut payload = json!({
+                "query": query,
+                "tools": tools,
+                "hint": "Use tool_help(name) for full documentation and examples"
+            });
+            if filtering_active {
+                payload["filtering_active"] = json!(true);
+            }
             return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({
-                    "query": query,
-                    "tools": tools,
-                    "hint": "Use tool_help(name) for full documentation and examples"
-                }))
-                .unwrap(),
+                serde_json::to_string_pretty(&payload).unwrap(),
             )]));
         }
 
-        // No query or category - list all categories
+        // No query or category - list all categories. Counts reflect enabled
+        // tools so users see exactly what's available under the active filter.
         let categories: Vec<_> = ToolCategory::all()
             .iter()
             .map(|c| {
-                let count = tool_registry::tools_by_category(*c).count();
+                let count = tool_registry::tools_by_category(*c)
+                    .filter(|t| filter.is_enabled(t.name))
+                    .count();
                 json!({
                     "category": c.as_str(),
                     "description": c.description(),
@@ -1220,12 +1260,17 @@ impl IdaMcpServer {
             })
             .collect();
 
+        let mut payload = json!({
+            "categories": categories,
+            "hint": "Use tool_catalog(category='...') to list tools in a category, or tool_catalog(query='...') to search. tools/list already includes all tools."
+        });
+        if filtering_active {
+            payload["filtering_active"] = json!(true);
+            payload["enabled_tool_count"] = json!(filter.enabled_count());
+        }
+
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json!({
-                "categories": categories,
-                "hint": "Use tool_catalog(category='...') to list tools in a category, or tool_catalog(query='...') to search. tools/list already includes all tools."
-            }))
-            .unwrap(),
+            serde_json::to_string_pretty(&payload).unwrap(),
         )]))
     }
 
@@ -1238,6 +1283,26 @@ impl IdaMcpServer {
         Parameters(req): Parameters<ToolHelpRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: tool_help for {}", req.name);
+
+        // If the tool exists in the registry but is filter-disabled, do not
+        // leak its schema as available — return a clear disabled message.
+        if self.filter.is_active()
+            && tool_registry::get_tool(&req.name).is_some()
+            && !self.filter.is_enabled(&req.name)
+        {
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({
+                    "error": format!(
+                        "tool '{}' is disabled by current filter \
+                         (--toolsets/--tools/--exclude-tools/--read-only)",
+                        req.name
+                    ),
+                    "filtering_active": true,
+                    "hint": "call tool_catalog to see enabled tools",
+                }))
+                .unwrap(),
+            )]));
+        }
 
         if let Some(tool) = tool_registry::get_tool(&req.name) {
             let params = tool_params_schema(&req.name);
@@ -3986,12 +4051,31 @@ impl ServerHandler for IdaMcpServer {
 /// Some MCP clients (like Claude Desktop) choke on the JSON Schema `$schema` field.
 /// This wrapper intercepts `list_tools` to remove these fields while delegating
 /// all other methods to the inner server.
-pub struct SanitizedIdaServer<S>(pub S);
+pub struct SanitizedIdaServer<S> {
+    inner: S,
+    filter: Arc<tool_filter::ToolFilter>,
+}
+
+impl<S> SanitizedIdaServer<S> {
+    /// Wrap an inner server with no filtering. Convenience for paths
+    /// that don't read CLI/env (e.g. tests).
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            filter: Arc::new(tool_filter::ToolFilter::unrestricted()),
+        }
+    }
+
+    /// Wrap with an explicit filter (built from CLI/env at startup).
+    pub fn with_filter(inner: S, filter: Arc<tool_filter::ToolFilter>) -> Self {
+        Self { inner, filter }
+    }
+}
 
 impl<S> std::ops::Deref for SanitizedIdaServer<S> {
     type Target = S;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
@@ -4054,13 +4138,23 @@ fn annotate_task_support(tool: Tool) -> Tool {
     apply_tool_metadata(tool)
 }
 
+/// Error message for a filter-rejected tool/call. Centralized so the
+/// dispatch and tool_help paths return identical wording.
+fn disabled_tool_message(name: &str) -> String {
+    format!(
+        "tool '{name}' is disabled by current filter \
+         (--toolsets/--tools/--exclude-tools/--read-only); \
+         call tool_catalog to see enabled tools"
+    )
+}
+
 impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
     async fn initialize(
         &self,
         params: InitializeRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        self.0.initialize(params, ctx).await
+        self.inner.initialize(params, ctx).await
     }
 
     async fn list_tools(
@@ -4068,7 +4162,12 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         params: Option<PaginatedRequestParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let mut result = self.0.list_tools(params, ctx).await?;
+        let mut result = self.inner.list_tools(params, ctx).await?;
+        if self.filter.is_active() {
+            result
+                .tools
+                .retain(|tool| self.filter.is_enabled(&tool.name));
+        }
         sanitize_tool_schemas(&mut result);
         Ok(result)
     }
@@ -4078,15 +4177,24 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.0.call_tool(params, ctx).await
+        if self.filter.is_active() && !self.filter.is_enabled(&params.name) {
+            return Err(McpError::invalid_params(
+                disabled_tool_message(&params.name),
+                None,
+            ));
+        }
+        self.inner.call_tool(params, ctx).await
     }
 
     fn get_info(&self) -> ServerInfo {
-        self.0.get_info()
+        self.inner.get_info()
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.0.get_tool(name).map(annotate_task_support)
+        if self.filter.is_active() && !self.filter.is_enabled(name) {
+            return None;
+        }
+        self.inner.get_tool(name).map(annotate_task_support)
     }
 
     async fn enqueue_task(
@@ -4094,7 +4202,13 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         request: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CreateTaskResult, McpError> {
-        self.0.enqueue_task(request, ctx).await
+        if self.filter.is_active() && !self.filter.is_enabled(&request.name) {
+            return Err(McpError::invalid_params(
+                disabled_tool_message(&request.name),
+                None,
+            ));
+        }
+        self.inner.enqueue_task(request, ctx).await
     }
 
     async fn list_tasks(
@@ -4102,7 +4216,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         request: Option<PaginatedRequestParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListTasksResult, McpError> {
-        self.0.list_tasks(request, ctx).await
+        self.inner.list_tasks(request, ctx).await
     }
 
     async fn get_task_info(
@@ -4110,7 +4224,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         request: GetTaskInfoParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        self.0.get_task_info(request, ctx).await
+        self.inner.get_task_info(request, ctx).await
     }
 
     async fn get_task_result(
@@ -4118,7 +4232,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         request: GetTaskResultParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskPayloadResult, McpError> {
-        self.0.get_task_result(request, ctx).await
+        self.inner.get_task_result(request, ctx).await
     }
 
     async fn cancel_task(
@@ -4126,7 +4240,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         request: CancelTaskParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CancelTaskResult, McpError> {
-        self.0.cancel_task(request, ctx).await
+        self.inner.cancel_task(request, ctx).await
     }
 }
 
