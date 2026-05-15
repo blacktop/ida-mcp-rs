@@ -376,7 +376,7 @@ pub fn handle_callgraph(
 
 #[cfg(test)]
 mod tests {
-    use super::is_direct_branch_operand;
+    use crate::ida::handlers::controlflow::is_direct_branch_operand;
     use idalib::insn::OperandType;
 
     #[test]

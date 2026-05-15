@@ -11,8 +11,9 @@ pub use requests::*;
 
 use crate::error::ToolError;
 use crate::ida::observability::{ProgressReceiver, ProgressSender};
-use crate::ida::worker::{CloseAuthorization, CloseTokenGrant, MAX_TIMEOUT_SECS};
-use crate::ida::IdaWorker;
+use crate::ida::worker::{
+    CloseAuthorization, CloseTokenGrant, IdaWorker, WorkerBackend, MAX_TIMEOUT_SECS,
+};
 use crate::server::operation::{
     next_operation_id, OperationRegistry, OperationSnapshot, RecentOperations,
 };
@@ -24,6 +25,7 @@ use rmcp::{
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
 use serde_json::{json, Map, Value};
+use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +34,7 @@ use tracing::{debug, info, instrument, warn};
 /// MCP server for IDA Pro analysis
 #[derive(Clone)]
 pub struct IdaMcpServer {
-    worker: Arc<IdaWorker>,
+    worker: WorkerBackend,
     tool_mux: ToolMux<IdaMcpServer>,
     mode: ServerMode,
     task_registry: task::TaskRegistry,
@@ -50,6 +52,7 @@ pub struct IdaMcpServer {
 pub enum ServerMode {
     Stdio,
     Http,
+    Worker,
 }
 
 #[derive(Clone)]
@@ -108,6 +111,16 @@ const OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES: u64 = 50 * 1024 * 1024;
 /// Bound the MCP elicitation prompt separately from IDA work. If the client
 /// leaves the prompt unanswered, default to background analysis.
 const OPEN_IDB_ELICITATION_TIMEOUT_SECS: u64 = 30;
+/// Give foreground operations a short window to observe cancellation and clean
+/// up owned resources before the MCP timeout/cancel response is returned.
+const FOREGROUND_CANCEL_CLEANUP_TIMEOUT_SECS: u64 = 6;
+
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|err| {
+        warn!(error = %err, "failed to pretty-print JSON response");
+        value.to_string()
+    })
+}
 
 enum ForegroundOperationError {
     Tool(ToolError),
@@ -123,14 +136,14 @@ enum ForegroundOperationError {
 impl IdaMcpServer {
     pub fn new(worker: Arc<IdaWorker>, mode: ServerMode) -> Self {
         Self::with_filter(
-            worker,
+            WorkerBackend::local(worker),
             mode,
             Arc::new(tool_filter::ToolFilter::unrestricted()),
         )
     }
 
     pub fn with_filter(
-        worker: Arc<IdaWorker>,
+        worker: WorkerBackend,
         mode: ServerMode,
         filter: Arc<tool_filter::ToolFilter>,
     ) -> Self {
@@ -163,12 +176,15 @@ impl IdaMcpServer {
     }
 
     fn close_hint(&self) -> &'static str {
-        close_hint_for(self.mode)
+        close_hint_for(self.mode, self.worker.is_pooled())
     }
 
     fn http_close_grant(&self) -> Option<Result<CloseTokenGrant, String>> {
-        matches!(self.mode, ServerMode::Http)
-            .then(|| self.worker.issue_close_token_for_session(&self.session_id))
+        if matches!(self.mode, ServerMode::Http) && self.worker.uses_close_tokens() {
+            self.worker.issue_close_token_for_session(&self.session_id)
+        } else {
+            None
+        }
     }
 
     fn apply_close_metadata(
@@ -421,6 +437,26 @@ impl IdaMcpServer {
         next_operation_id(self.operation_nonce.as_ref())
     }
 
+    async fn finish_cancelled_foreground<T, Fut>(
+        tool_name: &'static str,
+        operation_fut: Pin<&mut Fut>,
+    ) where
+        Fut: std::future::Future<Output = Result<T, ToolError>>,
+    {
+        let cleanup = tokio::time::timeout(
+            Duration::from_secs(FOREGROUND_CANCEL_CLEANUP_TIMEOUT_SECS),
+            operation_fut,
+        )
+        .await;
+        if cleanup.is_err() {
+            warn!(
+                tool_name,
+                timeout_secs = FOREGROUND_CANCEL_CLEANUP_TIMEOUT_SECS,
+                "foreground operation did not finish cancellation cleanup before response"
+            );
+        }
+    }
+
     async fn run_foreground_operation<T, F, Fut>(
         &self,
         ctx: &RequestContext<RoleServer>,
@@ -517,6 +553,7 @@ impl IdaMcpServer {
                 }
             }
             Outcome::TimedOut(timeout_secs) => {
+                Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
                 drain_task.abort();
                 let _ = drain_task.await;
                 let snapshot = self
@@ -541,6 +578,7 @@ impl IdaMcpServer {
                 })
             }
             Outcome::Cancelled => {
+                Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
                 drain_task.abort();
                 let _ = drain_task.await;
                 let snapshot = self
@@ -648,7 +686,9 @@ impl IdaMcpServer {
             if !frameworks.is_empty() {
                 map.insert("frameworks_loaded".to_string(), json!(frameworks));
             }
-            self.apply_close_metadata(map, close_token);
+            if !matches!(self.mode, ServerMode::Worker) {
+                self.apply_close_metadata(map, close_token);
+            }
         }
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -660,7 +700,7 @@ impl IdaMcpServer {
     async fn run_dsc_background(
         task_id: String,
         registry: task::TaskRegistry,
-        worker: Arc<IdaWorker>,
+        worker: WorkerBackend,
         mode: ServerMode,
         ctx: DscBackgroundCtx,
     ) {
@@ -763,7 +803,7 @@ impl IdaMcpServer {
 
         let close_token = match (mode, owner_session_id.as_deref()) {
             (ServerMode::Http, Some(owner_session_id)) => {
-                Some(worker.issue_close_token_for_session(owner_session_id))
+                worker.issue_close_token_for_session(owner_session_id)
             }
             _ => None,
         };
@@ -775,7 +815,7 @@ impl IdaMcpServer {
             if !frameworks.is_empty() {
                 map.insert("frameworks_loaded".to_string(), json!(frameworks));
             }
-            apply_close_metadata(map, close_token, close_hint_for(mode));
+            apply_close_metadata(map, close_token, close_hint_for(mode, worker.is_pooled()));
         }
 
         info!(task_id = %task_id, "DSC background task completed");
@@ -816,10 +856,12 @@ macro_rules! try_param {
     };
 }
 
-fn close_hint_for(mode: ServerMode) -> &'static str {
-    match mode {
-        ServerMode::Stdio => "Call close_idb when done to release locks for other sessions.",
-        ServerMode::Http => "In multi-client (HTTP/SSE) mode, close_idb accepts the close_token returned by open_idb. The owning session can also close without re-sending the token, and close_idb(force=true) can recover from a lost session.",
+fn close_hint_for(mode: ServerMode, pooled: bool) -> &'static str {
+    match (mode, pooled) {
+        (ServerMode::Http, true) => "In pooled HTTP/SSE mode, close_idb releases this session's child worker lease. Sessions do not share one global close_token.",
+        (ServerMode::Stdio, _) => "Call close_idb when done to release locks for other sessions.",
+        (ServerMode::Http, false) => "In multi-client (HTTP/SSE) mode, close_idb accepts the close_token returned by open_idb. The owning session can also close without re-sending the token, and close_idb(force=true) can recover from a lost session.",
+        (ServerMode::Worker, _) => "Child worker mode is managed by the parent router; close_idb is normally called by the parent.",
     }
 }
 
@@ -899,7 +941,10 @@ impl IdaMcpServer {
         ));
 
         let user_auto_analyse = req.auto_analyse.unwrap_or(false);
-        let large_input_size = if user_auto_analyse && !Self::is_database_path(&path) {
+        let large_input_size = if !matches!(self.mode, ServerMode::Worker)
+            && user_auto_analyse
+            && !Self::is_database_path(&path)
+        {
             Self::input_size_above_threshold(&path)
         } else {
             None
@@ -972,8 +1017,10 @@ impl IdaMcpServer {
                         quick_tools.extend(["decompile", "xrefs_to"]);
                     }
                     map.insert("quick_tools".to_string(), json!(quick_tools));
-                    map.insert("session_id".to_string(), json!(self.session_id));
-                    self.apply_close_metadata(map, close_token);
+                    if !matches!(self.mode, ServerMode::Worker) {
+                        map.insert("session_id".to_string(), json!(self.session_id));
+                        self.apply_close_metadata(map, close_token);
+                    }
                     if let Some((task_id, status)) = analysis_task {
                         let reason = format!(
                             "Input size exceeded {} MiB; auto-analysis routed to a background task. Poll task_status(task_id) for progress.",
@@ -1150,8 +1197,10 @@ impl IdaMcpServer {
             Ok(status) => {
                 let mut value =
                     serde_json::to_value(&status).unwrap_or_else(|_| json!(format!("{status:?}")));
-                if let Value::Object(map) = &mut value {
-                    map.insert("session_id".to_string(), json!(self.session_id));
+                if !matches!(self.mode, ServerMode::Worker) {
+                    if let Value::Object(map) = &mut value {
+                        map.insert("session_id".to_string(), json!(self.session_id));
+                    }
                 }
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{status:?}")),
@@ -1172,7 +1221,7 @@ impl IdaMcpServer {
         Parameters(req): Parameters<CloseIdbRequest>,
     ) -> Result<CallToolResult, McpError> {
         info!("Tool call: close_idb received");
-        if matches!(self.mode, ServerMode::Http) {
+        if matches!(self.mode, ServerMode::Http) && self.worker.uses_close_tokens() {
             match self.worker.authorize_close(
                 &self.session_id,
                 req.token.as_deref(),
@@ -1251,9 +1300,9 @@ impl IdaMcpServer {
                 if filtering_active {
                     payload["filtering_active"] = json!(true);
                 }
-                return Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&payload).unwrap(),
-                )]));
+                return Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                    &payload,
+                ))]));
             }
         }
 
@@ -1282,9 +1331,9 @@ impl IdaMcpServer {
             if filtering_active {
                 payload["filtering_active"] = json!(true);
             }
-            return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&payload).unwrap(),
-            )]));
+            return Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &payload,
+            ))]));
         }
 
         // No query or category - list all categories. Counts reflect enabled
@@ -1318,9 +1367,9 @@ impl IdaMcpServer {
             payload["enabled_tool_count"] = json!(filter.enabled_count());
         }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&payload).unwrap(),
-        )]))
+        Ok(CallToolResult::success(vec![Content::text(pretty_json(
+            &payload,
+        ))]))
     }
 
     #[tool(
@@ -1339,8 +1388,8 @@ impl IdaMcpServer {
             && tool_registry::get_tool(&req.name).is_some()
             && !self.filter.is_enabled(&req.name)
         {
-            return Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({
+            return Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &json!({
                     "error": format!(
                         "tool '{}' is disabled by current filter \
                          (--toolsets/--tools/--exclude-tools/--read-only)",
@@ -1348,37 +1397,34 @@ impl IdaMcpServer {
                     ),
                     "filtering_active": true,
                     "hint": "call tool_catalog to see enabled tools",
-                }))
-                .unwrap(),
-            )]));
+                }),
+            ))]));
         }
 
         if let Some(tool) = tool_registry::get_tool(&req.name) {
             let params = tool_params_schema(&req.name);
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({
+            Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &json!({
                     "name": tool.name,
                     "category": tool.category.as_str(),
                     "description": tool.full_desc,
                     "parameters": params,
                     "example": tool.example,
                     "keywords": tool.keywords,
-                }))
-                .unwrap(),
-            )]))
+                }),
+            ))]))
         } else {
             // Suggest similar tools
             let suggestions = tool_registry::search_tools(&req.name, 3);
             let suggestion_names: Vec<_> = suggestions.iter().map(|(t, _)| t.name).collect();
 
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({
+            Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &json!({
                     "error": format!("Tool '{}' not found", req.name),
                     "suggestions": suggestion_names,
                     "hint": "Use tool_catalog to discover available tools"
-                }))
-                .unwrap(),
-            )]))
+                }),
+            ))]))
         }
     }
 
@@ -2130,8 +2176,10 @@ impl IdaMcpServer {
             Ok(result) => {
                 let mut value =
                     serde_json::to_value(&result).unwrap_or_else(|_| json!(format!("{result:?}")));
-                if let Value::Object(map) = &mut value {
-                    map.insert("session_id".to_string(), json!(self.session_id));
+                if !matches!(self.mode, ServerMode::Worker) {
+                    if let Value::Object(map) = &mut value {
+                        map.insert("session_id".to_string(), json!(self.session_id));
+                    }
                 }
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{result:?}")),
@@ -3214,7 +3262,7 @@ impl IdaMcpServer {
         info!(task_id = %task_id, "Spawning background auto-analysis");
 
         let registry = self.task_registry.clone();
-        let worker = Arc::clone(&self.worker);
+        let worker = self.worker.clone();
         let tid = task_id.clone();
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let worker_cancel_token = cancel_token.clone();
@@ -3409,7 +3457,7 @@ impl IdaMcpServer {
         );
 
         let registry = self.task_registry.clone();
-        let worker = Arc::clone(&self.worker);
+        let worker = self.worker.clone();
         let mode = self.mode;
         let module = req.module.clone();
         let tid = task_id.clone();
@@ -3905,7 +3953,7 @@ fn dsc_analysis_next_steps(
 }
 
 async fn get_int_values(
-    worker: &IdaWorker,
+    worker: &WorkerBackend,
     address: Value,
     size: usize,
 ) -> Result<CallToolResult, McpError> {
@@ -4579,6 +4627,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::ToolError;
     use crate::ida::worker::CloseTokenGrant;
     use crate::server::{
         apply_close_metadata, close_hint_for, normalize_schema_value,
@@ -4590,6 +4639,7 @@ mod tests {
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::CallToolResult;
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
 
     fn test_server() -> IdaMcpServer {
@@ -4705,6 +4755,24 @@ mod tests {
         assert!(message.contains("Last known phase: opening"));
         assert!(message.contains("Operation id: fg-1"));
         assert!(message.contains("detail"));
+    }
+
+    #[tokio::test]
+    async fn foreground_cancel_cleanup_polls_cancelled_future() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_for_future = observed.clone();
+        let future = async move {
+            cancel.cancelled().await;
+            observed_for_future.store(true, Ordering::SeqCst);
+            Err::<(), ToolError>(ToolError::Cancelled("cancelled".to_string()))
+        };
+        tokio::pin!(future);
+
+        IdaMcpServer::finish_cancelled_foreground("test_tool", future.as_mut()).await;
+
+        assert!(observed.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -4956,7 +5024,11 @@ mod tests {
         grant: Option<Result<CloseTokenGrant, String>>,
     ) -> serde_json::Map<String, Value> {
         let mut map = serde_json::Map::new();
-        apply_close_metadata(&mut map, grant, close_hint_for(crate::ServerMode::Http));
+        apply_close_metadata(
+            &mut map,
+            grant,
+            close_hint_for(crate::ServerMode::Http, false),
+        );
         map
     }
 

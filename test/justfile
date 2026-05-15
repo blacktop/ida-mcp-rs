@@ -15,7 +15,7 @@ default:
 
 # Build test fixture
 fixture:
-    {{ cc }} {{ cflags }} -o "{{ test_bin }}" "{{ test_src }}"
+    @[ "{{ test_bin }}" -nt "{{ test_src }}" ] || {{ cc }} {{ cflags }} -o "{{ test_bin }}" "{{ test_src }}"
 
 # Bootstrap a deterministic .i64 fixture for tests that should not wait on raw-binary auto-analysis
 test-bootstrap: fixture
@@ -26,20 +26,22 @@ test-bootstrap: fixture
         echo "Run 'cargo build --release' first"
         exit 1
     fi
-    if [ -f "{{ test_i64 }}" ]; then
-        echo "✅ Bootstrap fixture already present: {{ test_i64 }}"
-        exit 0
-    fi
     LOCK="{{ test_lock }}"
     if [ -f "$LOCK" ]; then
         pid=$(awk -F= '$1=="pid"{print $2}' "$LOCK" | tr -d '\r')
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             echo "Lock file $LOCK is held by pid $pid; close that server first." >&2
             exit 1
-        else
-            rm -f "$LOCK"
         fi
+        echo "🧹 Removing stale lock $LOCK (pid $pid dead)"
+        rm -f "$LOCK"
     fi
+    rm -f "{{ test_bin }}".id0 "{{ test_bin }}".id1 "{{ test_bin }}".id2 "{{ test_bin }}".nam "{{ test_bin }}".til
+    if [ -f "{{ test_i64 }}" ] && [ "{{ test_i64 }}" -nt "{{ test_bin }}" ]; then
+        echo "✅ Bootstrap fixture already present: {{ test_i64 }}"
+        exit 0
+    fi
+    rm -f "{{ test_i64 }}"
     echo "🧪 Bootstrapping {{ test_i64 }} via MCP server..."
     RUST_LOG="{{ rust_log }}" MCP_HTTP_BIN="{{ server_bin }}" IDB_PATH="{{ test_bin }}" bash ./http_bootstrap.sh
     echo "✅ Bootstrap fixture created: {{ test_i64 }}"
@@ -165,6 +167,135 @@ test-http-recovery: fixture
         MCP_HTTP_BIN="{{ server_bin }}" \
         ./http_close_recovery.sh
     echo "✅ HTTP close-recovery test passed"
+
+# Pool tests use raw fixture copies in tmpdirs instead of the shared mini.i64
+# so killed workers cannot poison later runs with stale packed fixture state.
+
+# Run HTTP worker-pool concurrency test
+test-pool: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool concurrency test..."
+    PORT=$((9300 + RANDOM % 500)) \
+        POOL_TEST_CASE=concurrency \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool concurrency test passed"
+
+# Run HTTP worker-pool crash-containment test
+test-pool-crash: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool crash test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool crash-containment test..."
+    PORT=$((9400 + RANDOM % 500)) \
+        POOL_TEST_CASE=crash \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool crash-containment test passed"
+
+# Run HTTP worker-pool exhaustion test
+test-pool-exhaustion: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool exhaustion test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool exhaustion test..."
+    PORT=$((9500 + RANDOM % 500)) \
+        POOL_TEST_CASE=exhaustion \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool exhaustion test passed"
+
+# Run HTTP worker-pool failed-second-open lease preservation test
+test-pool-second-open: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool second-open test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool second-open failure test..."
+    PORT=$((9550 + RANDOM % 500)) \
+        POOL_TEST_CASE=second-open-failure \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool second-open failure test passed"
+
+# Run HTTP worker-pool abandoned-client cleanup test
+test-pool-disconnect: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool disconnect test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool abandoned-client cleanup test..."
+    PORT=$((9600 + RANDOM % 500)) \
+        POOL_TEST_CASE=disconnect \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool abandoned-client cleanup test passed"
+
+# Run HTTP worker-pool session-manager disconnect wiring test without opening IDA
+test-pool-manager-disconnect:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool manager-disconnect test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool session-manager disconnect wiring test..."
+    PORT=$((9700 + RANDOM % 500)) \
+        POOL_TEST_CASE=manager-disconnect \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool session-manager disconnect wiring test passed"
 
 # Run IDAPython script integration test
 test-script: test-bootstrap

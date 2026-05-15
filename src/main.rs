@@ -11,14 +11,17 @@ use axum::Router;
 use clap::{Args, Parser, Subcommand};
 use ida_mcp::server::http_access::{HttpAccessPolicy, HttpAccessService};
 use ida_mcp::server::http_config::{
-    build_session_manager, build_streamable_config, HttpServerOptions,
+    build_pooled_session_manager, build_session_manager, build_streamable_config, HttpServerOptions,
 };
 use ida_mcp::server::task::TaskRegistry;
 use ida_mcp::server::tool_filter::ToolFilter;
 use ida_mcp::server::SanitizedIdaServer;
 use ida_mcp::{
-    disasm::generate_disasm_line, expand_path, ida, DbInfo, FunctionInfo, IdaMcpServer, IdaWorker,
-    ServerMode,
+    disasm::generate_disasm_line,
+    expand_path, ida,
+    ida::pool::{PooledSessionState, WorkerPool, WorkerPoolConfig},
+    ida::worker::WorkerBackend,
+    DbInfo, FunctionInfo, IdaMcpServer, IdaWorker, ServerMode,
 };
 use idalib::{idb::IDBOpenOptions, Address, IDB};
 use rmcp::transport::stdio;
@@ -37,6 +40,8 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
+const LEGACY_HTTP_SESSION_KEEP_ALIVE_SECS: u64 = 1800;
+const POOLED_HTTP_SESSION_KEEP_ALIVE_SECS: u64 = 300;
 
 #[derive(Parser)]
 #[command(name = "ida-mcp", version, about = "Headless IDA Pro MCP Server")]
@@ -53,6 +58,9 @@ enum Command {
     Serve,
     /// Run the MCP server over Streamable HTTP (SSE)
     ServeHttp(ServeHttpArgs),
+    /// Run a child worker for the HTTP process pool
+    #[command(hide = true)]
+    Worker(WorkerArgs),
     /// Run a direct CLI probe to exercise idalib
     Probe(ProbeArgs),
 }
@@ -106,6 +114,26 @@ impl ToolFilterArgs {
         )
         .map_err(|e| e.to_string())
     }
+
+    fn child_args(&self) -> Vec<OsString> {
+        let mut args = Vec::new();
+        if !self.toolsets.is_empty() {
+            args.push(OsString::from("--toolsets"));
+            args.push(OsString::from(self.toolsets.join(",")));
+        }
+        if !self.tools.is_empty() {
+            args.push(OsString::from("--tools"));
+            args.push(OsString::from(self.tools.join(",")));
+        }
+        if !self.exclude_tools.is_empty() {
+            args.push(OsString::from("--exclude-tools"));
+            args.push(OsString::from(self.exclude_tools.join(",")));
+        }
+        if self.read_only {
+            args.push(OsString::from("--read-only"));
+        }
+        args
+    }
 }
 
 #[derive(Args)]
@@ -117,10 +145,10 @@ struct ServeHttpArgs {
     #[arg(long, default_value_t = 15)]
     sse_keep_alive_secs: u64,
     /// HTTP session inactivity timeout in seconds (0 disables, but may leak
-    /// zombie sessions on silent disconnects). rmcp defaults to 300s, which
-    /// kills sessions during long IDA analyses; see issue #19.
-    #[arg(long, default_value_t = 1800)]
-    session_keep_alive_secs: u64,
+    /// zombie sessions on silent disconnects). Defaults to 1800s in legacy
+    /// HTTP mode and 300s in pooled mode.
+    #[arg(long)]
+    session_keep_alive_secs: Option<u64>,
     /// Use stateless mode (POST only; no sessions)
     #[arg(long)]
     stateless: bool,
@@ -139,7 +167,35 @@ struct ServeHttpArgs {
     /// Pass `*` or an empty value to disable the Host check.
     #[arg(long, value_delimiter = ',')]
     allow_host: Option<Vec<String>>,
+    /// Maximum child worker processes in pooled mode. 1 preserves legacy in-process HTTP behavior.
+    #[arg(long, default_value_t = 1)]
+    max_workers: usize,
+    /// Minimum idle child worker processes to keep warm in pooled mode.
+    #[arg(long, default_value_t = 0)]
+    min_workers: usize,
+    /// Seconds before an idle pooled worker is reaped (0 disables reaping).
+    #[arg(long, default_value_t = 300)]
+    worker_idle_timeout_secs: u64,
+    /// Per-child operation timeout in seconds; the parent kills a child that exceeds it.
+    #[arg(long, default_value_t = 600)]
+    worker_op_timeout_secs: u64,
+    /// Grace period before pooled sessions are closed after a client stream disconnects.
+    #[arg(long, default_value_t = 2)]
+    worker_disconnect_grace_secs: u64,
 }
+
+fn effective_session_keep_alive_secs(args: &ServeHttpArgs) -> u64 {
+    args.session_keep_alive_secs.unwrap_or({
+        if args.max_workers > 1 {
+            POOLED_HTTP_SESSION_KEEP_ALIVE_SECS
+        } else {
+            LEGACY_HTTP_SESSION_KEEP_ALIVE_SECS
+        }
+    })
+}
+
+#[derive(Args)]
+struct WorkerArgs {}
 
 #[derive(Args)]
 struct ProbeArgs {
@@ -192,9 +248,11 @@ fn main() -> anyhow::Result<()> {
             .map(Arc::new)
             .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))
     };
+    let child_filter_args = cli.filter.child_args();
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => run_server(build_filter()?),
-        Command::ServeHttp(args) => run_server_http(args, build_filter()?),
+        Command::ServeHttp(args) => run_server_http(args, build_filter()?, child_filter_args),
+        Command::Worker(_args) => run_server_with_mode(build_filter()?, ServerMode::Worker),
         Command::Probe(args) => run_probe(args),
     }
 }
@@ -250,16 +308,21 @@ fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
 }
 
 fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
-    info!("Starting IDA MCP Server (server mode)");
+    run_server_with_mode(filter, ServerMode::Stdio)
+}
+
+fn run_server_with_mode(filter: Arc<ToolFilter>, mode: ServerMode) -> anyhow::Result<()> {
+    info!(?mode, "Starting IDA MCP Server (stdio transport)");
     let init_state = init_stdio_ida_state()?;
 
     // Create channel for IDA requests
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
     let worker = IdaWorker::new(tx);
+    let backend = WorkerBackend::local(Arc::new(worker.clone()));
 
     // Spawn background thread for tokio runtime and MCP server
-    let worker_for_server = worker.clone();
-    let worker_for_shutdown = worker.clone();
+    let worker_for_server = backend.clone();
+    let worker_for_shutdown = backend.clone();
     let filter_for_server = filter.clone();
     let server_handle = thread::spawn(move || {
         // Create tokio runtime on this background thread
@@ -271,8 +334,8 @@ fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
         rt.block_on(async move {
             info!("MCP server listening on stdio");
             let server = IdaMcpServer::with_filter(
-                Arc::new(worker_for_server),
-                ServerMode::Stdio,
+                worker_for_server,
+                mode,
                 filter_for_server.clone(),
             );
             let task_registry = server.task_registry().clone();
@@ -378,23 +441,64 @@ fn run_server(filter: Arc<ToolFilter>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_server_http(args: ServeHttpArgs, filter: Arc<ToolFilter>) -> anyhow::Result<()> {
+fn run_server_http(
+    args: ServeHttpArgs,
+    filter: Arc<ToolFilter>,
+    child_filter_args: Vec<OsString>,
+) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (streamable HTTP mode)");
-    let init_state = ida::IdaInitState::deferred();
     if args.json_response && !args.stateless {
         info!("--json-response is ignored unless --stateless is also set");
+    }
+    if args.max_workers == 0 {
+        return Err(anyhow::anyhow!("--max-workers must be at least 1"));
+    }
+    if args.min_workers > args.max_workers {
+        return Err(anyhow::anyhow!(
+            "--min-workers ({}) cannot exceed --max-workers ({})",
+            args.min_workers,
+            args.max_workers
+        ));
+    }
+    if args.max_workers > 1 && args.stateless {
+        return Err(anyhow::anyhow!(
+            "--max-workers > 1 requires stateful HTTP sessions; remove --stateless"
+        ));
+    }
+    if args.worker_op_timeout_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "--worker-op-timeout-secs must be at least 1"
+        ));
     }
 
     let bind_addr: SocketAddr = args
         .bind
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
+    let session_keep_alive_secs = effective_session_keep_alive_secs(&args);
 
+    if args.max_workers > 1 {
+        return run_server_http_pooled(
+            args,
+            filter,
+            child_filter_args,
+            bind_addr,
+            session_keep_alive_secs,
+        );
+    }
+
+    info!(
+        "HTTP worker pool disabled (max_workers=1); HTTP sessions share one IDA context. \
+         Pass --max-workers N where N > 1 for concurrent multi-IDB analysis."
+    );
+
+    let init_state = ida::IdaInitState::deferred();
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
     let worker = Arc::new(IdaWorker::new(tx));
+    let backend = WorkerBackend::local(worker.clone());
 
-    let worker_for_factory = worker.clone();
-    let worker_for_shutdown = worker.clone();
+    let worker_for_factory = backend.clone();
+    let worker_for_shutdown = backend.clone();
     let filter_for_factory = filter.clone();
     let server_handle = thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -423,7 +527,7 @@ fn run_server_http(args: ServeHttpArgs, filter: Arc<ToolFilter>) -> anyhow::Resu
             );
             info!("HTTP Host guard: {}", access_policy.host_policy_summary());
 
-            let session_manager = build_session_manager(args.session_keep_alive_secs);
+            let session_manager = build_session_manager(session_keep_alive_secs);
             let cancel = tokio_util::sync::CancellationToken::new();
             let config = build_streamable_config(
                 HttpServerOptions {
@@ -489,6 +593,139 @@ fn run_server_http(args: ServeHttpArgs, filter: Arc<ToolFilter>) -> anyhow::Resu
     }
 
     info!("Server stopped");
+    Ok(())
+}
+
+fn run_server_http_pooled(
+    args: ServeHttpArgs,
+    filter: Arc<ToolFilter>,
+    child_filter_args: Vec<OsString>,
+    bind_addr: SocketAddr,
+    session_keep_alive_secs: u64,
+) -> anyhow::Result<()> {
+    info!(
+        max_workers = args.max_workers,
+        min_workers = args.min_workers,
+        "Starting pooled HTTP router; parent will not initialize IDA"
+    );
+    let server_handle = thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                error!("Failed to create tokio runtime: {e}");
+                return;
+            }
+        };
+
+        let result = rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind(bind_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
+            let listen_addr = listener
+                .local_addr()
+                .map_err(|e| anyhow::anyhow!("failed to read listener address: {e}"))?;
+
+            let access_policy = HttpAccessPolicy::from_cli(
+                listen_addr,
+                &args.allow_origin,
+                args.allow_host.as_deref(),
+            );
+            info!("HTTP Host guard: {}", access_policy.host_policy_summary());
+
+            let exe_path = std::env::current_exe()
+                .map_err(|e| anyhow::anyhow!("failed to resolve current executable: {e}"))?;
+            let pool = WorkerPool::new(WorkerPoolConfig {
+                max_workers: args.max_workers,
+                min_workers: args.min_workers,
+                worker_idle_timeout: Duration::from_secs(args.worker_idle_timeout_secs),
+                worker_op_timeout: Duration::from_secs(args.worker_op_timeout_secs),
+                exe_path,
+                filter_args: child_filter_args,
+            });
+            pool.warm_min()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to warm worker pool: {e}"))?;
+
+            let session_manager = build_pooled_session_manager(
+                session_keep_alive_secs,
+                Duration::from_secs(args.worker_disconnect_grace_secs),
+            );
+            info!(
+                session_keep_alive_secs,
+                worker_disconnect_grace_secs = args.worker_disconnect_grace_secs,
+                "Using disconnect-aware pooled HTTP session manager"
+            );
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let config = build_streamable_config(
+                HttpServerOptions {
+                    sse_keep_alive_secs: args.sse_keep_alive_secs,
+                    stateless: args.stateless,
+                    json_response: args.json_response,
+                },
+                cancel.clone(),
+            );
+
+            let pool_for_factory = pool.clone();
+            let filter_for_factory = filter.clone();
+            let service = StreamableHttpService::new(
+                move || {
+                    let pooled_state = Arc::new(PooledSessionState::new(
+                        pool_for_factory.clone(),
+                        uuid::Uuid::new_v4().to_string(),
+                    ));
+                    let inner = IdaMcpServer::with_filter(
+                        WorkerBackend::pooled(pooled_state),
+                        ServerMode::Http,
+                        filter_for_factory.clone(),
+                    );
+                    Ok(SanitizedIdaServer::with_filter(
+                        inner,
+                        filter_for_factory.clone(),
+                    ))
+                },
+                session_manager,
+                config,
+            );
+            let service = HttpAccessService::new(service, access_policy);
+
+            let router = Router::new().route_service("/", service);
+            info!("MCP pooled HTTP server listening on http://{listen_addr}");
+
+            let cancel_for_shutdown = cancel.clone();
+            let pool_for_shutdown = pool.clone();
+            tokio::spawn(async move {
+                if wait_for_shutdown_signal().await.is_ok() {
+                    info!("Shutdown signal received");
+                    cancel_for_shutdown.cancel();
+                    pool_for_shutdown.shutdown_all().await;
+                }
+            });
+
+            let cancel_for_serve = cancel.clone();
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    cancel_for_serve.cancelled().await;
+                    info!("Pooled HTTP server shutting down");
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("serve failed: {e}"))?;
+
+            pool.shutdown_all().await;
+            Ok::<_, anyhow::Error>(())
+        });
+        if let Err(err) = result {
+            error!("HTTP server error: {err}");
+        }
+    });
+
+    if let Err(e) = server_handle.join() {
+        error!("Server thread panicked: {:?}", e);
+    }
+
+    info!("Pooled HTTP server stopped");
     Ok(())
 }
 
@@ -748,4 +985,56 @@ fn disasm_at(db: &IDB, addr: Address, count: usize) -> anyhow::Result<String> {
     }
 
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        effective_session_keep_alive_secs, ServeHttpArgs, LEGACY_HTTP_SESSION_KEEP_ALIVE_SECS,
+        POOLED_HTTP_SESSION_KEEP_ALIVE_SECS,
+    };
+
+    fn serve_http_args(max_workers: usize, session_keep_alive_secs: Option<u64>) -> ServeHttpArgs {
+        ServeHttpArgs {
+            bind: "127.0.0.1:8765".to_string(),
+            sse_keep_alive_secs: 15,
+            session_keep_alive_secs,
+            stateless: false,
+            json_response: false,
+            allow_origin: Vec::new(),
+            allow_host: None,
+            max_workers,
+            min_workers: 0,
+            worker_idle_timeout_secs: 300,
+            worker_op_timeout_secs: 600,
+            worker_disconnect_grace_secs: 2,
+        }
+    }
+
+    #[test]
+    fn legacy_http_keeps_long_session_default() {
+        let args = serve_http_args(1, None);
+
+        assert_eq!(
+            effective_session_keep_alive_secs(&args),
+            LEGACY_HTTP_SESSION_KEEP_ALIVE_SECS
+        );
+    }
+
+    #[test]
+    fn pooled_http_uses_shorter_session_default() {
+        let args = serve_http_args(2, None);
+
+        assert_eq!(
+            effective_session_keep_alive_secs(&args),
+            POOLED_HTTP_SESSION_KEEP_ALIVE_SECS
+        );
+    }
+
+    #[test]
+    fn explicit_session_keep_alive_overrides_mode_default() {
+        let args = serve_http_args(2, Some(1200));
+
+        assert_eq!(effective_session_keep_alive_secs(&args), 1200);
+    }
 }

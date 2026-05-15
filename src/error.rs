@@ -60,6 +60,17 @@ pub enum ToolError {
     #[error("Server is busy (request queue full). Please retry.")]
     Busy,
 
+    #[error(
+        "Worker pool exhausted: {active}/{max} workers are leased. Close an IDB or retry later."
+    )]
+    PoolExhausted { active: usize, max: usize },
+
+    #[error("Worker {worker_id} crashed or disconnected during {last_op}")]
+    WorkerCrashed { worker_id: usize, last_op: String },
+
+    #[error("Remote worker protocol error: {0}")]
+    RemoteProtocol(String),
+
     #[error("IDA error: {0}")]
     IdaError(String),
 

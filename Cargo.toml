@@ -12,8 +12,8 @@ categories = ["development-tools", "command-line-utilities"]
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3.1" }
-rmcp = { version = "1.6", features = ["server", "transport-io", "transport-streamable-http-server", "elicitation", "schemars"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal"] }
+rmcp = { version = "1.6", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "elicitation", "schemars"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal", "process", "io-util"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 bytes = "1"
+futures-util = "0.3"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"

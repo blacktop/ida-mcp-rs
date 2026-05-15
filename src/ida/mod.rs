@@ -8,6 +8,8 @@ pub mod handlers;
 pub mod lock;
 mod loop_impl;
 pub mod observability;
+pub mod pool;
+mod remote;
 pub mod request;
 pub mod types;
 pub mod worker;

@@ -183,6 +183,36 @@ decompile(address: "0x100000f00")
 tool_catalog(query: "find callers")
 ```
 
+#### HTTP/SSE worker pool
+
+`serve-http` keeps the existing single in-process IDA worker by default. For
+stateful multi-client HTTP/SSE usage, set `--max-workers` above `1` to route
+sessions through child `ida-mcp worker` processes:
+
+```bash
+ida-mcp serve-http --bind 127.0.0.1:8765 --max-workers 4 --min-workers 1
+```
+
+Without `--max-workers N`, HTTP sessions still share one IDA context; a second
+client opening another binary waits behind the first and then gets the normal
+`A database is already open` error. Pooled startup logs include
+`Starting pooled HTTP router` and `MCP pooled HTTP server listening`.
+
+Each opened HTTP session leases one child worker until `close_idb`, HTTP
+`DELETE`, session timeout, or server shutdown. `close_idb` releases the lease
+immediately, but the child process may stay alive idle for reuse until
+`--worker-idle-timeout-secs` elapses. If all workers are leased, new
+`open_idb`/`open_dsc` calls fail with `Worker pool exhausted` so clients can
+retry later. Pooled mode requires stateful HTTP sessions; `--max-workers > 1`
+is rejected with `--stateless`.
+
+If an SSE-capable client exits without sending `close_idb` or HTTP `DELETE`,
+pooled mode closes the session after its standalone SSE stream disconnects and
+the `--worker-disconnect-grace-secs` reconnect grace elapses.
+POST-only clients do not always leave a stream for the server to observe, so
+their orphaned sessions are reclaimed by `--session-keep-alive-secs`, which
+defaults to 300 seconds in pooled mode and 1800 seconds in legacy HTTP mode.
+
 #### `dyld_shared_cache` analysis
 
 `open_dsc` opens a single module from Apple's dyld_shared_cache. On first use it runs `idat` in the background to create the `.i64` (this can take minutes). Subsequent opens are instant.

@@ -1,9 +1,9 @@
 //! Response types for IDA worker operations.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Database info returned after opening
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DbInfo {
     pub path: String,
     pub file_type: String,
@@ -14,14 +14,14 @@ pub struct DbInfo {
     pub analysis_status: AnalysisStatus,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DebugInfoLoad {
     pub path: String,
     pub loaded: bool,
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnalysisStatus {
     pub auto_enabled: bool,
     pub auto_is_ok: bool,
@@ -30,7 +30,7 @@ pub struct AnalysisStatus {
     pub analysis_running: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SymbolInfo {
     pub name: String,
     pub address: String,
@@ -40,7 +40,7 @@ pub struct SymbolInfo {
     pub is_weak: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionRangeInfo {
     pub address: String,
     pub name: String,
@@ -49,7 +49,7 @@ pub struct FunctionRangeInfo {
     pub size: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AddressInfo {
     pub address: String,
     pub segment: Option<SegmentInfo>,
@@ -58,7 +58,7 @@ pub struct AddressInfo {
 }
 
 /// Function info for listing
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionInfo {
     pub address: String,
     pub name: String,
@@ -66,7 +66,7 @@ pub struct FunctionInfo {
 }
 
 /// Paginated function list result
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionListResult {
     pub functions: Vec<FunctionInfo>,
     pub total: usize,
@@ -75,7 +75,7 @@ pub struct FunctionListResult {
 }
 
 /// Segment info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SegmentInfo {
     pub name: String,
     pub start: String,
@@ -87,7 +87,7 @@ pub struct SegmentInfo {
 }
 
 /// String info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StringInfo {
     pub address: String,
     pub content: String,
@@ -95,7 +95,7 @@ pub struct StringInfo {
 }
 
 /// String list result with pagination
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StringListResult {
     pub strings: Vec<StringInfo>,
     pub total: usize,
@@ -103,7 +103,7 @@ pub struct StringListResult {
     pub next_offset: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StringXrefInfo {
     pub address: String,
     pub content: String,
@@ -112,7 +112,7 @@ pub struct StringXrefInfo {
     pub xref_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StringXrefsResult {
     pub strings: Vec<StringXrefInfo>,
     pub total: usize,
@@ -121,7 +121,7 @@ pub struct StringXrefsResult {
 }
 
 /// Local type info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LocalTypeInfo {
     pub ordinal: u32,
     pub name: String,
@@ -130,7 +130,7 @@ pub struct LocalTypeInfo {
 }
 
 /// Local types list result with pagination
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LocalTypeListResult {
     pub types: Vec<LocalTypeInfo>,
     pub total: usize,
@@ -139,14 +139,14 @@ pub struct LocalTypeListResult {
 }
 
 /// Frame range info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FrameRange {
     pub start: String,
     pub end: String,
 }
 
 /// Stack frame member info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FrameMemberInfo {
     pub name: String,
     pub type_name: String,
@@ -159,7 +159,7 @@ pub struct FrameMemberInfo {
 }
 
 /// Stack frame info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FrameInfo {
     pub address: String,
     pub frame_size: u64,
@@ -177,7 +177,7 @@ pub struct FrameInfo {
 }
 
 /// Struct summary info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StructSummary {
     pub ordinal: u32,
     pub name: String,
@@ -187,7 +187,7 @@ pub struct StructSummary {
 }
 
 /// Struct list result with pagination
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StructListResult {
     pub structs: Vec<StructSummary>,
     pub total: usize,
@@ -196,7 +196,7 @@ pub struct StructListResult {
 }
 
 /// Struct member info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StructMemberInfo {
     pub name: String,
     pub type_name: String,
@@ -208,7 +208,7 @@ pub struct StructMemberInfo {
 }
 
 /// Struct detailed info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StructInfo {
     pub ordinal: u32,
     pub name: String,
@@ -219,7 +219,7 @@ pub struct StructInfo {
 }
 
 /// Struct member value
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StructMemberValue {
     pub name: String,
     pub type_name: String,
@@ -232,7 +232,7 @@ pub struct StructMemberValue {
 }
 
 /// Struct read result
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StructReadResult {
     pub address: String,
     pub ordinal: u32,
@@ -242,7 +242,7 @@ pub struct StructReadResult {
 }
 
 /// Cross-reference info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct XRefInfo {
     pub from: String,
     pub to: String,
@@ -251,7 +251,7 @@ pub struct XRefInfo {
 }
 
 /// Declared type result
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeclareTypeResult {
     pub code: i32,
     pub name: String,
@@ -261,13 +261,13 @@ pub struct DeclareTypeResult {
 }
 
 /// Declare multiple types result
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeclareTypesResult {
     pub errors: i32,
 }
 
 /// Applied type result
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApplyTypeResult {
     pub address: String,
     pub applied: bool,
@@ -275,7 +275,7 @@ pub struct ApplyTypeResult {
 }
 
 /// Guess type result
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GuessTypeResult {
     pub address: String,
     pub code: i32,
@@ -285,7 +285,7 @@ pub struct GuessTypeResult {
 }
 
 /// Stack variable operation result
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StackVarResult {
     pub function: String,
     pub name: String,
@@ -295,7 +295,7 @@ pub struct StackVarResult {
 }
 
 /// Xrefs to a struct field
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct XrefsToFieldResult {
     pub struct_ordinal: u32,
     pub struct_name: String,
@@ -310,7 +310,7 @@ pub struct XrefsToFieldResult {
 }
 
 /// Import info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ImportInfo {
     pub address: String,
     pub name: String,
@@ -318,7 +318,7 @@ pub struct ImportInfo {
 }
 
 /// Export/Name info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExportInfo {
     pub address: String,
     pub name: String,
@@ -326,7 +326,7 @@ pub struct ExportInfo {
 }
 
 /// Global variable/name info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GlobalInfo {
     pub address: String,
     pub name: String,
@@ -336,7 +336,7 @@ pub struct GlobalInfo {
 }
 
 /// Basic block info
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BasicBlockInfo {
     pub start: String,
     pub end: String,
@@ -347,7 +347,7 @@ pub struct BasicBlockInfo {
 }
 
 /// Bytes result
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BytesResult {
     pub address: String,
     pub bytes: String,

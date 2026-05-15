@@ -152,7 +152,8 @@ fn clean(input: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::server::tool_filter::{ToolFilter, ToolFilterError, READ_ONLY_DENY_LIST};
+    use crate::tool_registry;
 
     fn cat(s: &str) -> Vec<String> {
         vec![s.to_string()]

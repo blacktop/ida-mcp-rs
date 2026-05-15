@@ -105,8 +105,11 @@ On Linux and Windows, users may need to set environment variables at runtime:
 # Stdio (default, single-client)
 ./target/release/ida-mcp
 
-# Streamable HTTP (multi-client, SSE)
+# Streamable HTTP (multi-client transport, one IDB by default)
 ./target/release/ida-mcp serve-http --bind 127.0.0.1:8765
+
+# Streamable HTTP with concurrent multi-IDB worker pool
+./target/release/ida-mcp serve-http --bind 127.0.0.1:8765 --max-workers 4 --min-workers 1
 
 # CLI probe (test IDA connection)
 ./target/release/ida-mcp probe --path /path/to/binary --list 10

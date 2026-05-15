@@ -89,15 +89,6 @@ echo "$open_resp" | grep -q "function_count" || {
   exit 1
 }
 
-if [[ ! -f "$BOOTSTRAP_I64" ]]; then
-  echo "bootstrap did not create $BOOTSTRAP_I64" >&2
-  if [[ -s "$server_log" ]]; then
-    echo "server output:" >&2
-    cat "$server_log" >&2
-  fi
-  exit 1
-fi
-
 close_token="$(echo "$open_resp" | sed -n 's/.*\\\"close_token\\\"[[:space:]]*:[[:space:]]*\\\"\\([^\\\"]*\\)\\\".*/\\1/p')"
 if [[ -n "$close_token" ]]; then
   close_args="{\"close_token\":\"$close_token\"}"
@@ -112,5 +103,14 @@ curl -sS \
   -H "Mcp-Session-Id: $session_id" \
   -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"close_idb\",\"arguments\":$close_args}}" \
   "http://127.0.0.1:$PORT/" >/dev/null
+
+if [[ ! -f "$BOOTSTRAP_I64" ]]; then
+  echo "bootstrap did not create $BOOTSTRAP_I64" >&2
+  if [[ -s "$server_log" ]]; then
+    echo "server output:" >&2
+    cat "$server_log" >&2
+  fi
+  exit 1
+fi
 
 echo "HTTP bootstrap test passed"

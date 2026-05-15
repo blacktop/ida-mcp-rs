@@ -244,9 +244,11 @@ pub fn handle_open(
         db
     } else {
         // Raw binary - open with auto-analysis and save to .i64
-        let out_path = raw_out_path
-            .as_ref()
-            .expect("raw binary should have out path");
+        let Some(out_path) = raw_out_path.as_ref() else {
+            return Err(ToolError::OpenFailed(
+                "raw binary output path was not initialized".to_string(),
+            ));
+        };
         info!(
             "Opening raw binary with auto-analysis (idb_out={})",
             out_path.display()

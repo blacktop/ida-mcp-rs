@@ -2,6 +2,7 @@
 
 use crate::error::ToolError;
 use crate::ida::observability::ProgressSender;
+use crate::ida::pool::PooledSessionState;
 use crate::ida::request::IdaRequest;
 use crate::ida::types::*;
 use serde_json::Value;
@@ -1170,9 +1171,940 @@ impl IdaWorker {
     }
 }
 
+/// Dispatch surface used by MCP handlers.
+///
+/// The local variant preserves the existing in-process worker path. The pooled
+/// variant routes calls through a per-session child process lease.
+#[derive(Clone)]
+pub enum WorkerBackend {
+    Local(Arc<IdaWorker>),
+    Pooled(Arc<PooledSessionState>),
+}
+
+impl WorkerBackend {
+    pub fn local(worker: Arc<IdaWorker>) -> Self {
+        Self::Local(worker)
+    }
+
+    pub fn pooled(state: Arc<PooledSessionState>) -> Self {
+        Self::Pooled(state)
+    }
+
+    pub(crate) fn uses_close_tokens(&self) -> bool {
+        matches!(self, Self::Local(_))
+    }
+
+    pub(crate) fn is_pooled(&self) -> bool {
+        matches!(self, Self::Pooled(_))
+    }
+
+    pub(crate) fn issue_close_token_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<Result<CloseTokenGrant, String>> {
+        match self {
+            Self::Local(worker) => Some(worker.issue_close_token_for_session(session_id)),
+            Self::Pooled(_) => None,
+        }
+    }
+
+    pub(crate) fn authorize_close(
+        &self,
+        session_id: &str,
+        token: Option<&str>,
+        force: bool,
+    ) -> CloseAuthorization {
+        match self {
+            Self::Local(worker) => worker.authorize_close(session_id, token, force),
+            // Pooled HTTP workers are private to one rmcp session, so close_idb
+            // cannot affect another client's database and does not need a
+            // cross-session recovery token.
+            Self::Pooled(_) => CloseAuthorization::Granted,
+        }
+    }
+
+    pub(crate) fn clear_close_token(&self) {
+        if let Self::Local(worker) = self {
+            worker.clear_close_token();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open(
+        &self,
+        path: &str,
+        load_debug_info: bool,
+        debug_info_path: Option<String>,
+        debug_info_verbose: bool,
+        force: bool,
+        file_type: Option<String>,
+        auto_analyse: bool,
+        extra_args: Vec<String>,
+    ) -> Result<DbInfo, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .open(
+                        path,
+                        load_debug_info,
+                        debug_info_path,
+                        debug_info_verbose,
+                        force,
+                        file_type,
+                        auto_analyse,
+                        extra_args,
+                    )
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .open(
+                        path,
+                        load_debug_info,
+                        debug_info_path,
+                        debug_info_verbose,
+                        force,
+                        file_type,
+                        auto_analyse,
+                        extra_args,
+                    )
+                    .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_observed(
+        &self,
+        path: &str,
+        load_debug_info: bool,
+        debug_info_path: Option<String>,
+        debug_info_verbose: bool,
+        force: bool,
+        file_type: Option<String>,
+        auto_analyse: bool,
+        extra_args: Vec<String>,
+        progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<DbInfo, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .open_observed(
+                        path,
+                        load_debug_info,
+                        debug_info_path,
+                        debug_info_verbose,
+                        force,
+                        file_type,
+                        auto_analyse,
+                        extra_args,
+                        progress_tx,
+                        cancel,
+                    )
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .open_observed(
+                        path,
+                        load_debug_info,
+                        debug_info_path,
+                        debug_info_verbose,
+                        force,
+                        file_type,
+                        auto_analyse,
+                        extra_args,
+                        progress_tx,
+                        cancel,
+                    )
+                    .await
+            }
+        }
+    }
+
+    pub async fn close(&self) -> Result<(), ToolError> {
+        match self {
+            Self::Local(worker) => worker.close().await,
+            Self::Pooled(state) => state.close().await,
+        }
+    }
+
+    pub async fn close_for_shutdown(&self) -> Result<(), ToolError> {
+        match self {
+            Self::Local(worker) => worker.close_for_shutdown().await,
+            Self::Pooled(state) => state.close().await,
+        }
+    }
+
+    pub async fn shutdown(&self) -> Result<(), ToolError> {
+        match self {
+            Self::Local(worker) => worker.shutdown().await,
+            Self::Pooled(_) => Ok(()),
+        }
+    }
+
+    pub async fn load_debug_info(
+        &self,
+        path: Option<String>,
+        verbose: bool,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.load_debug_info(path, verbose).await,
+            Self::Pooled(state) => state.load_debug_info(path, verbose).await,
+        }
+    }
+
+    pub async fn analysis_status(&self) -> Result<AnalysisStatus, ToolError> {
+        match self {
+            Self::Local(worker) => worker.analysis_status().await,
+            Self::Pooled(state) => state.analysis_status().await,
+        }
+    }
+
+    pub async fn list_functions(
+        &self,
+        offset: usize,
+        limit: usize,
+        filter: Option<String>,
+        timeout_secs: Option<u64>,
+    ) -> Result<FunctionListResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .list_functions(offset, limit, filter, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .list_functions(offset, limit, filter, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn resolve_function(&self, name: &str) -> Result<FunctionInfo, ToolError> {
+        match self {
+            Self::Local(worker) => worker.resolve_function(name).await,
+            Self::Pooled(state) => state.resolve_function(name).await,
+        }
+    }
+
+    pub async fn disasm_by_name(&self, name: &str, count: usize) -> Result<String, ToolError> {
+        match self {
+            Self::Local(worker) => worker.disasm_by_name(name, count).await,
+            Self::Pooled(state) => state.disasm_by_name(name, count).await,
+        }
+    }
+
+    pub async fn disasm(&self, addr: u64, count: usize) -> Result<String, ToolError> {
+        match self {
+            Self::Local(worker) => worker.disasm(addr, count).await,
+            Self::Pooled(state) => state.disasm(addr, count).await,
+        }
+    }
+
+    pub async fn decompile(&self, addr: u64) -> Result<String, ToolError> {
+        match self {
+            Self::Local(worker) => worker.decompile(addr).await,
+            Self::Pooled(state) => state.decompile(addr).await,
+        }
+    }
+
+    pub async fn segments(&self) -> Result<Vec<SegmentInfo>, ToolError> {
+        match self {
+            Self::Local(worker) => worker.segments().await,
+            Self::Pooled(state) => state.segments().await,
+        }
+    }
+
+    pub async fn strings(
+        &self,
+        offset: usize,
+        limit: usize,
+        filter: Option<String>,
+        timeout_secs: Option<u64>,
+    ) -> Result<StringListResult, ToolError> {
+        match self {
+            Self::Local(worker) => worker.strings(offset, limit, filter, timeout_secs).await,
+            Self::Pooled(state) => state.strings(offset, limit, filter, timeout_secs).await,
+        }
+    }
+
+    pub async fn local_types(
+        &self,
+        offset: usize,
+        limit: usize,
+        filter: Option<String>,
+        timeout_secs: Option<u64>,
+    ) -> Result<LocalTypeListResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .local_types(offset, limit, filter, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => state.local_types(offset, limit, filter, timeout_secs).await,
+        }
+    }
+
+    pub async fn declare_type(
+        &self,
+        decl: String,
+        relaxed: bool,
+        replace: bool,
+        multi: bool,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.declare_type(decl, relaxed, replace, multi).await,
+            Self::Pooled(state) => state.declare_type(decl, relaxed, replace, multi).await,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_types(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        stack_offset: Option<i64>,
+        stack_name: Option<String>,
+        decl: Option<String>,
+        type_name: Option<String>,
+        relaxed: bool,
+        delay: bool,
+        strict: bool,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .apply_types(
+                        addr,
+                        name,
+                        offset,
+                        stack_offset,
+                        stack_name,
+                        decl,
+                        type_name,
+                        relaxed,
+                        delay,
+                        strict,
+                    )
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .apply_types(
+                        addr,
+                        name,
+                        offset,
+                        stack_offset,
+                        stack_name,
+                        decl,
+                        type_name,
+                        relaxed,
+                        delay,
+                        strict,
+                    )
+                    .await
+            }
+        }
+    }
+
+    pub async fn infer_types(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+    ) -> Result<GuessTypeResult, ToolError> {
+        match self {
+            Self::Local(worker) => worker.infer_types(addr, name, offset).await,
+            Self::Pooled(state) => state.infer_types(addr, name, offset).await,
+        }
+    }
+
+    pub async fn addr_info(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+    ) -> Result<AddressInfo, ToolError> {
+        match self {
+            Self::Local(worker) => worker.addr_info(addr, name, offset).await,
+            Self::Pooled(state) => state.addr_info(addr, name, offset).await,
+        }
+    }
+
+    pub async fn function_at(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+    ) -> Result<FunctionRangeInfo, ToolError> {
+        match self {
+            Self::Local(worker) => worker.function_at(addr, name, offset).await,
+            Self::Pooled(state) => state.function_at(addr, name, offset).await,
+        }
+    }
+
+    pub async fn disasm_function_at(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        count: usize,
+    ) -> Result<String, ToolError> {
+        match self {
+            Self::Local(worker) => worker.disasm_function_at(addr, name, offset, count).await,
+            Self::Pooled(state) => state.disasm_function_at(addr, name, offset, count).await,
+        }
+    }
+
+    pub async fn declare_stack(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        var_name: Option<String>,
+        decl: String,
+        relaxed: bool,
+    ) -> Result<StackVarResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .declare_stack(addr, name, offset, var_name, decl, relaxed)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .declare_stack(addr, name, offset, var_name, decl, relaxed)
+                    .await
+            }
+        }
+    }
+
+    pub async fn delete_stack(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: Option<i64>,
+        var_name: Option<String>,
+    ) -> Result<StackVarResult, ToolError> {
+        match self {
+            Self::Local(worker) => worker.delete_stack(addr, name, offset, var_name).await,
+            Self::Pooled(state) => state.delete_stack(addr, name, offset, var_name).await,
+        }
+    }
+
+    pub async fn stack_frame(&self, addr: u64) -> Result<FrameInfo, ToolError> {
+        match self {
+            Self::Local(worker) => worker.stack_frame(addr).await,
+            Self::Pooled(state) => state.stack_frame(addr).await,
+        }
+    }
+
+    pub async fn structs(
+        &self,
+        offset: usize,
+        limit: usize,
+        filter: Option<String>,
+        timeout_secs: Option<u64>,
+    ) -> Result<StructListResult, ToolError> {
+        match self {
+            Self::Local(worker) => worker.structs(offset, limit, filter, timeout_secs).await,
+            Self::Pooled(state) => state.structs(offset, limit, filter, timeout_secs).await,
+        }
+    }
+
+    pub async fn struct_info(
+        &self,
+        ordinal: Option<u32>,
+        name: Option<String>,
+    ) -> Result<StructInfo, ToolError> {
+        match self {
+            Self::Local(worker) => worker.struct_info(ordinal, name).await,
+            Self::Pooled(state) => state.struct_info(ordinal, name).await,
+        }
+    }
+
+    pub async fn read_struct(
+        &self,
+        addr: u64,
+        ordinal: Option<u32>,
+        name: Option<String>,
+    ) -> Result<StructReadResult, ToolError> {
+        match self {
+            Self::Local(worker) => worker.read_struct(addr, ordinal, name).await,
+            Self::Pooled(state) => state.read_struct(addr, ordinal, name).await,
+        }
+    }
+
+    pub async fn xrefs_to(&self, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+        match self {
+            Self::Local(worker) => worker.xrefs_to(addr).await,
+            Self::Pooled(state) => state.xrefs_to(addr).await,
+        }
+    }
+
+    pub async fn xrefs_from(&self, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+        match self {
+            Self::Local(worker) => worker.xrefs_from(addr).await,
+            Self::Pooled(state) => state.xrefs_from(addr).await,
+        }
+    }
+
+    pub async fn xrefs_to_field(
+        &self,
+        ordinal: Option<u32>,
+        name: Option<String>,
+        member_index: Option<u32>,
+        member_name: Option<String>,
+        limit: usize,
+    ) -> Result<XrefsToFieldResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .xrefs_to_field(ordinal, name, member_index, member_name, limit)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .xrefs_to_field(ordinal, name, member_index, member_name, limit)
+                    .await
+            }
+        }
+    }
+
+    pub async fn imports(&self, offset: usize, limit: usize) -> Result<Vec<ImportInfo>, ToolError> {
+        match self {
+            Self::Local(worker) => worker.imports(offset, limit).await,
+            Self::Pooled(state) => state.imports(offset, limit).await,
+        }
+    }
+
+    pub async fn exports(&self, offset: usize, limit: usize) -> Result<Vec<ExportInfo>, ToolError> {
+        match self {
+            Self::Local(worker) => worker.exports(offset, limit).await,
+            Self::Pooled(state) => state.exports(offset, limit).await,
+        }
+    }
+
+    pub async fn entrypoints(&self) -> Result<Vec<String>, ToolError> {
+        match self {
+            Self::Local(worker) => worker.entrypoints().await,
+            Self::Pooled(state) => state.entrypoints().await,
+        }
+    }
+
+    pub async fn get_bytes(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        size: usize,
+    ) -> Result<BytesResult, ToolError> {
+        match self {
+            Self::Local(worker) => worker.get_bytes(addr, name, offset, size).await,
+            Self::Pooled(state) => state.get_bytes(addr, name, offset, size).await,
+        }
+    }
+
+    pub async fn set_comments(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        comment: String,
+        repeatable: bool,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .set_comments(addr, name, offset, comment, repeatable)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .set_comments(addr, name, offset, comment, repeatable)
+                    .await
+            }
+        }
+    }
+
+    pub async fn rename(
+        &self,
+        addr: Option<u64>,
+        current_name: Option<String>,
+        new_name: String,
+        flags: i32,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.rename(addr, current_name, new_name, flags).await,
+            Self::Pooled(state) => state.rename(addr, current_name, new_name, flags).await,
+        }
+    }
+
+    pub async fn patch_bytes(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        bytes: Vec<u8>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.patch_bytes(addr, name, offset, bytes).await,
+            Self::Pooled(state) => state.patch_bytes(addr, name, offset, bytes).await,
+        }
+    }
+
+    pub async fn patch_asm(
+        &self,
+        addr: Option<u64>,
+        name: Option<String>,
+        offset: i64,
+        line: String,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.patch_asm(addr, name, offset, line).await,
+            Self::Pooled(state) => state.patch_asm(addr, name, offset, line).await,
+        }
+    }
+
+    pub async fn basic_blocks(&self, addr: u64) -> Result<Vec<BasicBlockInfo>, ToolError> {
+        match self {
+            Self::Local(worker) => worker.basic_blocks(addr).await,
+            Self::Pooled(state) => state.basic_blocks(addr).await,
+        }
+    }
+
+    pub async fn callees(&self, addr: u64) -> Result<Vec<FunctionInfo>, ToolError> {
+        match self {
+            Self::Local(worker) => worker.callees(addr).await,
+            Self::Pooled(state) => state.callees(addr).await,
+        }
+    }
+
+    pub async fn callers(&self, addr: u64) -> Result<Vec<FunctionInfo>, ToolError> {
+        match self {
+            Self::Local(worker) => worker.callers(addr).await,
+            Self::Pooled(state) => state.callers(addr).await,
+        }
+    }
+
+    pub async fn idb_meta(&self) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.idb_meta().await,
+            Self::Pooled(state) => state.idb_meta().await,
+        }
+    }
+
+    pub async fn lookup_funcs(&self, queries: Vec<String>) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.lookup_funcs(queries).await,
+            Self::Pooled(state) => state.lookup_funcs(queries).await,
+        }
+    }
+
+    pub async fn list_globals(
+        &self,
+        query: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .list_globals(query, offset, limit, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => state.list_globals(query, offset, limit, timeout_secs).await,
+        }
+    }
+
+    pub async fn analyze_strings(
+        &self,
+        query: Option<String>,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .analyze_strings(query, offset, limit, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .analyze_strings(query, offset, limit, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn find_string(
+        &self,
+        query: String,
+        exact: bool,
+        case_insensitive: bool,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<StringListResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .find_string(query, exact, case_insensitive, offset, limit, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .find_string(query, exact, case_insensitive, offset, limit, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn xrefs_to_string(
+        &self,
+        query: String,
+        exact: bool,
+        case_insensitive: bool,
+        offset: usize,
+        limit: usize,
+        max_xrefs: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<StringXrefsResult, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .xrefs_to_string(
+                        query,
+                        exact,
+                        case_insensitive,
+                        offset,
+                        limit,
+                        max_xrefs,
+                        timeout_secs,
+                    )
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .xrefs_to_string(
+                        query,
+                        exact,
+                        case_insensitive,
+                        offset,
+                        limit,
+                        max_xrefs,
+                        timeout_secs,
+                    )
+                    .await
+            }
+        }
+    }
+
+    pub async fn analyze_funcs(&self, timeout_secs: Option<u64>) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.analyze_funcs(timeout_secs).await,
+            Self::Pooled(state) => state.analyze_funcs(timeout_secs).await,
+        }
+    }
+
+    pub async fn analyze_funcs_observed(
+        &self,
+        progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.analyze_funcs_observed(progress_tx, cancel).await,
+            Self::Pooled(state) => state.analyze_funcs_observed(progress_tx, cancel).await,
+        }
+    }
+
+    pub async fn find_bytes(
+        &self,
+        pattern: String,
+        max_results: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.find_bytes(pattern, max_results, timeout_secs).await,
+            Self::Pooled(state) => state.find_bytes(pattern, max_results, timeout_secs).await,
+        }
+    }
+
+    pub async fn search_text(
+        &self,
+        text: String,
+        max_results: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.search_text(text, max_results, timeout_secs).await,
+            Self::Pooled(state) => state.search_text(text, max_results, timeout_secs).await,
+        }
+    }
+
+    pub async fn search_imm(
+        &self,
+        imm: u64,
+        max_results: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.search_imm(imm, max_results, timeout_secs).await,
+            Self::Pooled(state) => state.search_imm(imm, max_results, timeout_secs).await,
+        }
+    }
+
+    pub async fn find_insns(
+        &self,
+        patterns: Vec<String>,
+        max_results: usize,
+        case_insensitive: bool,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .find_insns(patterns, max_results, case_insensitive, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .find_insns(patterns, max_results, case_insensitive, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn find_insn_operands(
+        &self,
+        patterns: Vec<String>,
+        max_results: usize,
+        case_insensitive: bool,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .find_insn_operands(patterns, max_results, case_insensitive, timeout_secs)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .find_insn_operands(patterns, max_results, case_insensitive, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    pub async fn read_int(&self, addr: u64, size: usize) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.read_int(addr, size).await,
+            Self::Pooled(state) => state.read_int(addr, size).await,
+        }
+    }
+
+    pub async fn get_string(&self, addr: u64, max_len: usize) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.get_string(addr, max_len).await,
+            Self::Pooled(state) => state.get_string(addr, max_len).await,
+        }
+    }
+
+    pub async fn get_global_value(&self, query: String) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.get_global_value(query).await,
+            Self::Pooled(state) => state.get_global_value(query).await,
+        }
+    }
+
+    pub async fn find_paths(
+        &self,
+        start: u64,
+        end: u64,
+        max_paths: usize,
+        max_depth: usize,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.find_paths(start, end, max_paths, max_depth).await,
+            Self::Pooled(state) => state.find_paths(start, end, max_paths, max_depth).await,
+        }
+    }
+
+    pub async fn callgraph(
+        &self,
+        addr: u64,
+        max_depth: usize,
+        max_nodes: usize,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.callgraph(addr, max_depth, max_nodes).await,
+            Self::Pooled(state) => state.callgraph(addr, max_depth, max_nodes).await,
+        }
+    }
+
+    pub async fn xref_matrix(&self, addrs: Vec<u64>) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.xref_matrix(addrs).await,
+            Self::Pooled(state) => state.xref_matrix(addrs).await,
+        }
+    }
+
+    pub async fn export_funcs(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<FunctionListResult, ToolError> {
+        match self {
+            Self::Local(worker) => worker.export_funcs(offset, limit).await,
+            Self::Pooled(state) => state.export_funcs(offset, limit).await,
+        }
+    }
+
+    pub async fn run_script(
+        &self,
+        code: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.run_script(code, timeout_secs).await,
+            Self::Pooled(state) => state.run_script(code, timeout_secs).await,
+        }
+    }
+
+    pub async fn run_script_observed(
+        &self,
+        code: &str,
+        progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.run_script_observed(code, progress_tx, cancel).await,
+            Self::Pooled(state) => state.run_script_observed(code, progress_tx, cancel).await,
+        }
+    }
+
+    pub async fn pseudocode_at(
+        &self,
+        addr: u64,
+        end_addr: Option<u64>,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.pseudocode_at(addr, end_addr).await,
+            Self::Pooled(state) => state.pseudocode_at(addr, end_addr).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CloseAuthorization, IdaWorker};
+    use crate::ida::worker::{CloseAuthorization, IdaWorker};
     use std::sync::mpsc;
 
     fn test_worker() -> IdaWorker {
