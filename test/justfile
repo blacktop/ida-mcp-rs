@@ -94,6 +94,38 @@ test: fixture
     rm -f "$tmp"
     echo "✅ Stdio test passed"
 
+# Verify the license-expiry preflight runs and reports a healthy license
+test-license: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        exit 1
+    fi
+    echo "🧪 Running license preflight test..."
+    log="$(mktemp)"
+    printf '%s\n' \
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"lic","version":"0"},"capabilities":{}}}' \
+      '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_idb","arguments":{"path":"{{ test_bin }}"}}}' \
+      '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}' \
+      | RUST_LOG="{{ rust_log }}" "{{ server_bin }}" serve >/dev/null 2>"$log" || true
+    if rg -q 'IDA license expired|IDA license is invalid' "$log"; then
+        echo "❌ License preflight reports an unhealthy license:" >&2
+        rg 'IDA license' "$log" >&2
+        rm -f "$log"
+        exit 1
+    fi
+    if ! rg -q 'IDA license valid' "$log" && ! rg -q 'IDA license expires in' "$log"; then
+        echo "❌ License preflight did not run (no expiry log line). Init log tail:" >&2
+        rg 'Initializing|runtime version|license' "$log" >&2 || tail -20 "$log" >&2
+        rm -f "$log"
+        exit 1
+    fi
+    rg 'IDA license' "$log"
+    rm -f "$log"
+    echo "✅ License preflight test passed"
+
 # Run HTTP integration test
 test-http: fixture
     #!/usr/bin/env bash

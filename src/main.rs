@@ -40,8 +40,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
-const LEGACY_HTTP_SESSION_KEEP_ALIVE_SECS: u64 = 1800;
-const POOLED_HTTP_SESSION_KEEP_ALIVE_SECS: u64 = 300;
+const DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS: u64 = 1800;
 
 #[derive(Parser)]
 #[command(name = "ida-mcp", version, about = "Headless IDA Pro MCP Server")]
@@ -145,10 +144,11 @@ struct ServeHttpArgs {
     #[arg(long, default_value_t = 15)]
     sse_keep_alive_secs: u64,
     /// HTTP session inactivity timeout in seconds (0 disables, but may leak
-    /// zombie sessions on silent disconnects). Defaults to 1800s in legacy
-    /// HTTP mode and 300s in pooled mode.
-    #[arg(long)]
-    session_keep_alive_secs: Option<u64>,
+    /// zombie sessions on silent disconnects). In pooled mode this is the
+    /// fallback for POST-only clients; SSE clients are reclaimed via
+    /// --worker-disconnect-grace-secs.
+    #[arg(long, default_value_t = DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS)]
+    session_keep_alive_secs: u64,
     /// Use stateless mode (POST only; no sessions)
     #[arg(long)]
     stateless: bool,
@@ -182,16 +182,6 @@ struct ServeHttpArgs {
     /// Grace period before pooled sessions are closed after a client stream disconnects.
     #[arg(long, default_value_t = 2)]
     worker_disconnect_grace_secs: u64,
-}
-
-fn effective_session_keep_alive_secs(args: &ServeHttpArgs) -> u64 {
-    args.session_keep_alive_secs.unwrap_or({
-        if args.max_workers > 1 {
-            POOLED_HTTP_SESSION_KEEP_ALIVE_SECS
-        } else {
-            LEGACY_HTTP_SESSION_KEEP_ALIVE_SECS
-        }
-    })
 }
 
 #[derive(Args)]
@@ -475,7 +465,7 @@ fn run_server_http(
         .bind
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
-    let session_keep_alive_secs = effective_session_keep_alive_secs(&args);
+    let session_keep_alive_secs = args.session_keep_alive_secs;
 
     if args.max_workers > 1 {
         return run_server_http_pooled(
@@ -989,52 +979,19 @@ fn disasm_at(db: &IDB, addr: Address, count: usize) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        effective_session_keep_alive_secs, ServeHttpArgs, LEGACY_HTTP_SESSION_KEEP_ALIVE_SECS,
-        POOLED_HTTP_SESSION_KEEP_ALIVE_SECS,
-    };
-
-    fn serve_http_args(max_workers: usize, session_keep_alive_secs: Option<u64>) -> ServeHttpArgs {
-        ServeHttpArgs {
-            bind: "127.0.0.1:8765".to_string(),
-            sse_keep_alive_secs: 15,
-            session_keep_alive_secs,
-            stateless: false,
-            json_response: false,
-            allow_origin: Vec::new(),
-            allow_host: None,
-            max_workers,
-            min_workers: 0,
-            worker_idle_timeout_secs: 300,
-            worker_op_timeout_secs: 600,
-            worker_disconnect_grace_secs: 2,
-        }
-    }
+    use crate::{Cli, DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS};
+    use clap::Parser;
 
     #[test]
-    fn legacy_http_keeps_long_session_default() {
-        let args = serve_http_args(1, None);
-
+    fn http_session_keep_alive_default_is_thirty_minutes() {
+        let cli = Cli::parse_from(["ida-mcp", "serve-http"]);
+        let crate::Command::ServeHttp(args) = cli.command.expect("subcommand") else {
+            panic!("expected serve-http")
+        };
         assert_eq!(
-            effective_session_keep_alive_secs(&args),
-            LEGACY_HTTP_SESSION_KEEP_ALIVE_SECS
+            args.session_keep_alive_secs,
+            DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS
         );
-    }
-
-    #[test]
-    fn pooled_http_uses_shorter_session_default() {
-        let args = serve_http_args(2, None);
-
-        assert_eq!(
-            effective_session_keep_alive_secs(&args),
-            POOLED_HTTP_SESSION_KEEP_ALIVE_SECS
-        );
-    }
-
-    #[test]
-    fn explicit_session_keep_alive_overrides_mode_default() {
-        let args = serve_http_args(2, Some(1200));
-
-        assert_eq!(effective_session_keep_alive_secs(&args), 1200);
+        assert_eq!(DEFAULT_HTTP_SESSION_KEEP_ALIVE_SECS, 1800);
     }
 }

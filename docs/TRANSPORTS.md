@@ -58,8 +58,9 @@ Options:
 - `--allow-host`: comma-separated extra `Host` allowlist for DNS names or
   alternate authorities; pass a quoted `*` or an empty value to disable the check
 - `--sse-keep-alive-secs`: keep-alive interval (0 disables)
-- `--session-keep-alive-secs`: HTTP session inactivity timeout (defaults to
-  1800s with `--max-workers 1`, 300s with pooled workers; 0 disables)
+- `--session-keep-alive-secs`: HTTP session inactivity timeout (default 1800s;
+  0 disables). In pooled mode this is the fallback reclaim for POST-only
+  clients — SSE clients are reclaimed faster via `--worker-disconnect-grace-secs`.
 - `--max-workers`: maximum child worker processes for concurrent multi-IDB
   sessions; `1` keeps the legacy in-process worker
 - `--min-workers`: idle child workers to keep warm when pooled mode is enabled

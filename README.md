@@ -210,8 +210,8 @@ If an SSE-capable client exits without sending `close_idb` or HTTP `DELETE`,
 pooled mode closes the session after its standalone SSE stream disconnects and
 the `--worker-disconnect-grace-secs` reconnect grace elapses.
 POST-only clients do not always leave a stream for the server to observe, so
-their orphaned sessions are reclaimed by `--session-keep-alive-secs`, which
-defaults to 300 seconds in pooled mode and 1800 seconds in legacy HTTP mode.
+their orphaned sessions are reclaimed by `--session-keep-alive-secs` (default
+1800 seconds). Lower it if you need faster pool reclaim for POST-only clients.
 
 #### `dyld_shared_cache` analysis
 

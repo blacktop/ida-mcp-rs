@@ -61,6 +61,46 @@ fn check_ida_version() -> Option<String> {
     }
 }
 
+fn check_license_expiry() -> Result<(), String> {
+    if let Ok(false) = idalib::is_valid_license() {
+        return Err(
+            "IDA license is invalid (is_valid_license() returned false). \
+             Check ida.hexlic / license server reachability."
+                .to_string(),
+        );
+    }
+    let end = match idalib::license_end_date() {
+        Ok(Some(ts)) => ts,
+        Ok(None) => {
+            info!("IDA license valid (no expiry date set)");
+            return Ok(());
+        }
+        Err(e) => {
+            warn!("Could not query IDA license expiry: {e}");
+            return Ok(());
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if end <= now {
+        let days_ago = (now - end) / 86_400;
+        return Err(format!(
+            "IDA license expired {days_ago} days ago (end_date={end}). \
+             Renew the license before opening databases; otherwise IDA's \
+             init_database() will terminate this process mid-open."
+        ));
+    }
+    let days_left = (end - now) / 86_400;
+    if days_left <= 7 {
+        warn!("IDA license expires in {days_left} days (end_date={end})");
+    } else {
+        info!("IDA license valid for {days_left} more days");
+    }
+    Ok(())
+}
+
 /// Initialize IDA on the main thread and record the version state.
 pub fn init_ida_library() -> Result<IdaInitState, String> {
     info!("Initializing IDA library (main thread)");
@@ -70,6 +110,8 @@ pub fn init_ida_library() -> Result<IdaInitState, String> {
     let version_mismatch = check_ida_version();
     if let Some(ref msg) = version_mismatch {
         error!("{msg}");
+    } else {
+        check_license_expiry()?;
     }
 
     Ok(IdaInitState {

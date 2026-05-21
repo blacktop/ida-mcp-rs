@@ -275,7 +275,7 @@ second-open-failure)
 
   meta_resp="$(tool_call "$session_a" 30 idb_meta '{}' 10)"
   assert_tool_ok "$meta_resp" "idb_meta after failed second open"
-  printf '%s' "$meta_resp" | tool_text | jq -e '.path | contains("mini-a")' >/dev/null || {
+  printf '%s' "$meta_resp" | tool_text | jq -e '(.path // .input_file_path // "") | contains("mini-a")' >/dev/null || {
     echo "failed second open did not preserve the original database" >&2
     printf '%s\n' "$meta_resp" | jq . >&2
     cat "$server_log" >&2 || true
