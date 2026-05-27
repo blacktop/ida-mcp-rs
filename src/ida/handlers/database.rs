@@ -75,6 +75,11 @@ fn idb_path_for_raw_binary(path: &Path) -> PathBuf {
     PathBuf::from(raw_idb)
 }
 
+fn existing_idb_for_raw_binary(path: &Path) -> Option<PathBuf> {
+    let idb_path = idb_path_for_raw_binary(path);
+    idb_path.exists().then_some(idb_path)
+}
+
 fn has_ida_database_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -135,6 +140,7 @@ pub fn handle_open(
     debug_info_path: Option<&str>,
     debug_info_verbose: bool,
     force: bool,
+    rebuild: bool,
     file_type: Option<&str>,
     auto_analyse: bool,
     extra_args: &[String],
@@ -178,13 +184,33 @@ pub fn handle_open(
     let is_idb = ext == "i64" || ext == "idb" || ext == "id0";
 
     let mut raw_out_path = None;
+    let mut existing_raw_idb_path = None;
     let mut dsym_path = None;
     let mut should_load_dsym = false;
     if !is_idb {
         let out_path = idb_path_for_raw_binary(&expanded);
-        should_load_dsym = !out_path.exists();
-        if should_load_dsym {
-            dsym_path = dsym_path_for_binary(&expanded);
+        let generated_idb_path = existing_idb_for_raw_binary(&expanded);
+        let generated_exists = generated_idb_path.is_some();
+        if let Some(generated_idb_path) = generated_idb_path.filter(|_| !rebuild) {
+            info!(
+                input = %expanded.display(),
+                idb = %generated_idb_path.display(),
+                auto_analyse,
+                "Reusing existing IDA database for raw input; set rebuild=true to reanalyze raw input"
+            );
+            existing_raw_idb_path = Some(generated_idb_path);
+        } else {
+            if generated_exists {
+                warn!(
+                    input = %expanded.display(),
+                    idb = %out_path.display(),
+                    "Rebuilding raw input and overwriting existing generated IDA database"
+                );
+            }
+            should_load_dsym = !generated_exists;
+            if should_load_dsym {
+                dsym_path = dsym_path_for_binary(&expanded);
+            }
         }
         raw_out_path = Some(out_path);
     }
@@ -230,9 +256,9 @@ pub fn handle_open(
     });
 
     let open_start = Instant::now();
-    let mut opened_path = expanded.clone();
     let init_args = init_database_args(extra_args);
-    let open_message = if is_idb {
+    let open_existing_database = is_idb || existing_raw_idb_path.is_some();
+    let open_message = if open_existing_database {
         "Opening existing IDA database"
     } else if auto_analyse {
         "Opening raw binary and waiting for initial auto-analysis"
@@ -247,16 +273,18 @@ pub fn handle_open(
         Some(OPEN_IDB_PROGRESS_TOTAL),
         open_message,
     );
-    let db = if is_idb {
+    let db_path_to_open = existing_raw_idb_path.as_ref().unwrap_or(&expanded);
+    let (db, opened_path) = if open_existing_database {
         // Open existing IDA database (no auto-analysis needed, but save=true to pack on close)
+        let mut opened_path = db_path_to_open.clone();
         let mut opts = IDBOpenOptions::new();
         opts.auto_analyse(false).save(true);
         for arg in &init_args {
             opts.arg(arg);
         }
-        let mut db = opts.open(&expanded);
+        let mut db = opts.open(db_path_to_open);
         if db.is_err() {
-            if let Some(id0_path) = unpacked_id0_path(&expanded) {
+            if let Some(id0_path) = unpacked_id0_path(db_path_to_open) {
                 if id0_path.exists() {
                     info!(path = %id0_path.display(), "Falling back to unpacked ID0 database");
                     opened_path = id0_path.clone();
@@ -269,7 +297,7 @@ pub fn handle_open(
                 }
             }
         }
-        db
+        (db, opened_path)
     } else {
         // Raw binary - open with auto-analysis and save to .i64
         let Some(out_path) = raw_out_path.as_ref() else {
@@ -281,7 +309,7 @@ pub fn handle_open(
             "Opening raw binary with auto-analysis (idb_out={})",
             out_path.display()
         );
-        opened_path = out_path.clone();
+        let opened_path = out_path.clone();
         let mut opts = IDBOpenOptions::new();
         opts.auto_analyse(auto_analyse);
         if let Some(ft) = file_type {
@@ -291,7 +319,8 @@ pub fn handle_open(
         for arg in &init_args {
             opts.arg(arg);
         }
-        opts.idb(out_path).save(true).open(&expanded)
+        let db = opts.idb(out_path).save(true).open(&expanded);
+        (db, opened_path)
     };
     let _ = ticker_stop_tx.send(());
     let _ = ticker.join();
@@ -451,11 +480,15 @@ pub fn handle_load_debug_info(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        fs,
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use crate::ida::handlers::database::{
-        base_input_path_for_database, database_paths_match, has_ida_database_extension,
-        idb_path_for_raw_binary, init_database_args, non_empty_trimmed,
+        base_input_path_for_database, database_paths_match, existing_idb_for_raw_binary,
+        has_ida_database_extension, idb_path_for_raw_binary, init_database_args, non_empty_trimmed,
     };
 
     #[test]
@@ -520,6 +553,28 @@ mod tests {
             idb_path_for_raw_binary(Path::new("/tmp/kernelcache.release.iphone")),
             Path::new("/tmp/kernelcache.release.iphone.i64")
         );
+    }
+
+    #[test]
+    fn existing_idb_for_raw_binary_detects_generated_database_without_replacing_extension() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ida-mcp-test-{unique}"));
+        fs::create_dir(&dir).expect("create temp dir");
+        let raw = dir.join("testA.exe");
+        let generated = dir.join("testA.exe.i64");
+        let replaced_extension = dir.join("testA.i64");
+
+        fs::write(&raw, b"raw").expect("write raw");
+        fs::write(&replaced_extension, b"wrong idb").expect("write replaced-extension idb");
+
+        assert_eq!(existing_idb_for_raw_binary(&raw), None);
+
+        fs::write(&generated, b"generated idb").expect("write generated idb");
+        assert_eq!(existing_idb_for_raw_binary(&raw), Some(generated));
+        fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
     #[test]

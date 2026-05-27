@@ -740,7 +740,17 @@ impl IdaMcpServer {
         let i64_str = out_i64.display().to_string();
         let open_result = self
             .worker
-            .open(&i64_str, false, None, false, false, None, true, Vec::new())
+            .open(
+                &i64_str,
+                false,
+                None,
+                false,
+                false,
+                false,
+                None,
+                true,
+                Vec::new(),
+            )
             .await;
 
         let db_info = match open_result {
@@ -887,6 +897,7 @@ impl IdaMcpServer {
                 None,
                 false,
                 false,
+                false,
                 None,
                 true,
                 Vec::new(),
@@ -1018,7 +1029,8 @@ fn apply_close_metadata(
 impl IdaMcpServer {
     #[tool(
         description = "Open an IDA database (.i64/.idb) or raw binary (Mach-O/ELF/PE). \
-        Raw binaries are saved as .i64 alongside the input. \
+        Raw binaries are saved as .i64 alongside the input and later raw-path opens reuse \
+        that database unless rebuild=true is set. \
         For raw binaries, auto-analysis is OFF by default — check analysis_status; \
         call analyze_funcs(background=true) for full xrefs/decompile. \
         Returns close_token in HTTP/SSE mode (provide to close_idb). \
@@ -1087,6 +1099,7 @@ impl IdaMcpServer {
                         debug_info_path.clone(),
                         req.debug_info_verbose.unwrap_or(false),
                         req.force.unwrap_or(false),
+                        req.rebuild.unwrap_or(false),
                         file_type.clone(),
                         effective_auto_analyse,
                         worker_extra_args.clone(),

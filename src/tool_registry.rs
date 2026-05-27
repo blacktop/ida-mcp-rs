@@ -150,7 +150,9 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         short_desc: "Open an IDA database or raw binary",
         full_desc: "Open an IDA Pro database file or a raw binary for analysis. \
                     Supports .i64 (64-bit) and .idb (32-bit) databases, as well as raw binaries \
-                    like Mach-O/ELF/PE. Raw binaries are saved as .i64 alongside the input. \
+                    like Mach-O/ELF/PE. Raw binaries are saved as .i64 alongside the input; \
+                    if that generated .i64 already exists, ida-mcp opens it directly instead of rebuilding. \
+                    Set rebuild=true only when the raw input changed or stale analysis should be overwritten. \
                     Auto-analysis does NOT run by default — open returns quickly with the database \
                     loaded. Check analysis_status in the response: if auto_is_ok is false and you \
                     need xrefs/decompile, call analyze_funcs(background=true) and poll task_status. \

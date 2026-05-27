@@ -85,7 +85,15 @@ fn main() {
     );
     let _ = writeln!(
         out,
-        "auto-analyzed and saved as a .i64 alongside the input. If a sibling .dSYM"
+        "auto-analyzed and saved as a .i64 alongside the input. If that generated .i64"
+    );
+    let _ = writeln!(
+        out,
+        "already exists, it is opened directly instead of rebuilding the raw input. Set rebuild=true"
+    );
+    let _ = writeln!(
+        out,
+        "only when the input changed or stale analysis should be overwritten. If a sibling .dSYM"
     );
     let _ = writeln!(
         out,
@@ -127,7 +135,7 @@ fn main() {
     let _ = writeln!(out, "- Addresses accept hex (`0x1000`) or decimal (`4096`)");
     let _ = writeln!(
         out,
-        "- Raw binaries are auto-analyzed on first open; `.i64` is saved alongside the input"
+        "- Raw binaries are auto-analyzed on first open; `.i64` is saved alongside the input and reused on later raw-path opens unless `rebuild=true`"
     );
 
     let args: Vec<String> = std::env::args().collect();

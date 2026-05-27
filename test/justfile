@@ -392,6 +392,25 @@ test-elicitation: fixture
     RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" bash ./stdio_elicitation.sh
     echo "✅ Elicitation test passed"
 
+# Run open_idb rebuild semantics test (Cases C and D from the rebuild=bool patch)
+# Phase 1 seeds a tmpdir .i64 with a renamed function via the raw-input path,
+# Phase 2 re-opens the raw path and asserts the rename survives (reuse),
+# Phase 3 re-opens with rebuild=true and asserts the rename is gone (overwrite).
+test-rebuild-idb: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for rebuild-idb test (brew install jq)"
+        exit 1
+    fi
+    RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" \
+        bash ./stdio_rebuild_idb.sh
+
 # Run callees-indirect regression test (PR #20)
 # Builds a tiny C fixture with both a direct and an indirect call, opens it
 # at a bundle-id-style path, and checks that callees() returns only the direct
@@ -492,7 +511,7 @@ test-crash-guard: test-bootstrap
     exec 3>"$fifo_in"
 
     cleanup() {
-        exec 3>&- 2>/dev/null || true
+        exec 3>&- || true
         rm -f "$fifo_in"
         kill "$server_pid" 2>/dev/null || true
         wait "$server_pid" 2>/dev/null || true
@@ -620,7 +639,7 @@ test-dsc dsc_path=dsc_test_path:
     exec 3>"$fifo_in"
 
     cleanup() {
-        exec 3>&- 2>/dev/null || true
+        exec 3>&- || true
         rm -f "$fifo_in"
         kill "$server_pid" 2>/dev/null || true
         wait "$server_pid" 2>/dev/null || true

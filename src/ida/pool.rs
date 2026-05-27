@@ -935,6 +935,7 @@ impl PooledSessionState {
         debug_info_path: Option<String>,
         debug_info_verbose: bool,
         force: bool,
+        rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
         extra_args: Vec<String>,
@@ -953,6 +954,7 @@ impl PooledSessionState {
                     debug_info_path,
                     debug_info_verbose,
                     force,
+                    rebuild,
                     file_type,
                     auto_analyse,
                     extra_args,
@@ -986,6 +988,7 @@ impl PooledSessionState {
         debug_info_path: Option<String>,
         debug_info_verbose: bool,
         force: bool,
+        rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
         extra_args: Vec<String>,
@@ -996,6 +999,7 @@ impl PooledSessionState {
             debug_info_path,
             debug_info_verbose,
             force,
+            rebuild,
             file_type,
             auto_analyse,
             extra_args,
@@ -1856,6 +1860,7 @@ fn open_idb_child_args(
     debug_info_path: Option<String>,
     debug_info_verbose: bool,
     force: bool,
+    rebuild: bool,
     file_type: Option<String>,
     auto_analyse: bool,
     extra_args: Vec<String>,
@@ -1867,6 +1872,7 @@ fn open_idb_child_args(
         "debug_info_path": debug_info_path,
         "debug_info_verbose": debug_info_verbose,
         "force": force,
+        "rebuild": rebuild,
         "file_type": file_type,
         "auto_analyse": auto_analyse,
         "_worker_extra_args": extra_args,
@@ -2079,12 +2085,14 @@ mod tests {
             Some("/tmp/a.dSYM".to_string()),
             true,
             false,
+            false,
             Some("pe".to_string()),
             true,
             vec!["-A".to_string()],
             Some(600),
         );
         assert_eq!(open_args["timeout_secs"], json!(600));
+        assert_eq!(open_args["rebuild"], json!(false));
 
         let analyze_args = analyze_funcs_child_args(Some(600), false);
         assert_eq!(analyze_args["timeout_secs"], json!(600));

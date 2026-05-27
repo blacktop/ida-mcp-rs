@@ -26,7 +26,7 @@ tmpdir=""
 current_large=""
 
 cleanup_case() {
-  exec 3>&- 2>/dev/null || true
+  exec 3>&- || true
   if [[ -n "${server_pid:-}" ]]; then
     kill "$server_pid" >/dev/null 2>&1 || true
     sleep 0.5

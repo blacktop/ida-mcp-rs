@@ -185,6 +185,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 debug_info_path,
                 debug_info_verbose,
                 force,
+                rebuild,
                 file_type,
                 auto_analyse,
                 extra_args,
@@ -203,7 +204,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     let _ = resp.send(Err(err));
                     continue;
                 }
-                info!(path = %path, force, file_type = ?file_type, auto_analyse, "Opening database");
+                info!(path = %path, force, rebuild, file_type = ?file_type, auto_analyse, "Opening database");
                 let result = database::handle_open(
                     &mut idb,
                     &mut lock_file,
@@ -213,6 +214,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     debug_info_path.as_deref(),
                     debug_info_verbose,
                     force,
+                    rebuild,
                     file_type.as_deref(),
                     auto_analyse,
                     &extra_args,

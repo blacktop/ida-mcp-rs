@@ -24,6 +24,10 @@ pub struct OpenIdbRequest {
     #[serde(alias = "recover")]
     pub force: Option<bool>,
     #[schemars(
+        description = "For raw binaries, rebuild and overwrite the generated <path>.i64 instead of reusing it. Use when the input binary changed or stale analysis must be replaced."
+    )]
+    pub rebuild: Option<bool>,
+    #[schemars(
         description = "IDA file-type selector (-T). Raw binaries only. Empty strings are ignored."
     )]
     pub file_type: Option<String>,
@@ -86,6 +90,7 @@ mod tests {
             debug_info_path: debug_info_path.map(str::to_string),
             debug_info_verbose: None,
             force: None,
+            rebuild: None,
             file_type: file_type.map(str::to_string),
             auto_analyse: None,
             timeout_secs: None,

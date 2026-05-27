@@ -180,6 +180,10 @@ test-observability: build
 test-elicitation: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-elicitation
 
+# Run open_idb rebuild semantics test (raw reuse vs rebuild=true overwrite)
+test-rebuild-idb: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-rebuild-idb
+
 # Run dyld_shared_cache integration test (requires mounted iOS DMG; default path is /tmp/ios_sys_mount/...)
 test-dsc dsc_path="": build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-dsc {{ if dsc_path != "" { dsc_path } else { "" } }}

@@ -15,6 +15,7 @@ pub enum IdaRequest {
         debug_info_path: Option<String>,
         debug_info_verbose: bool,
         force: bool,
+        rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
         extra_args: Vec<String>,

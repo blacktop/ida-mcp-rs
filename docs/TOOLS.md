@@ -11,7 +11,9 @@
 - Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires close_token from open_idb)
 
 Note: `open_idb` accepts .i64/.idb or raw binaries (Mach-O/ELF/PE). Raw binaries are
-auto-analyzed and saved as a .i64 alongside the input. If a sibling .dSYM
+auto-analyzed and saved as a .i64 alongside the input. If that generated .i64
+already exists, it is opened directly instead of rebuilding the raw input. Set rebuild=true
+only when the input changed or stale analysis should be overwritten. If a sibling .dSYM
 exists and no .i64 is present, its DWARF debug info is loaded automatically.
 
 ## Core (`core`)
@@ -39,7 +41,7 @@ List, search, and resolve functions
 
 | Tool | Description |
 |------|-------------|
-| `analyze_funcs` | Run auto-analysis and wait for completion |
+| `analyze_funcs` | Run auto-analysis (foreground or background task) |
 | `function_at` | Find the function containing an address |
 | `list_funcs` | Alias of list_functions |
 | `list_functions` | List functions with pagination and filtering |
@@ -174,4 +176,4 @@ Execute Python scripts via IDAPython
 - Many tools accept a single value or array (e.g., `"0x1000"` or `["0x1000", "0x2000"]`)
 - String inputs may be comma-separated: `"0x1000, 0x2000"`
 - Addresses accept hex (`0x1000`) or decimal (`4096`)
-- Raw binaries are auto-analyzed on first open; `.i64` is saved alongside the input
+- Raw binaries are auto-analyzed on first open; `.i64` is saved alongside the input and reused on later raw-path opens unless `rebuild=true`
