@@ -21,7 +21,10 @@ use crate::server::operation::{
 use crate::tool_registry::{self, ToolCategory};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo, Tool, ToolAnnotations},
+    model::{
+        CallToolResult, ContentBlock as Content, ServerCapabilities, ServerInfo, Tool,
+        ToolAnnotations,
+    },
     schemars::{schema_for, JsonSchema},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
@@ -4472,7 +4475,7 @@ impl ServerHandler for IdaMcpServer {
 
     async fn get_task_info(
         &self,
-        request: GetTaskInfoParams,
+        request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         let state = self.task_registry.get(&request.task_id).ok_or_else(|| {
@@ -4481,15 +4484,12 @@ impl ServerHandler for IdaMcpServer {
                 Some(json!({ "task_id": request.task_id })),
             )
         })?;
-        Ok(GetTaskResult {
-            meta: None,
-            task: task_state_to_mcp(&state),
-        })
+        Ok(GetTaskResult::new(task_state_to_mcp(&state)))
     }
 
     async fn get_task_result(
         &self,
-        request: GetTaskResultParams,
+        request: GetTaskPayloadParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskPayloadResult, McpError> {
         let state = self.task_registry.get(&request.task_id);
@@ -4526,10 +4526,7 @@ impl ServerHandler for IdaMcpServer {
                     None,
                 )
             })?;
-            Ok(CancelTaskResult {
-                meta: None,
-                task: task_state_to_mcp(&state),
-            })
+            Ok(CancelTaskResult::new(task_state_to_mcp(&state)))
         } else {
             Err(McpError::invalid_params(
                 "Task not found or not running",
@@ -4841,7 +4838,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
     async fn get_task_info(
         &self,
-        request: GetTaskInfoParams,
+        request: GetTaskParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         self.inner.get_task_info(request, ctx).await
@@ -4849,7 +4846,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
     async fn get_task_result(
         &self,
-        request: GetTaskResultParams,
+        request: GetTaskPayloadParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskPayloadResult, McpError> {
         self.inner.get_task_result(request, ctx).await
@@ -5274,7 +5271,7 @@ mod tests {
 
     #[test]
     fn task_payload_preserves_valid_call_tool_result() {
-        let result = CallToolResult::success(vec![rmcp::model::Content::text("ok")]);
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text("ok")]);
         let as_value = serde_json::to_value(&result).expect("serialize CallToolResult");
         assert_eq!(task_payload_result_value(Some(as_value.clone())), as_value);
     }

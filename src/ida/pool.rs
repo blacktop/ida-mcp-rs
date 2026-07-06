@@ -8,8 +8,8 @@ use crate::ida::types::*;
 use crate::ida::worker::MAX_TIMEOUT_SECS;
 use futures_util::future::join_all;
 use rmcp::handler::client::ClientHandler;
-use rmcp::model::{CallToolResult, ClientInfo, JsonObject, LoggingMessageNotificationParam};
-use rmcp::service::{NotificationContext, Peer, RoleClient, RunningService};
+use rmcp::model::{CallToolResult, ClientInfo, JsonObject};
+use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::ServiceExt;
 use serde::de::DeserializeOwned;
@@ -93,26 +93,9 @@ pub struct PooledWorkerHandle {
 }
 
 #[derive(Clone)]
-struct ParentClientHandler {
-    worker_id: usize,
-}
+struct ParentClientHandler;
 
 impl ClientHandler for ParentClientHandler {
-    async fn on_logging_message(
-        &self,
-        params: LoggingMessageNotificationParam,
-        _context: NotificationContext<RoleClient>,
-    ) {
-        debug!(
-            target: "ida_mcp::worker",
-            worker_id = self.worker_id,
-            level = ?params.level,
-            logger = ?params.logger,
-            data = ?params.data,
-            "child worker log"
-        );
-    }
-
     fn get_info(&self) -> ClientInfo {
         ClientInfo::default()
     }
@@ -443,7 +426,7 @@ impl WorkerPool {
             })?;
         let pid = transport.id();
         let stderr_task = spawn_stderr_relay(id, stderr);
-        let handler = ParentClientHandler { worker_id: id };
+        let handler = ParentClientHandler;
         let service = handler.serve(transport).await.map_err(|err| {
             ToolError::RemoteProtocol(format!("failed to initialize worker {id}: {err}"))
         })?;

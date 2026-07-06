@@ -3,7 +3,7 @@
 //! Tool execution errors are returned with `is_error: true` in CallToolResult,
 //! while protocol errors (invalid tool name, malformed args) are handled by rmcp.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock as Content};
 use thiserror::Error;
 
 /// Tool execution errors - returned with is_error: true in CallToolResult
