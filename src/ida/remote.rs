@@ -154,7 +154,7 @@ pub(crate) async fn call_tool(
 mod tests {
     use crate::error::ToolError;
     use crate::ida::remote::{parse_json, parse_value};
-    use rmcp::model::{CallToolResult, Content};
+    use rmcp::model::{CallToolResult, ContentBlock as Content};
     use serde_json::{json, Value};
 
     #[test]

@@ -157,11 +157,15 @@ pub enum IdaRequest {
     },
     XRefsTo {
         addr: u64,
-        resp: oneshot::Sender<Result<Vec<XRefInfo>, ToolError>>,
+        offset: usize,
+        limit: usize,
+        resp: oneshot::Sender<Result<XRefListResult, ToolError>>,
     },
     XRefsFrom {
         addr: u64,
-        resp: oneshot::Sender<Result<Vec<XRefInfo>, ToolError>>,
+        offset: usize,
+        limit: usize,
+        resp: oneshot::Sender<Result<XRefListResult, ToolError>>,
     },
     XRefsToField {
         ordinal: Option<u32>,

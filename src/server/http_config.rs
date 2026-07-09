@@ -32,6 +32,7 @@ fn session_manager_with_keep_alive(session_keep_alive_secs: u64) -> LocalSession
     } else {
         Some(Duration::from_secs(session_keep_alive_secs))
     };
+    manager.session_config.sse_retry = None;
     manager
 }
 
@@ -415,6 +416,15 @@ mod tests {
             manager.session_config.keep_alive,
             Some(Duration::from_secs(1800)),
             "explicit value must override rmcp's 300s default that killed long IDA calls"
+        );
+    }
+
+    #[test]
+    fn session_manager_disables_request_wise_priming() {
+        let manager = build_session_manager(1800);
+        assert!(
+            manager.session_config.sse_retry.is_none(),
+            "request-wise SSE priming must match the outer streamable config"
         );
     }
 

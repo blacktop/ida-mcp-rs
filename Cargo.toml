@@ -1,6 +1,6 @@
 [package]
 name = "ida-mcp"
-version = "9.3.24"
+version = "9.3.26"
 edition = "2024"
 description = "Headless IDA Pro MCP Server"
 license = "MIT"
@@ -12,7 +12,7 @@ categories = ["development-tools", "command-line-utilities"]
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.3.1" }
-rmcp = { version = "1.7", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "elicitation", "schemars"] }
+rmcp = { version = "2.2.0", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "elicitation", "schemars"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal", "process", "io-util"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }

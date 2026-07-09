@@ -250,6 +250,20 @@ pub struct XRefInfo {
     pub is_code: bool,
 }
 
+/// Paginated cross-reference listing.
+///
+/// `truncated` is true when more references exist beyond `limit`; in that case
+/// `next_offset` carries the offset to pass on the next call to page through
+/// the remaining references. High-frequency targets can have enormous xref
+/// counts, so enumeration is always bounded.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct XRefListResult {
+    pub xrefs: Vec<XRefInfo>,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<usize>,
+}
+
 /// Declared type result
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeclareTypeResult {

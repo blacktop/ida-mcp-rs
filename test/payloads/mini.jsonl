@@ -23,6 +23,8 @@
 {"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"strings","arguments":{"limit":10}}}
 {"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"find_string","arguments":{"query":"value=%d","limit":10}}}
 {"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"xrefs_to_string","arguments":{"query":"value=%d","limit":5}}}
+{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"xrefs_to","arguments":{"address":"0x100004010","limit":5}}}
+{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"xrefs_from","arguments":{"address":"0x10000058c","limit":5}}}
 {"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"local_types","arguments":{"limit":10}}}
 {"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"declare_type","arguments":{"decl":"typedef int mcp_int_t;","replace":true}}}
 {"jsonrpc":"2.0","id":27,"method":"tools/call","params":{"name":"apply_types","arguments":{"name":"interesting_function_renamed","decl":"int interesting_function_renamed(int a, int b);","strict":true}}}

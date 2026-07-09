@@ -473,6 +473,23 @@ pub struct AddressRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct XrefsRequest {
+    #[schemars(description = "Address(es) (string/number or array)")]
+    #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
+    pub address: Value,
+    #[schemars(description = "Maximum xrefs to return per address (1-10000, default: 1000)")]
+    #[serde(alias = "count")]
+    #[schemars(range(min = 1, max = 10000))]
+    pub limit: Option<i64>,
+    #[schemars(description = "Offset for pagination (default: 0)")]
+    #[schemars(range(min = 0))]
+    pub offset: Option<i64>,
+    #[schemars(description = "Timeout in seconds for this operation (default: 120, max: 600)")]
+    #[schemars(range(min = 0, max = 600))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetBytesRequest {
     #[schemars(description = "Address(es) to read from (string/number or array)")]
     #[serde(alias = "addrs", alias = "addr", alias = "addresses")]

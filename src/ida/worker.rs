@@ -651,17 +651,39 @@ impl IdaWorker {
     }
 
     /// Get cross-references to an address.
-    pub async fn xrefs_to(&self, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+    pub async fn xrefs_to(
+        &self,
+        addr: u64,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<XRefListResult, ToolError> {
         let (tx, rx) = oneshot::channel();
-        self.try_send(IdaRequest::XRefsTo { addr, resp: tx })?;
-        rx.await?
+        self.try_send(IdaRequest::XRefsTo {
+            addr,
+            offset,
+            limit,
+            resp: tx,
+        })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
     }
 
     /// Get cross-references from an address.
-    pub async fn xrefs_from(&self, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+    pub async fn xrefs_from(
+        &self,
+        addr: u64,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<XRefListResult, ToolError> {
         let (tx, rx) = oneshot::channel();
-        self.try_send(IdaRequest::XRefsFrom { addr, resp: tx })?;
-        rx.await?
+        self.try_send(IdaRequest::XRefsFrom {
+            addr,
+            offset,
+            limit,
+            resp: tx,
+        })?;
+        Self::recv_with_timeout(rx, timeout_secs).await
     }
 
     /// Get xrefs to a struct field.
@@ -1654,17 +1676,29 @@ impl WorkerBackend {
         }
     }
 
-    pub async fn xrefs_to(&self, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+    pub async fn xrefs_to(
+        &self,
+        addr: u64,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<XRefListResult, ToolError> {
         match self {
-            Self::Local(worker) => worker.xrefs_to(addr).await,
-            Self::Pooled(state) => state.xrefs_to(addr).await,
+            Self::Local(worker) => worker.xrefs_to(addr, offset, limit, timeout_secs).await,
+            Self::Pooled(state) => state.xrefs_to(addr, offset, limit, timeout_secs).await,
         }
     }
 
-    pub async fn xrefs_from(&self, addr: u64) -> Result<Vec<XRefInfo>, ToolError> {
+    pub async fn xrefs_from(
+        &self,
+        addr: u64,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+    ) -> Result<XRefListResult, ToolError> {
         match self {
-            Self::Local(worker) => worker.xrefs_from(addr).await,
-            Self::Pooled(state) => state.xrefs_from(addr).await,
+            Self::Local(worker) => worker.xrefs_from(addr, offset, limit, timeout_secs).await,
+            Self::Pooled(state) => state.xrefs_from(addr, offset, limit, timeout_secs).await,
         }
     }
 

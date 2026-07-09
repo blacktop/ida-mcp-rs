@@ -1,5 +1,5 @@
 name: ida-mcp
-version: '9.3.24'
+version: '9.3.26'
 summary: Headless IDA Pro MCP Server for AI-powered binary analysis
 description: |
   ida-mcp exposes IDA Pro's analysis engine over the Model Context Protocol,

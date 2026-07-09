@@ -663,24 +663,44 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::XRefsTo { addr, resp } => {
+            IdaRequest::XRefsTo {
+                addr,
+                offset,
+                limit,
+                resp,
+            } => {
                 debug!(address = format!("{:#x}", addr), "Getting xrefs to");
                 let result = crate::crash_guard::crash_guarded("handle_xrefs_to", || {
-                    xrefs::handle_xrefs_to(&idb, addr)
+                    xrefs::handle_xrefs_to(&idb, addr, offset, limit)
                 });
                 match &result {
-                    Ok(refs) => debug!(count = refs.len(), "Got xrefs to"),
+                    Ok(refs) => {
+                        debug!(
+                            count = refs.xrefs.len(),
+                            truncated = refs.truncated,
+                            "Got xrefs to"
+                        )
+                    }
                     Err(e) => warn!(error = %e, "Failed to get xrefs"),
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::XRefsFrom { addr, resp } => {
+            IdaRequest::XRefsFrom {
+                addr,
+                offset,
+                limit,
+                resp,
+            } => {
                 debug!(address = format!("{:#x}", addr), "Getting xrefs from");
                 let result = crate::crash_guard::crash_guarded("handle_xrefs_from", || {
-                    xrefs::handle_xrefs_from(&idb, addr)
+                    xrefs::handle_xrefs_from(&idb, addr, offset, limit)
                 });
                 match &result {
-                    Ok(refs) => debug!(count = refs.len(), "Got xrefs from"),
+                    Ok(refs) => debug!(
+                        count = refs.xrefs.len(),
+                        truncated = refs.truncated,
+                        "Got xrefs from"
+                    ),
                     Err(e) => warn!(error = %e, "Failed to get xrefs"),
                 }
                 let _ = resp.send(result);

@@ -21,7 +21,10 @@ use crate::server::operation::{
 use crate::tool_registry::{self, ToolCategory};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo, Tool, ToolAnnotations},
+    model::{
+        CallToolResult, ContentBlock as Content, ServerCapabilities, ServerInfo, Tool,
+        ToolAnnotations,
+    },
     schemars::{schema_for, JsonSchema},
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
@@ -196,6 +199,13 @@ fn timeout_with_child_grace(timeout_secs: Option<u64>, default_timeout_secs: u64
         .unwrap_or(default_timeout_secs)
         .min(MAX_TIMEOUT_SECS)
         .saturating_add(CHILD_TIMEOUT_GRACE_SECS)
+}
+
+/// Which side of the xref relation the `xrefs_to`/`xrefs_from` tools query.
+#[derive(Clone, Copy)]
+enum XrefDirection {
+    To,
+    From,
 }
 
 impl IdaMcpServer {
@@ -407,6 +417,108 @@ impl IdaMcpServer {
             _ => Err(ToolError::InvalidParams(format!(
                 "{field_name} must contain exactly one value"
             ))),
+        }
+    }
+
+    /// Default page size for xref listings when the caller omits `limit`.
+    const DEFAULT_XREFS_LIMIT: usize = 1000;
+    /// Hard cap on a single xref page, mirroring other paginated tools.
+    const MAX_XREFS_LIMIT: usize = 10000;
+
+    /// Parse and clamp the pagination inputs shared by `xrefs_to`/`xrefs_from`.
+    ///
+    /// Returns `(offset, limit, timeout_secs)`. The limit is clamped to
+    /// `1..=MAX_XREFS_LIMIT`: the upper bound stops a high-frequency target from
+    /// forcing an unbounded enumeration, and the lower bound of 1 guarantees a
+    /// paginating caller always makes forward progress (a `limit` of 0 would
+    /// return an empty-but-truncated page whose `next_offset` never advances).
+    fn parse_xrefs_paging(req: &XrefsRequest) -> Result<(usize, usize, Option<u64>), ToolError> {
+        let limit = parse_optional_unsigned::<usize>(req.limit, "limit")?
+            .unwrap_or(Self::DEFAULT_XREFS_LIMIT)
+            .clamp(1, Self::MAX_XREFS_LIMIT);
+        let offset = parse_optional_unsigned::<usize>(req.offset, "offset")?.unwrap_or(0);
+        let timeout_secs = parse_optional_unsigned::<u64>(req.timeout_secs, "timeout_secs")?;
+        Ok((offset, limit, timeout_secs))
+    }
+
+    /// Wrap a per-address xref result for the multi-address response, injecting
+    /// the queried address into the serialized listing.
+    fn xrefs_entry(addr: u64, result: crate::ida::types::XRefListResult) -> Value {
+        let mut entry = serde_json::to_value(&result).unwrap_or_else(|_| json!({}));
+        if let Value::Object(map) = &mut entry {
+            map.insert("address".to_string(), json!(format!("{:#x}", addr)));
+        }
+        entry
+    }
+
+    /// Fetch one paginated xref listing in the given direction.
+    async fn xrefs_for(
+        &self,
+        addr: u64,
+        offset: usize,
+        limit: usize,
+        timeout_secs: Option<u64>,
+        direction: XrefDirection,
+    ) -> Result<crate::ida::types::XRefListResult, ToolError> {
+        match direction {
+            XrefDirection::To => {
+                self.worker
+                    .xrefs_to(addr, offset, limit, timeout_secs)
+                    .await
+            }
+            XrefDirection::From => {
+                self.worker
+                    .xrefs_from(addr, offset, limit, timeout_secs)
+                    .await
+            }
+        }
+    }
+
+    /// Shared body of the `xrefs_to`/`xrefs_from` tools: parse pagination,
+    /// resolve addresses, and assemble the single- or multi-address response.
+    async fn xrefs_lookup(
+        &self,
+        req: XrefsRequest,
+        direction: XrefDirection,
+    ) -> Result<CallToolResult, McpError> {
+        let (offset, limit, timeout_secs) = match Self::parse_xrefs_paging(&req) {
+            Ok(paging) => paging,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+        let addrs = match Self::value_to_addresses(&req.address) {
+            Ok(a) => a,
+            Err(e) => return Ok(e.to_tool_result()),
+        };
+
+        if addrs.len() == 1 {
+            match self
+                .xrefs_for(addrs[0], offset, limit, timeout_secs, direction)
+                .await
+            {
+                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                )])),
+                Err(e) => Ok(e.to_tool_result()),
+            }
+        } else {
+            let mut results = Vec::new();
+            for addr in addrs {
+                match self
+                    .xrefs_for(addr, offset, limit, timeout_secs, direction)
+                    .await
+                {
+                    Ok(result) => results.push(Self::xrefs_entry(addr, result)),
+                    Err(e) => results.push(json!({
+                        "address": format!("{:#x}", addr),
+                        "error": e.to_string()
+                    })),
+                }
+            }
+            Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&json!({ "results": results }))
+                    .unwrap_or_else(|_| format!("{:?}", results)),
+            )]))
         }
     }
 
@@ -1974,86 +2086,32 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get cross-references TO an address (who references this address)")]
+    #[tool(
+        description = "Get cross-references TO an address (who references this address). \
+        Paginated (default limit 1000, max 10000); when truncated=true, pass next_offset back \
+        as offset to page through high-frequency targets."
+    )]
     #[instrument(skip(self), fields(address = %req.address))]
     async fn xrefs_to(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<XrefsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: xrefs_to");
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(a) => a,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-
-        if addrs.len() == 1 {
-            match self.worker.xrefs_to(addrs[0]).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self.worker.xrefs_to(addr).await {
-                    Ok(result) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "xrefs": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        self.xrefs_lookup(req, XrefDirection::To).await
     }
 
-    #[tool(description = "Get cross-references FROM an address (what this address references)")]
+    #[tool(
+        description = "Get cross-references FROM an address (what this address references). \
+        Paginated (default limit 1000, max 10000); when truncated=true, pass next_offset back \
+        as offset to page through the remaining references."
+    )]
     #[instrument(skip(self), fields(address = %req.address))]
     async fn xrefs_from(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<XrefsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: xrefs_from");
-        let addrs = match Self::value_to_addresses(&req.address) {
-            Ok(a) => a,
-            Err(e) => return Ok(e.to_tool_result()),
-        };
-
-        if addrs.len() == 1 {
-            match self.worker.xrefs_from(addrs[0]).await {
-                Ok(result) => Ok(CallToolResult::success(vec![Content::text(
-                    serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                )])),
-                Err(e) => Ok(e.to_tool_result()),
-            }
-        } else {
-            let mut results = Vec::new();
-            for addr in addrs {
-                match self.worker.xrefs_from(addr).await {
-                    Ok(result) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "xrefs": result
-                    })),
-                    Err(e) => results.push(json!({
-                        "address": format!("{:#x}", addr),
-                        "error": e.to_string()
-                    })),
-                }
-            }
-            Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&json!({ "results": results }))
-                    .unwrap_or_else(|_| format!("{:?}", results)),
-            )]))
-        }
+        self.xrefs_lookup(req, XrefDirection::From).await
     }
 
     #[tool(description = "List imports (external symbols) with pagination")]
@@ -4245,7 +4303,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "pseudocode_at" => Some(schema::<PseudocodeAtRequest>()),
 
         // Xrefs / Control flow
-        "xrefs_to" | "xrefs_from" => Some(schema::<AddressRequest>()),
+        "xrefs_to" | "xrefs_from" => Some(schema::<XrefsRequest>()),
         "xref_matrix" => Some(schema::<XrefMatrixRequest>()),
         "basic_blocks" | "callers" | "callees" => Some(schema::<AddressRequest>()),
         "find_paths" => Some(schema::<FindPathsRequest>()),
@@ -4417,7 +4475,7 @@ impl ServerHandler for IdaMcpServer {
 
     async fn get_task_info(
         &self,
-        request: GetTaskInfoParams,
+        request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         let state = self.task_registry.get(&request.task_id).ok_or_else(|| {
@@ -4426,15 +4484,12 @@ impl ServerHandler for IdaMcpServer {
                 Some(json!({ "task_id": request.task_id })),
             )
         })?;
-        Ok(GetTaskResult {
-            meta: None,
-            task: task_state_to_mcp(&state),
-        })
+        Ok(GetTaskResult::new(task_state_to_mcp(&state)))
     }
 
     async fn get_task_result(
         &self,
-        request: GetTaskResultParams,
+        request: GetTaskPayloadParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskPayloadResult, McpError> {
         let state = self.task_registry.get(&request.task_id);
@@ -4471,10 +4526,7 @@ impl ServerHandler for IdaMcpServer {
                     None,
                 )
             })?;
-            Ok(CancelTaskResult {
-                meta: None,
-                task: task_state_to_mcp(&state),
-            })
+            Ok(CancelTaskResult::new(task_state_to_mcp(&state)))
         } else {
             Err(McpError::invalid_params(
                 "Task not found or not running",
@@ -4786,7 +4838,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
     async fn get_task_info(
         &self,
-        request: GetTaskInfoParams,
+        request: GetTaskParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         self.inner.get_task_info(request, ctx).await
@@ -4794,7 +4846,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 
     async fn get_task_result(
         &self,
-        request: GetTaskResultParams,
+        request: GetTaskPayloadParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskPayloadResult, McpError> {
         self.inner.get_task_result(request, ctx).await
@@ -4819,7 +4871,7 @@ mod tests {
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
         run_script_truncate_chars, task_payload_result_value, timeout_with_child_grace,
         tool_params_schema, IdaMcpServer, RecentOperationsRequest, ToolCatalogRequest,
-        ToolHelpRequest,
+        ToolHelpRequest, XrefsRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::CallToolResult;
@@ -4833,6 +4885,43 @@ mod tests {
             Arc::new(crate::IdaWorker::new(tx)),
             crate::ServerMode::Stdio,
         )
+    }
+
+    fn xrefs_request(limit: Option<i64>, offset: Option<i64>) -> XrefsRequest {
+        XrefsRequest {
+            address: json!("0x1000"),
+            limit,
+            offset,
+            timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn xrefs_paging_clamps_zero_limit_to_one() {
+        // limit 0 would yield an empty-but-truncated page whose next_offset never
+        // advances; the parser must clamp it so pagination always progresses.
+        let (offset, limit, _) =
+            IdaMcpServer::parse_xrefs_paging(&xrefs_request(Some(0), None)).unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(limit, 1);
+    }
+
+    #[test]
+    fn xrefs_paging_applies_default_and_upper_bound() {
+        let (_, default_limit, _) =
+            IdaMcpServer::parse_xrefs_paging(&xrefs_request(None, Some(7))).unwrap();
+        assert_eq!(default_limit, IdaMcpServer::DEFAULT_XREFS_LIMIT);
+
+        let (offset, capped_limit, _) =
+            IdaMcpServer::parse_xrefs_paging(&xrefs_request(Some(999_999), Some(7))).unwrap();
+        assert_eq!(offset, 7);
+        assert_eq!(capped_limit, IdaMcpServer::MAX_XREFS_LIMIT);
+    }
+
+    #[test]
+    fn xrefs_paging_rejects_negative_values() {
+        assert!(IdaMcpServer::parse_xrefs_paging(&xrefs_request(Some(-1), None)).is_err());
+        assert!(IdaMcpServer::parse_xrefs_paging(&xrefs_request(None, Some(-1))).is_err());
     }
 
     fn tool_result_text(result: CallToolResult) -> String {
@@ -5182,7 +5271,7 @@ mod tests {
 
     #[test]
     fn task_payload_preserves_valid_call_tool_result() {
-        let result = CallToolResult::success(vec![rmcp::model::Content::text("ok")]);
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text("ok")]);
         let as_value = serde_json::to_value(&result).expect("serialize CallToolResult");
         assert_eq!(task_payload_result_value(Some(as_value.clone())), as_value);
     }
