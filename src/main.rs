@@ -370,25 +370,24 @@ fn run_server_with_mode(filter: Arc<ToolFilter>, mode: ServerMode) -> anyhow::Re
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                        if let Some(running) = service.as_ref() {
-                            if running.is_transport_closed() {
-                                cancel_background_tasks(
-                                    &task_registry,
-                                    "Cancelled by client disconnect",
+                        if let Some(running) = service.as_ref()
+                            && running.is_transport_closed()
+                        {
+                            cancel_background_tasks(
+                                &task_registry,
+                                "Cancelled by client disconnect",
+                            );
+                            if let Some(mut running) = service.take()
+                                && running
+                                    .close_with_timeout(Duration::from_secs(2))
+                                    .await?
+                                    .is_none()
+                            {
+                                warn!(
+                                    "Timed out waiting for stdio transport cleanup after client disconnect"
                                 );
-                                if let Some(mut running) = service.take() {
-                                    if running
-                                        .close_with_timeout(Duration::from_secs(2))
-                                        .await?
-                                        .is_none()
-                                    {
-                                        warn!(
-                                            "Timed out waiting for stdio transport cleanup after client disconnect"
-                                        );
-                                    }
-                                }
-                                break;
                             }
+                            break;
                         }
                     }
                 }
@@ -935,16 +934,16 @@ fn list_functions(db: &IDB, offset: usize, limit: usize) -> ida_mcp::FunctionLis
 
 fn resolve_function(db: &IDB, name: &str) -> anyhow::Result<FunctionInfo> {
     for (_id, func) in db.functions() {
-        if let Some(func_name) = func.name() {
-            if func_name == name || func_name.contains(name) {
-                let addr = func.start_address();
-                let size = func.len();
-                return Ok(FunctionInfo {
-                    address: format!("{:#x}", addr),
-                    name: func_name,
-                    size,
-                });
-            }
+        if let Some(func_name) = func.name()
+            && (func_name == name || func_name.contains(name))
+        {
+            let addr = func.start_address();
+            let size = func.len();
+            return Ok(FunctionInfo {
+                address: format!("{:#x}", addr),
+                name: func_name,
+                size,
+            });
         }
     }
 

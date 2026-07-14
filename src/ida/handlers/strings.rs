@@ -22,10 +22,10 @@ pub fn handle_strings(
 
     for (addr, content) in string_list.iter() {
         // Apply filter if provided
-        if let Some(f) = &filter_lower {
-            if !content.to_lowercase().contains(f) {
-                continue;
-            }
+        if let Some(f) = &filter_lower
+            && !content.to_lowercase().contains(f)
+        {
+            continue;
         }
 
         total += 1;
@@ -70,10 +70,10 @@ pub fn handle_analyze_strings(
     let mut results = Vec::new();
 
     for (addr, content) in string_list.iter() {
-        if let Some(f) = &filter_lower {
-            if !content.to_lowercase().contains(f) {
-                continue;
-            }
+        if let Some(f) = &filter_lower
+            && !content.to_lowercase().contains(f)
+        {
+            continue;
         }
 
         total += 1;

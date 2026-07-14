@@ -9,7 +9,9 @@ use thiserror::Error;
 /// Tool execution errors - returned with is_error: true in CallToolResult
 #[derive(Error, Debug)]
 pub enum ToolError {
-    #[error("No database is currently open. If you had one open previously, the server may have restarted — call open_idb again.")]
+    #[error(
+        "No database is currently open. If you had one open previously, the server may have restarted — call open_idb again."
+    )]
     NoDatabaseOpen,
 
     #[error("A database is already open: {0}. Use close_idb first.")]

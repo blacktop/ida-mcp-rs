@@ -18,24 +18,24 @@ pub fn handle_imports(
 
     for name in db.names().iter() {
         // Check if this is in an external segment
-        if let Some(seg) = db.segment_at(name.address()) {
-            if seg.r#type().is_extern() || seg.r#type().is_import() {
-                if count < offset {
-                    count += 1;
-                    continue;
-                }
-
-                if imports.len() >= limit {
-                    break;
-                }
-
-                imports.push(ImportInfo {
-                    address: format!("{:#x}", name.address()),
-                    name: name.name().to_string(),
-                    ordinal: count,
-                });
+        if let Some(seg) = db.segment_at(name.address())
+            && (seg.r#type().is_extern() || seg.r#type().is_import())
+        {
+            if count < offset {
                 count += 1;
+                continue;
             }
+
+            if imports.len() >= limit {
+                break;
+            }
+
+            imports.push(ImportInfo {
+                address: format!("{:#x}", name.address()),
+                name: name.name().to_string(),
+                ordinal: count,
+            });
+            count += 1;
         }
     }
 

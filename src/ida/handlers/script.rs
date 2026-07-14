@@ -82,10 +82,10 @@ pub fn handle_run_script(
     });
     if let Some(error) = &output.error {
         result["error"] = json!(error);
-    } else if !output.success {
-        if let Some(summary) = &error_summary {
-            result["error"] = json!(summary);
-        }
+    } else if !output.success
+        && let Some(summary) = &error_summary
+    {
+        result["error"] = json!(summary);
     }
     if let Some(summary) = &error_summary {
         result["error_summary"] = json!(summary);

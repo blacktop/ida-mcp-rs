@@ -1,5 +1,5 @@
 name: ida-mcp
-version: '9.3.26'
+version: '9.4.0'
 summary: Headless IDA Pro MCP Server for AI-powered binary analysis
 description: |
   ida-mcp exposes IDA Pro's analysis engine over the Model Context Protocol,
@@ -8,9 +8,9 @@ description: |
 
   **Requires a licensed IDA Pro 9.x installation in your home directory.**
   This snap does not bundle IDA — it links against libida.so from your
-  existing install. The installer default ~/ida-pro-9.3 is auto-detected;
+  existing install. The installer default ~/ida-pro-9.4 is auto-detected;
   for custom paths under $HOME set IDADIR. Installs outside $HOME (e.g.
-  /opt/ida-pro-9.3) are not accessible under strict confinement — use
+  /opt/ida-pro-9.4) are not accessible under strict confinement — use
   Homebrew or Nix for those.
 
 license: MIT
@@ -21,7 +21,7 @@ contact: https://github.com/blacktop/ida-mcp-rs/issues
 base: core24
 grade: stable
 # Strict confinement with home interface: ida-mcp links against libida.so
-# from ~/ida-pro-9.3 (the installer default). Users with IDA outside $HOME
+# from ~/ida-pro-9.4 (the installer default). Users with IDA outside $HOME
 # need Homebrew/Nix instead.
 confinement: strict
 
@@ -37,7 +37,7 @@ apps:
   ida-mcp:
     command: bin/ida-mcp
     plugs:
-      - home          # ~/ida-pro-9.3/libida.so and IDB files
+      - home          # ~/ida-pro-9.4/libida.so and IDB files
       - dot-idapro    # ~/.idapro/ (IDA license + config; dotfiles need personal-files)
       - network       # MCP over HTTP (serve-http subcommand)
       - network-bind  # listen on a port in serve-http mode

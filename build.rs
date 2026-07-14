@@ -7,10 +7,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (install_path, ida_path, idalib_path) = idalib_build::idalib_install_paths_with(false);
 
-    if !ida_path.exists() || !idalib_path.exists() {
+    let using_sdk_stubs = !ida_path.exists() || !idalib_path.exists();
+    if using_sdk_stubs {
         if idalib_build::requires_local_ida_install() {
             return Err(
-                "IDA installation not found; Linux arm64 builds require a local IDA 9.4 install because the SDK does not ship arm64 Linux stub libraries".into(),
+                "IDA installation not found for a target that requires local IDA libraries".into(),
             );
         }
         println!("cargo::warning=IDA installation not found, using SDK stubs");
@@ -30,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Always set rpaths for runtime library discovery.
     // This adds the specified install path plus common default locations
     // so the binary can find IDA libraries without DYLD_LIBRARY_PATH.
-    set_rpath(&install_path);
+    set_rpath(&install_path, using_sdk_stubs);
 
     Ok(())
 }
@@ -38,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Set rpath to the IDA installation directory for runtime library loading.
 /// Adds multiple common IDA installation paths so the binary can find libraries
 /// without requiring DYLD_LIBRARY_PATH to be set.
-fn set_rpath(install_path: &Path) {
+fn set_rpath(install_path: &Path, include_install_path: bool) {
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| {
         if cfg!(target_os = "macos") {
             "macos".to_string()
@@ -49,8 +50,11 @@ fn set_rpath(install_path: &Path) {
         }
     });
 
-    // Always add the specified install path first
-    add_rpath(install_path);
+    // configure_linkage() already adds the selected runtime path when a local
+    // IDA install is present. Stub builds still need us to add it explicitly.
+    if include_install_path {
+        add_rpath(install_path);
+    }
 
     let targeting_94 = install_path
         .components()

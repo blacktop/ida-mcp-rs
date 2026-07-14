@@ -66,10 +66,10 @@ pub fn handle_structs(
             None => continue,
         };
 
-        if let Some(f) = &filter_lower {
-            if !info.name.to_lowercase().contains(f) {
-                continue;
-            }
+        if let Some(f) = &filter_lower
+            && !info.name.to_lowercase().contains(f)
+        {
+            continue;
         }
 
         total += 1;
@@ -118,7 +118,7 @@ pub fn handle_struct_info(
         (None, None) => {
             return Err(ToolError::InvalidParams(
                 "struct_info requires ordinal or name".to_string(),
-            ))
+            ));
         }
     };
 
@@ -168,7 +168,7 @@ pub fn handle_read_struct(
         (None, None) => {
             return Err(ToolError::InvalidParams(
                 "read_struct requires ordinal or name".to_string(),
-            ))
+            ));
         }
     };
 
@@ -227,7 +227,7 @@ pub fn handle_xrefs_to_field(
         (None, None) => {
             return Err(ToolError::InvalidParams(
                 "xrefs_to_field requires struct ordinal or name".to_string(),
-            ))
+            ));
         }
     };
 
@@ -236,11 +236,11 @@ pub fn handle_xrefs_to_field(
         (None, Some(name)) => {
             let mut found = None;
             for idx in 0..info.member_count {
-                if let Some(member) = db.udt_member(info.ordinal, idx) {
-                    if member.name == name {
-                        found = Some(idx);
-                        break;
-                    }
+                if let Some(member) = db.udt_member(info.ordinal, idx)
+                    && member.name == name
+                {
+                    found = Some(idx);
+                    break;
                 }
             }
             found.ok_or_else(|| {
@@ -253,7 +253,7 @@ pub fn handle_xrefs_to_field(
         (None, None) => {
             return Err(ToolError::InvalidParams(
                 "xrefs_to_field requires member index or name".to_string(),
-            ))
+            ));
         }
     };
 

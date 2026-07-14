@@ -76,11 +76,11 @@ pub fn handle_find_bytes(
                 }
                 let mut ok = true;
                 for (j, pb) in pat.iter().enumerate() {
-                    if let Some(b) = pb {
-                        if bytes[i + j] != *b {
-                            ok = false;
-                            break;
-                        }
+                    if let Some(b) = pb
+                        && bytes[i + j] != *b
+                    {
+                        ok = false;
+                        break;
                     }
                 }
                 if ok {

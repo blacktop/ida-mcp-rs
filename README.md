@@ -16,7 +16,7 @@
 
 ## Prerequisites
 
-- IDA Pro 9.2+ with valid license (9.3sp1 recommended)
+- IDA Pro 9.4 with valid license
 
 ## Getting Started
 
@@ -24,8 +24,8 @@
 
 **macOS / Linux** (via [Homebrew](https://brew.sh))
 ```bash
-brew install blacktop/tap/ida-mcp        # Latest (IDA 9.3/9.3sp1)
-brew install blacktop/tap/ida-mcp@beta   # IDA 9.4 beta
+brew install blacktop/tap/ida-mcp        # Latest (IDA 9.4)
+brew install blacktop/tap/ida-mcp@9.3    # IDA 9.3/9.3sp1
 brew install blacktop/tap/ida-mcp@9.2    # IDA 9.2
 ```
 
@@ -48,7 +48,7 @@ nix shell github:blacktop/nur#ida-mcp \
 sudo snap install ida-mcp
 sudo snap connect ida-mcp:dot-idapro   # grant access to ~/.idapro (license)
 ```
-> Strict confinement. Requires IDA Pro installed under `$HOME` (installer default `~/ida-pro-9.3`). For IDA in `/opt/` or system paths, use Homebrew or Nix.
+> Strict confinement. Requires IDA Pro installed under `$HOME` (installer default `~/ida-pro-9.4`). For IDA in `/opt/` or system paths, use Homebrew or Nix.
 
 **Direct download** — grab the archive for your platform from [GitHub Releases](https://github.com/blacktop/ida-mcp-rs/releases).
 
@@ -56,7 +56,7 @@ sudo snap connect ida-mcp:dot-idapro   # grant access to ~/.idapro (license)
 
 See [docs/BUILDING.md](docs/BUILDING.md).
 
-> ida-mcp versions mirror IDA Pro versions (`v9.3.x` for IDA 9.3, `v9.2.x` for IDA 9.2). A version mismatch is detected at startup with a clear error message. Scoop and NUR publish the latest version. For older IDA versions, use the matching [GitHub Release](https://github.com/blacktop/ida-mcp-rs/releases) or the versioned Homebrew cask.
+> ida-mcp versions mirror IDA Pro versions (`v9.4.x` for IDA 9.4, `v9.3.x` for IDA 9.3, and `v9.2.x` for IDA 9.2). A version mismatch is detected at startup with a clear error message. Scoop and NUR publish the latest version. For older IDA versions, use the matching [GitHub Release](https://github.com/blacktop/ida-mcp-rs/releases) or the versioned Homebrew cask.
 
 ### Platform Setup
 
@@ -73,14 +73,13 @@ claude mcp add ida -e DYLD_LIBRARY_PATH='/path/to/IDA.app/Contents/MacOS' -- ida
 ```
 
 Supported paths (auto-detected):
-- `/Applications/IDA Professional 9.3.app/Contents/MacOS`
-- `/Applications/IDA Home 9.3.app/Contents/MacOS`
-- `/Applications/IDA Essential 9.3.app/Contents/MacOS`
-- `/Applications/IDA Professional 9.2.app/Contents/MacOS`
+- `/Applications/IDA Professional 9.4.app/Contents/MacOS`
+- `/Applications/IDA Home 9.4.app/Contents/MacOS`
+- `/Applications/IDA Essential 9.4.app/Contents/MacOS`
 
 #### Linux
 
-The IDA installer defaults to `~/ida-pro-9.3` — the launcher script auto-detects this:
+The IDA installer defaults to `~/ida-pro-9.4` — the launcher script auto-detects this:
 ```bash
 claude mcp add ida -- ida-mcp
 ```
@@ -90,15 +89,15 @@ For non-default install locations, set `IDADIR`:
 claude mcp add ida -e IDADIR='/path/to/ida' -- ida-mcp
 ```
 
-Resolution order: `$IDADIR` → `~/ida-pro-9.3` → `/opt/ida-pro-9.3` and other RUNPATH fallbacks.
+Resolution order: `$IDADIR` → `~/ida-pro-9.4` → `/opt/ida-pro-9.4` and other RUNPATH fallbacks.
 
 #### Windows
 
 **Option A** — Install `ida-mcp.exe` into your IDA directory (simplest, no env setup needed):
 ```powershell
 # Copy the binary next to ida.dll / idalib.dll
-copy ida-mcp.exe "C:\Program Files\IDA Professional 9.3\"
-claude mcp add ida -- "C:\Program Files\IDA Professional 9.3\ida-mcp.exe"
+copy ida-mcp.exe "C:\Program Files\IDA Professional 9.4\"
+claude mcp add ida -- "C:\Program Files\IDA Professional 9.4\ida-mcp.exe"
 ```
 
 **Option B** — Install via [Scoop](https://scoop.sh) (auto-detects IDA and sets `IDADIR`):
@@ -110,18 +109,25 @@ claude mcp add ida -- ida-mcp
 
 **Option C** — Set `IDADIR` manually:
 ```powershell
-# Persistent (survives reboots)
-setx IDADIR "C:\Program Files\IDA Professional 9.3"
+$idaDir = "C:\Program Files\IDA Professional 9.4"
+[Environment]::SetEnvironmentVariable("IDADIR", $idaDir, "User")
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ";" | Where-Object { $_ })
+if (-not ($pathEntries -contains $idaDir)) {
+  [Environment]::SetEnvironmentVariable(
+    "Path", (@($pathEntries + $idaDir) -join ";"), "User"
+  )
+}
 # Then restart your terminal
 claude mcp add ida -- ida-mcp
 ```
 
-Windows requires `ida.dll` and `idalib.dll` to be discoverable at startup. Placing `ida-mcp.exe` in the IDA directory is the easiest approach. Otherwise, the IDA directory must be on `PATH` or pointed to by `IDADIR`.
+Windows requires `ida.dll` and `idalib.dll` to be discoverable before `ida-mcp` starts. Placing `ida-mcp.exe` in the IDA directory is the easiest approach. Otherwise, set `IDADIR` for build/install discovery and add the same IDA directory to `PATH` for runtime DLL loading.
 
 Common IDA paths:
-- `C:\Program Files\IDA Professional 9.3`
-- `C:\Program Files\IDA Pro 9.3`
-- `C:\Program Files\IDA Home 9.3`
+- `C:\Program Files\IDA Professional 9.4`
+- `C:\Program Files\IDA Pro 9.4`
+- `C:\Program Files\IDA Home 9.4`
 
 ### Runtime Requirements
 
@@ -131,7 +137,7 @@ The binary links against IDA's libraries at runtime. Standard installation paths
 |----------|---------|------------------------|
 | macOS | `libida.dylib` | `DYLD_LIBRARY_PATH` |
 | Linux | `libida.so` | `IDADIR` (launcher reads it) or `LD_LIBRARY_PATH` |
-| Windows | `ida.dll` | Place exe in IDA dir, set `IDADIR`, or add IDA dir to `PATH` |
+| Windows | `ida.dll` | Place exe in IDA dir, or set `IDADIR` and add IDA dir to `PATH` |
 
 ### Configure your AI agent
 

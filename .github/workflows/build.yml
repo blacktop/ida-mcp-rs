@@ -21,33 +21,45 @@ jobs:
           - os: linux
             arch: x86_64
             runner: ubuntu-24.04
-            idadir: /opt/idapro-9.3
+            idadir: /opt/idapro-9.4
+            cargo_args: ""
             artifact_name: ida-mcp-linux-x86_64
             artifact_path: target/release/ida-mcp
           - os: linux
             arch: arm64
             runner: ubuntu-24.04-arm
-            idadir: /opt/idapro-9.3
+            idadir: /opt/idapro-9.4
+            cargo_args: ""
             artifact_name: ida-mcp-linux-arm64
             artifact_path: target/release/ida-mcp
           - os: macos
             arch: x86_64
             runner: macos-15-intel
-            idadir: /Applications/IDA Professional 9.3.app/Contents/MacOS
+            idadir: /Applications/IDA Professional 9.4.app/Contents/MacOS
+            cargo_args: ""
             artifact_name: ida-mcp-macos-x86_64
             artifact_path: target/release/ida-mcp
           - os: macos
             arch: arm64
             runner: macos-15
-            idadir: /Applications/IDA Professional 9.3.app/Contents/MacOS
+            idadir: /Applications/IDA Professional 9.4.app/Contents/MacOS
+            cargo_args: ""
             artifact_name: ida-mcp-macos-arm64
             artifact_path: target/release/ida-mcp
           - os: windows
             arch: x86_64
             runner: windows-2025
-            idadir: C:\Program Files\IDA Professional 9.3
+            idadir: C:\Program Files\IDA Professional 9.4
+            cargo_args: ""
             artifact_name: ida-mcp-windows-x86_64
             artifact_path: target/release/ida-mcp.exe
+          - os: windows
+            arch: arm64
+            runner: windows-2025
+            idadir: C:\Program Files\IDA Professional 9.4
+            cargo_args: --target aarch64-pc-windows-msvc
+            artifact_name: ida-mcp-windows-arm64
+            artifact_path: target/aarch64-pc-windows-msvc/release/ida-mcp.exe
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Install LLVM
@@ -59,6 +71,7 @@ jobs:
 
       - name: Configure LLVM environment
         if: matrix.os == 'windows'
+        shell: pwsh
         run: echo "LIBCLANG_PATH=$((gcm clang).source -replace "clang.exe")" >> $env:GITHUB_ENV
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
@@ -68,15 +81,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7  # stable
 
-      - name: Prepare arm64 link dependencies
-        if: matrix.os == 'linux' && matrix.arch == 'arm64'
-        env:
-          PASSPHRASE: ${{ secrets.ARM64_LINK_DEPS_PASSPHRASE }}
-        run: |
-          sudo mkdir -p "${{ matrix.idadir }}"
-          gpg --batch --yes --decrypt --passphrase "$PASSPHRASE" \
-            .github/ci/link-deps.tar.gz.gpg \
-            | sudo tar xz -C "${{ matrix.idadir }}"
+      - name: Install Windows ARM64 target
+        if: matrix.os == 'windows' && matrix.arch == 'arm64'
+        run: rustup target add aarch64-pc-windows-msvc
 
       - name: Build Linux
         if: matrix.os == 'linux'
@@ -89,7 +96,7 @@ jobs:
         if: matrix.os != 'linux'
         env:
           IDADIR: ${{ matrix.idadir }}
-        run: cargo build --release --locked
+        run: cargo build --release --locked ${{ matrix.cargo_args }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4

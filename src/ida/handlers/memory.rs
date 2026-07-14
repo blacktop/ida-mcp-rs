@@ -85,7 +85,7 @@ pub fn handle_read_int(idb: &Option<IDB>, addr: u64, size: usize) -> Result<Valu
             return Err(ToolError::IdaError(format!(
                 "unsupported integer size: {}",
                 size
-            )))
+            )));
         }
     };
 

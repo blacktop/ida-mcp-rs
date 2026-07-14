@@ -42,7 +42,7 @@ package-artifacts:
             'ida_dir="${IDADIR:-}"' \
             'runtime_home="${SNAP_REAL_HOME:-${HOME:-}}"' \
             'if [ -z "$ida_dir" ] && [ -n "$runtime_home" ]; then' \
-            '    ida_dir="${runtime_home}/ida-pro-9.3"' \
+            '    ida_dir="${runtime_home}/ida-pro-9.4"' \
             'fi' \
             'if [ -n "$ida_dir" ]; then' \
             '    export LD_LIBRARY_PATH="${ida_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"' \
@@ -78,6 +78,7 @@ package-artifacts:
     package_tar ida-mcp-macos-x86_64 "ida-mcp_${VERSION}_Darwin_x86_64.tar.gz"
     package_tar ida-mcp-macos-arm64 "ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
     package_zip ida-mcp-windows-x86_64 "ida-mcp_${VERSION}_Windows_x86_64.zip"
+    package_zip ida-mcp-windows-arm64 "ida-mcp_${VERSION}_Windows_arm64.zip"
 
 generate-checksums:
     #!/usr/bin/env bash
@@ -109,8 +110,10 @@ publish-scoop version:
 
     hash_for() { grep "$1" "${CHECKSUMS_FILE}" | awk '{print $1}'; }
     WIN_X86_64_HASH=$(hash_for "Windows_x86_64.zip")
+    WIN_ARM64_HASH=$(hash_for "Windows_arm64.zip")
     python3 "{{ justfile_directory() }}/scripts/gen-scoop-manifest.py" \
-      "${VERSION}" "${WIN_X86_64_HASH}" > "${WORKDIR}/ida-mcp.json"
+      "${VERSION}" "${WIN_X86_64_HASH}" "${WIN_ARM64_HASH}" \
+      > "${WORKDIR}/ida-mcp.json"
 
     TMPDIR="$(mktemp -d)"
     git clone "https://x-access-token:${GH_AUTH_TOKEN}@github.com/blacktop/scoop-bucket.git" "${TMPDIR}"

@@ -2,8 +2,10 @@
 
 ## Prerequisites
 
-- IDA Pro 9.3+ with valid license
-- Rust 1.77+ (stable toolchain)
+- IDA Pro 9.4 with valid license
+- Rust 1.89+ (stable toolchain; Rust edition 2024 requires at least 1.85, and
+  ida-mcp uses standard-library APIs stabilized in 1.89)
+- `just` task runner
 - LLVM/Clang (for C++ bindings)
 - IDA SDK (from Hex-Rays)
 
@@ -18,14 +20,14 @@ xcode-select --install
 # Clone and build
 git clone https://github.com/blacktop/ida-mcp-rs.git
 cd ida-mcp-rs
-cargo build --release
+just release
 ```
 
-Default IDA path: `/Applications/IDA Professional 9.3.app/Contents/MacOS`
+Default IDA path: `/Applications/IDA Professional 9.4.app/Contents/MacOS`
 
 Override with `IDADIR`:
 ```bash
-IDADIR='/Applications/IDA Home 9.3.app/Contents/MacOS' cargo build --release
+env IDADIR='/Applications/IDA Home 9.4.app/Contents/MacOS' just release
 ```
 
 ### Linux (x86_64)
@@ -36,20 +38,18 @@ sudo apt-get update
 sudo apt-get install -y build-essential llvm clang libclang-dev
 
 # Set IDA path
-export IDADIR=/opt/idapro-9.3
-
 # Clone and build
 git clone https://github.com/blacktop/ida-mcp-rs.git
 cd ida-mcp-rs
-cargo build --release
+env IDADIR=/opt/idapro-9.4 just release
 ```
 
 Common Linux IDA paths:
-- `/opt/idapro-9.3`
-- `/home/<user>/idapro-9.3`
-- `/usr/local/idapro-9.3`
+- `/opt/idapro-9.4`
+- `/home/<user>/idapro-9.4`
+- `/usr/local/idapro-9.4`
 
-### Windows (x86_64)
+### Windows (x86_64 / ARM64)
 
 ```powershell
 # Install LLVM (required for bindgen)
@@ -59,7 +59,7 @@ winget install LLVM.LLVM
 # Option 2: Download from https://releases.llvm.org/
 
 # Set environment variables
-$env:IDADIR = "C:\Program Files\IDA Professional 9.3"
+$env:IDADIR = "C:\Program Files\IDA Professional 9.4"
 $env:PATH = "$env:IDADIR;$env:PATH"
 
 # Ensure LLVM is in PATH
@@ -68,13 +68,13 @@ $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
 # Clone and build
 git clone https://github.com/blacktop/ida-mcp-rs.git
 cd ida-mcp-rs
-cargo build --release
+just release
 ```
 
 Common Windows IDA paths:
-- `C:\Program Files\IDA Professional 9.3`
-- `C:\IDA Professional 9.3`
-- `C:\Program Files\IDA Home 9.3`
+- `C:\Program Files\IDA Professional 9.4`
+- `C:\IDA Professional 9.4`
+- `C:\Program Files\IDA Home 9.4`
 
 ## Build Output
 
@@ -117,4 +117,4 @@ On Linux and Windows, users may need to set environment variables at runtime:
 
 ## Cross-Compilation
 
-**Not supported.** idalib links against IDA's native libraries at build time. You must build natively on each platform with IDA installed.
+CI cross-compiles Windows ARM64 from an x86_64 Windows runner using the official IDA 9.4 SDK stubs. Other cross-compilation combinations are not tested; local runtime tests still require the matching IDA architecture.

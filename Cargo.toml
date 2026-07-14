@@ -1,7 +1,8 @@
 [package]
 name = "ida-mcp"
-version = "9.4.0-beta.2"
-edition = "2021"
+version = "9.4.0"
+edition = "2024"
+rust-version = "1.89"
 description = "Headless IDA Pro MCP Server"
 license = "MIT"
 repository = "https://github.com/blacktop/ida-mcp-rs"

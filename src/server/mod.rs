@@ -397,22 +397,22 @@ impl IdaMcpServer {
         match value {
             Value::String(s) => {
                 let trimmed = s.trim();
-                if trimmed.starts_with('[') {
-                    if let Ok(Value::Array(arr)) = serde_json::from_str(trimmed) {
-                        let mut out = Vec::with_capacity(arr.len());
-                        for v in &arr {
-                            match v {
-                                Value::String(s) => out.push(s.to_string()),
-                                Value::Number(n) => out.push(n.to_string()),
-                                _ => {
-                                    return Err(ToolError::IdaError(
-                                        "expected string or number".to_string(),
-                                    ))
-                                }
+                if trimmed.starts_with('[')
+                    && let Ok(Value::Array(arr)) = serde_json::from_str(trimmed)
+                {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for v in &arr {
+                        match v {
+                            Value::String(s) => out.push(s.to_string()),
+                            Value::Number(n) => out.push(n.to_string()),
+                            _ => {
+                                return Err(ToolError::IdaError(
+                                    "expected string or number".to_string(),
+                                ));
                             }
                         }
-                        return Ok(out);
                     }
+                    return Ok(out);
                 }
                 if trimmed.contains(',') {
                     Ok(trimmed
@@ -437,7 +437,7 @@ impl IdaMcpServer {
                         _ => {
                             return Err(ToolError::IdaError(
                                 "expected string or number".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -641,7 +641,7 @@ impl IdaMcpServer {
                         _ => {
                             return Err(ToolError::InvalidParams(
                                 "bytes must be numbers or strings".to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -1026,7 +1026,7 @@ impl IdaMcpServer {
             Err(_) => {
                 return Ok(CallToolResult::success(vec![Content::text(format!(
                     "{db_info:?}"
-                ))]))
+                ))]));
             }
         };
         if let Value::Object(map) = &mut value {
@@ -1348,10 +1348,16 @@ macro_rules! try_param {
 
 fn close_hint_for(mode: ServerMode, pooled: bool) -> &'static str {
     match (mode, pooled) {
-        (ServerMode::Http, true) => "In pooled HTTP/SSE mode, close_idb releases this session's child worker lease. Sessions do not share one global close_token.",
+        (ServerMode::Http, true) => {
+            "In pooled HTTP/SSE mode, close_idb releases this session's child worker lease. Sessions do not share one global close_token."
+        }
         (ServerMode::Stdio, _) => "Call close_idb when done to release locks for other sessions.",
-        (ServerMode::Http, false) => "In multi-client (HTTP/SSE) mode, close_idb accepts the close_token returned by open_idb. The owning session can also close without re-sending the token, and close_idb(force=true) can recover from a lost session.",
-        (ServerMode::Worker, _) => "Child worker mode is managed by the parent router; close_idb is normally called by the parent.",
+        (ServerMode::Http, false) => {
+            "In multi-client (HTTP/SSE) mode, close_idb accepts the close_token returned by open_idb. The owning session can also close without re-sending the token, and close_idb(force=true) can recover from a lost session."
+        }
+        (ServerMode::Worker, _) => {
+            "Child worker mode is managed by the parent router; close_idb is normally called by the parent."
+        }
     }
 }
 
@@ -1508,7 +1514,7 @@ impl IdaMcpServer {
                     Err(_) => {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
                             "{info:?}"
-                        ))]))
+                        ))]));
                     }
                 };
                 if let Value::Object(map) = &mut value {
@@ -1705,10 +1711,10 @@ impl IdaMcpServer {
             Ok(status) => {
                 let mut value =
                     serde_json::to_value(&status).unwrap_or_else(|_| json!(format!("{status:?}")));
-                if !matches!(self.mode, ServerMode::Worker) {
-                    if let Value::Object(map) = &mut value {
-                        map.insert("session_id".to_string(), json!(self.session_id));
-                    }
+                if !matches!(self.mode, ServerMode::Worker)
+                    && let Value::Object(map) = &mut value
+                {
+                    map.insert("session_id".to_string(), json!(self.session_id));
                 }
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{status:?}")),
@@ -1785,33 +1791,33 @@ impl IdaMcpServer {
         let filtering_active = filter.is_active();
 
         // If category specified, list tools in that category
-        if let Some(cat_str) = &req.category {
-            if let Ok(cat) = cat_str.parse::<ToolCategory>() {
-                let tools: Vec<_> = tool_registry::tools_by_category(cat)
-                    .filter(|t| filter.is_enabled(t.name))
-                    .take(limit)
-                    .map(|t| {
-                        json!({
-                            "name": t.name,
-                            "description": t.short_desc,
-                            "category": t.category.as_str(),
-                        })
+        if let Some(cat_str) = &req.category
+            && let Ok(cat) = cat_str.parse::<ToolCategory>()
+        {
+            let tools: Vec<_> = tool_registry::tools_by_category(cat)
+                .filter(|t| filter.is_enabled(t.name))
+                .take(limit)
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.short_desc,
+                        "category": t.category.as_str(),
                     })
-                    .collect();
+                })
+                .collect();
 
-                let mut payload = json!({
-                    "category": cat.as_str(),
-                    "category_description": cat.description(),
-                    "tools": tools,
-                    "hint": "Use tool_help(name) for full documentation and examples"
-                });
-                if filtering_active {
-                    payload["filtering_active"] = json!(true);
-                }
-                return Ok(CallToolResult::success(vec![Content::text(pretty_json(
-                    &payload,
-                ))]));
+            let mut payload = json!({
+                "category": cat.as_str(),
+                "category_description": cat.description(),
+                "tools": tools,
+                "hint": "Use tool_help(name) for full documentation and examples"
+            });
+            if filtering_active {
+                payload["filtering_active"] = json!(true);
             }
+            return Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &payload,
+            ))]));
         }
 
         // If query specified, search for matching tools
@@ -2630,10 +2636,10 @@ impl IdaMcpServer {
             Ok(result) => {
                 let mut value =
                     serde_json::to_value(&result).unwrap_or_else(|_| json!(format!("{result:?}")));
-                if !matches!(self.mode, ServerMode::Worker) {
-                    if let Value::Object(map) = &mut value {
-                        map.insert("session_id".to_string(), json!(self.session_id));
-                    }
+                if !matches!(self.mode, ServerMode::Worker)
+                    && let Value::Object(map) = &mut value
+                {
+                    map.insert("session_id".to_string(), json!(self.session_id));
                 }
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{result:?}")),
@@ -3118,14 +3124,14 @@ impl IdaMcpServer {
         Parameters(req): Parameters<ExportFuncsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: export_funcs");
-        if let Some(fmt) = req.format.as_deref() {
-            if fmt.to_lowercase() != "json" {
-                return Ok(ToolError::NotSupported(format!(
-                    "format {} not supported (only json)",
-                    fmt
-                ))
-                .to_tool_result());
-            }
+        if let Some(fmt) = req.format.as_deref()
+            && fmt.to_lowercase() != "json"
+        {
+            return Ok(ToolError::NotSupported(format!(
+                "format {} not supported (only json)",
+                fmt
+            ))
+            .to_tool_result());
         }
         if let Some(addrs) = req.addrs {
             let queries = match Self::value_to_strings(&addrs) {
@@ -3938,13 +3944,13 @@ impl IdaMcpServer {
         }
 
         let log_path = req.log_path.map(std::path::PathBuf::from);
-        if let Some(ref lp) = log_path {
-            if lp.to_string_lossy().contains("..") {
-                return Ok(ToolError::InvalidParams(
-                    "log_path must not contain '..' path traversal".into(),
-                )
-                .to_tool_result());
-            }
+        if let Some(ref lp) = log_path
+            && lp.to_string_lossy().contains("..")
+        {
+            return Ok(ToolError::InvalidParams(
+                "log_path must not contain '..' path traversal".into(),
+            )
+            .to_tool_result());
         }
         let idat_args = crate::dsc::idat_dsc_args(
             dsc_path,
@@ -4073,7 +4079,7 @@ impl IdaMcpServer {
             Err(ToolError::InvalidAddress(addr)) => {
                 return Ok(
                     ToolError::InvalidParams(format!("Invalid address: {addr}")).to_tool_result()
-                )
+                );
             }
             Err(e) => return Ok(e.to_tool_result()),
         };
@@ -4185,10 +4191,10 @@ impl IdaMcpServer {
             "elapsed_secs": elapsed,
         });
 
-        if let Some(result) = &state.result {
-            if let Value::Object(map) = &mut response {
-                map.insert("result".to_string(), result.clone());
-            }
+        if let Some(result) = &state.result
+            && let Value::Object(map) = &mut response
+        {
+            map.insert("result".to_string(), result.clone());
         }
 
         Ok(CallToolResult::success(vec![Content::text(

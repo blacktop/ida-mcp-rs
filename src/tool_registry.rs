@@ -169,7 +169,9 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Returns metadata about the binary: file type, processor, bitness, function count, analysis_status.",
         example: r#"{"path": "/path/to/binary", "auto_analyse": false}"#,
         default: true,
-        keywords: &["open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe"],
+        keywords: &[
+            "open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe",
+        ],
     },
     ToolInfo {
         name: "open_dsc",
@@ -201,7 +203,16 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Requires: database opened via open_dsc.",
         example: r#"{"module": "/System/Library/Frameworks/Foundation.framework/Foundation", "timeout_secs": 300}"#,
         default: false,
-        keywords: &["dsc", "dyld", "dylib", "module", "load", "add", "framework", "cache"],
+        keywords: &[
+            "dsc",
+            "dyld",
+            "dylib",
+            "module",
+            "load",
+            "add",
+            "framework",
+            "cache",
+        ],
     },
     ToolInfo {
         name: "dsc_add_region",
@@ -216,15 +227,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         example: r#"{"address": "0x180116000", "timeout_secs": 300}"#,
         default: false,
         keywords: &[
-            "dsc",
-            "dyld",
-            "region",
-            "memory",
-            "address",
-            "got",
-            "stubs",
-            "data",
-            "load",
+            "dsc", "dyld", "region", "memory", "address", "got", "stubs", "data", "load",
         ],
     },
     ToolInfo {
@@ -291,7 +294,15 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Use this after timeouts, cancellations, or failures to inspect the last known phase.",
         example: r#"{"limit": 10}"#,
         default: false,
-        keywords: &["recent", "operations", "history", "progress", "timeout", "cancel", "observability"],
+        keywords: &[
+            "recent",
+            "operations",
+            "history",
+            "progress",
+            "timeout",
+            "cancel",
+            "observability",
+        ],
     },
     ToolInfo {
         name: "task_status",
@@ -316,7 +327,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: true,
         keywords: &["info", "metadata", "summary", "database", "binary"],
     },
-
     // === FUNCTIONS ===
     ToolInfo {
         name: "list_functions",
@@ -327,7 +337,14 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     Use filter parameter to search by substring in function name.",
         example: r#"{"offset": 0, "limit": 100, "filter": "init"}"#,
         default: false,
-        keywords: &["functions", "list", "enumerate", "find", "filter", "subroutines"],
+        keywords: &[
+            "functions",
+            "list",
+            "enumerate",
+            "find",
+            "filter",
+            "subroutines",
+        ],
     },
     ToolInfo {
         name: "list_funcs",
@@ -381,9 +398,15 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     for completion, records phase transitions in recent_operations, and respects timeout_secs.",
         example: r#"{"background": true}"#,
         default: false,
-        keywords: &["analyze", "functions", "analysis", "auto", "background", "task"],
+        keywords: &[
+            "analyze",
+            "functions",
+            "analysis",
+            "auto",
+            "background",
+            "task",
+        ],
     },
-
     // === DISASSEMBLY ===
     ToolInfo {
         name: "disasm",
@@ -416,7 +439,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["disassemble", "function", "address", "pc", "lr"],
     },
-
     // === DECOMPILE ===
     ToolInfo {
         name: "decompile",
@@ -439,7 +461,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["pseudocode", "decompile", "block", "range", "statement"],
     },
-
     // === XREFS ===
     ToolInfo {
         name: "xrefs_to",
@@ -483,7 +504,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["xrefs", "matrix", "relationships", "graph"],
     },
-
     // === CONTROL FLOW ===
     ToolInfo {
         name: "basic_blocks",
@@ -535,7 +555,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["paths", "route", "flow", "between", "reach"],
     },
-
     // === MEMORY ===
     ToolInfo {
         name: "get_bytes",
@@ -612,7 +631,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["int", "convert", "hex", "decimal", "ascii"],
     },
-
     // === SEARCH ===
     ToolInfo {
         name: "find_bytes",
@@ -685,7 +703,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["find", "operands", "instructions", "pattern"],
     },
-
     // === METADATA ===
     ToolInfo {
         name: "segments",
@@ -752,7 +769,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["globals", "variables", "data", "symbols"],
     },
-
     // === TYPES / STRUCTS ===
     ToolInfo {
         name: "local_types",
@@ -866,7 +882,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["struct", "search", "types"],
     },
-
     // === EDITING / PATCHING ===
     ToolInfo {
         name: "set_comments",
@@ -910,7 +925,6 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["rename", "symbol", "edit"],
     },
-
     // === SCRIPTING ===
     ToolInfo {
         name: "run_script",
@@ -926,7 +940,16 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     API reference: https://python.docs.hex-rays.com",
         example: r#"{"code": "import idautils\nfor f in idautils.Functions():\n    print(hex(f))"}"#,
         default: false,
-        keywords: &["script", "python", "execute", "eval", "idapython", "run", "code", "file"],
+        keywords: &[
+            "script",
+            "python",
+            "execute",
+            "eval",
+            "idapython",
+            "run",
+            "code",
+            "file",
+        ],
     },
 ];
 

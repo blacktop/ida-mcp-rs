@@ -1763,7 +1763,7 @@ impl PooledSessionState {
             _ => {
                 return Err(ToolError::InvalidParams(format!(
                     "unsupported integer size: {size}"
-                )))
+                )));
             }
         };
         self.call_value(

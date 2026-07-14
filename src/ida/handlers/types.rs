@@ -27,10 +27,10 @@ pub fn handle_local_types(
             None => continue,
         };
 
-        if let Some(f) = &filter_lower {
-            if !info.name.to_lowercase().contains(f) {
-                continue;
-            }
+        if let Some(f) = &filter_lower
+            && !info.name.to_lowercase().contains(f)
+        {
+            continue;
         }
 
         total += 1;

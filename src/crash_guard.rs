@@ -13,7 +13,7 @@
 use crate::error::ToolError;
 
 #[cfg(unix)]
-extern "C" {
+unsafe extern "C" {
     fn crash_guard_call(
         func: extern "C" fn(*mut std::ffi::c_void),
         ctx: *mut std::ffi::c_void,

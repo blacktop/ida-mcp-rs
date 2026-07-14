@@ -186,10 +186,10 @@ impl IdaWorker {
             match self.tx.try_send(pending) {
                 Ok(()) => return Ok(()),
                 Err(mpsc::TrySendError::Full(req)) => {
-                    if let Some(max_wait) = max_wait {
-                        if Instant::now().duration_since(start) >= max_wait {
-                            return Err(ToolError::Busy);
-                        }
+                    if let Some(max_wait) = max_wait
+                        && Instant::now().duration_since(start) >= max_wait
+                    {
+                        return Err(ToolError::Busy);
                     }
                     pending = req;
                     tokio::time::sleep(Duration::from_millis(CONTROL_SEND_BACKOFF_MS)).await;

@@ -140,10 +140,8 @@ pub fn handle_callees(idb: &Option<IDB>, addr: u64) -> Result<Vec<FunctionInfo>,
             }
         }
 
-        if !found_call_xref {
-            if let Some(target) = direct_call_target(db, current_addr) {
-                add_callee(db, &mut callees, &mut seen, target);
-            }
+        if !found_call_xref && let Some(target) = direct_call_target(db, current_addr) {
+            add_callee(db, &mut callees, &mut seen, target);
         }
 
         if let Some(insn) = db.insn_at(current_addr) {

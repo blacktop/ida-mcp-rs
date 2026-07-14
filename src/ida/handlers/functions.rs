@@ -28,10 +28,10 @@ pub fn handle_list_functions(
         let name = func.name().unwrap_or_else(|| format!("sub_{:x}", addr));
         let size = func.len();
 
-        if let Some(f) = &filter_lower {
-            if !name.to_lowercase().contains(f) {
-                continue;
-            }
+        if let Some(f) = &filter_lower
+            && !name.to_lowercase().contains(f)
+        {
+            continue;
         }
 
         total += 1;
@@ -66,16 +66,16 @@ pub fn handle_resolve_function(idb: &Option<IDB>, name: &str) -> Result<Function
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
     for (_id, func) in db.functions() {
-        if let Some(func_name) = func.name() {
-            if func_name == name || func_name.contains(name) {
-                let addr = func.start_address();
-                let size = func.len();
-                return Ok(FunctionInfo {
-                    address: format!("{:#x}", addr),
-                    name: func_name,
-                    size,
-                });
-            }
+        if let Some(func_name) = func.name()
+            && (func_name == name || func_name.contains(name))
+        {
+            let addr = func.start_address();
+            let size = func.len();
+            return Ok(FunctionInfo {
+                address: format!("{:#x}", addr),
+                name: func_name,
+                size,
+            });
         }
     }
 

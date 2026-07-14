@@ -1,6 +1,6 @@
 //! Main IDA worker loop.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::{c_char, CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -21,6 +21,10 @@ use crate::ida::observability::{
     SINGLE_PHASE_PROGRESS_TOTAL,
 };
 use crate::ida::request::IdaRequest;
+
+unsafe extern "C" {
+    fn qsetenv(varname: *const c_char, value: *const c_char) -> bool;
+}
 
 /// Log result with debug on success and warn on error.
 macro_rules! log_result {
@@ -55,6 +59,10 @@ struct IsolatedIdaUserDir {
 
 impl Drop for IsolatedIdaUserDir {
     fn drop(&mut self) {
+        if let Err(err) = set_idausr(self.previous_idausr.as_deref()) {
+            warn!(error = %err, "Failed to restore IDAUSR");
+            return;
+        }
         if let Err(err) = fs::remove_dir_all(&self.path) {
             debug!(
                 path = %self.path.display(),
@@ -62,23 +70,49 @@ impl Drop for IsolatedIdaUserDir {
                 "Failed to remove temporary IDA user directory"
             );
         }
-        if let Some(previous_idausr) = self.previous_idausr.as_ref() {
-            std::env::set_var("IDAUSR", previous_idausr);
-        } else {
-            std::env::remove_var("IDAUSR");
-        }
+    }
+}
+
+fn os_str_to_cstring(value: &OsStr) -> Result<CString, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        CString::new(value.as_bytes()).map_err(|_| "IDAUSR contains a NUL byte".to_string())
+    }
+
+    #[cfg(not(unix))]
+    {
+        CString::new(value.to_string_lossy().as_bytes())
+            .map_err(|_| "IDAUSR contains a NUL byte".to_string())
+    }
+}
+
+fn set_idausr(value: Option<&OsStr>) -> Result<(), String> {
+    let value = value.map(os_str_to_cstring).transpose()?;
+    // qsetenv rejects a null value and uses an empty string to unset a variable.
+    let value_ptr = value.as_ref().map_or(c"".as_ptr(), |value| value.as_ptr());
+
+    // SAFETY: qsetenv is IDA's thread-safe environment API. Both pointers are
+    // backed by C strings that remain alive for the call.
+    if unsafe { qsetenv(c"IDAUSR".as_ptr(), value_ptr) } {
+        Ok(())
+    } else {
+        Err("IDA qsetenv rejected the IDAUSR update".to_string())
     }
 }
 
 /// Check the IDA runtime version against the SDK we compiled with.
 ///
-/// Returns a mismatch message when the major versions differ.
+/// IDA 9.4+ must match the SDK minor because adjacent releases are not ABI
+/// compatible. Older SDKs retain the major-only check for IDA 9.3's product
+/// version reporting workaround.
 fn check_ida_version() -> Option<String> {
     let (sdk_major, sdk_minor) = idalib::SDK_VERSION;
     match idalib::version() {
         Ok(v) => {
             info!("IDA runtime version: {v} (compiled for SDK {sdk_major}.{sdk_minor})");
-            check_version_mismatch(sdk_major, v.major())
+            check_version_mismatch((sdk_major, sdk_minor), (v.major(), v.minor()))
         }
         Err(e) => {
             warn!("Could not query IDA runtime version: {e}");
@@ -155,9 +189,9 @@ fn ida_user_dir_source() -> Result<Option<PathBuf>, String> {
         let Some(appdata) = std::env::var_os("APPDATA") else {
             return Ok(None);
         };
-        return Ok(Some(
+        Ok(Some(
             PathBuf::from(appdata).join("Hex-Rays").join("IDA Pro"),
-        ));
+        ))
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -328,7 +362,10 @@ fn prepare_isolated_idausr(sdk_version: (i32, i32)) -> Result<Option<IsolatedIda
     }
 
     let previous_idausr = std::env::var_os("IDAUSR");
-    std::env::set_var("IDAUSR", &path);
+    if let Err(err) = set_idausr(Some(path.as_os_str())) {
+        let _ = fs::remove_dir_all(&path);
+        return Err(err);
+    }
     info!(
         source = %source.display(),
         isolated = %path.display(),
@@ -1761,16 +1798,20 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
     }
 }
 
-/// Compare compile-time SDK major version against runtime major version.
+/// Compare the compile-time SDK version against the runtime version.
 /// Returns an error message on mismatch, `None` if they match.
-fn check_version_mismatch(sdk_major: i32, runtime_major: i32) -> Option<String> {
-    if runtime_major != sdk_major {
+fn check_version_mismatch(sdk_version: (i32, i32), runtime_version: (i32, i32)) -> Option<String> {
+    let (sdk_major, sdk_minor) = sdk_version;
+    let (runtime_major, runtime_minor) = runtime_version;
+    let major_mismatch = runtime_major != sdk_major;
+    let minor_mismatch = sdk_version >= (9, 4) && runtime_minor != sdk_minor;
+
+    if major_mismatch || minor_mismatch {
         Some(format!(
-            "IDA major version mismatch: ida-mcp was compiled \
-             for IDA {sdk_major}.x but the runtime IDA library \
-             reports major version {runtime_major}. Install the \
-             matching IDA version or use the ida-mcp release \
-             built for your IDA version.",
+            "IDA version mismatch: ida-mcp was compiled for IDA \
+             {sdk_major}.{sdk_minor}, but the runtime IDA library reports \
+             {runtime_major}.{runtime_minor}. Install the matching IDA \
+             version or use the ida-mcp release built for your IDA version.",
         ))
     } else {
         None
@@ -1782,17 +1823,23 @@ mod tests {
     use crate::ida::loop_impl::{check_version_mismatch, should_check_license_expiry};
 
     #[test]
-    fn matching_major_version_passes() {
-        assert!(check_version_mismatch(9, 9).is_none());
+    fn matching_ida_94_version_passes() {
+        assert!(check_version_mismatch((9, 4), (9, 4)).is_none());
     }
 
     #[test]
     fn mismatched_major_version_returns_error() {
-        let msg = check_version_mismatch(9, 8);
-        assert!(msg.is_some());
-        let msg = msg.unwrap();
-        assert!(msg.contains("major version 8"), "{msg}");
-        assert!(msg.contains("IDA 9.x"), "{msg}");
+        let msg = check_version_mismatch((9, 4), (8, 4))
+            .expect("mismatched major version should return an error");
+        assert!(msg.contains("compiled for IDA 9.4"), "{msg}");
+        assert!(msg.contains("reports 8.4"), "{msg}");
+    }
+
+    #[test]
+    fn ida_94_rejects_mismatched_minor_version() {
+        let msg = check_version_mismatch((9, 4), (9, 3))
+            .expect("IDA 9.4 should reject a mismatched minor version");
+        assert!(msg.contains("reports 9.3"));
     }
 
     /// IDA 9.3 returns product version 9.0.260213 — the minor=0 must
@@ -1802,7 +1849,7 @@ mod tests {
         // sdk_major=9 (from SDK_VERSION=(9,3)), runtime major=9
         // (from get_library_version returning 9.0.260213).
         // The minor versions differ (3 vs 0) but we only compare major.
-        assert!(check_version_mismatch(9, 9).is_none());
+        assert!(check_version_mismatch((9, 3), (9, 0)).is_none());
     }
 
     #[test]

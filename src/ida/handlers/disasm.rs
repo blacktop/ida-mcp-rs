@@ -14,11 +14,11 @@ pub fn handle_disasm_by_name(
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
     for (_id, func) in db.functions() {
-        if let Some(func_name) = func.name() {
-            if func_name == name || func_name.contains(name) {
-                let addr = func.start_address();
-                return handle_disasm(idb, addr, count);
-            }
+        if let Some(func_name) = func.name()
+            && (func_name == name || func_name.contains(name))
+        {
+            let addr = func.start_address();
+            return handle_disasm(idb, addr, count);
         }
     }
 

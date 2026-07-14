@@ -155,18 +155,18 @@ pub(crate) fn clean_stale_mcp_lock(db_path: &Path) -> Option<StaleLockInfo> {
         Some(pid) => pid,
         None => {
             // Can't read PID, but file exists - try to acquire lock to check if stale
-            if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) {
-                if try_lock_file(&file).is_ok() {
-                    // We got the lock - file was stale (no process holding fcntl lock)
-                    drop(file);
-                    if std::fs::remove_file(&lock_path).is_ok() {
-                        info!(path = %lock_path.display(), "Removed stale lock file (no valid PID, no fcntl lock)");
-                        return Some(StaleLockInfo {
-                            path: lock_path,
-                            pid: 0,
-                            reason: "no valid PID and no fcntl lock held".to_string(),
-                        });
-                    }
+            if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path)
+                && try_lock_file(&file).is_ok()
+            {
+                // We got the lock - file was stale (no process holding fcntl lock)
+                drop(file);
+                if std::fs::remove_file(&lock_path).is_ok() {
+                    info!(path = %lock_path.display(), "Removed stale lock file (no valid PID, no fcntl lock)");
+                    return Some(StaleLockInfo {
+                        path: lock_path,
+                        pid: 0,
+                        reason: "no valid PID and no fcntl lock held".to_string(),
+                    });
                 }
             }
             return None;
@@ -247,26 +247,26 @@ pub(crate) fn detect_db_lock(path: &Path, _err: &IDAError) -> Option<String> {
     let mut candidates = Vec::new();
     candidates.push(path.to_path_buf());
 
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if ext == "i64" || ext == "idb" || ext == "id0" {
-            if ext == "id0" {
-                let mut i64_path = path.to_path_buf();
-                i64_path.set_extension("i64");
-                candidates.push(i64_path);
-            }
-
-            let mut id0 = path.to_path_buf();
-            id0.set_extension("id0");
-            candidates.push(id0);
-
-            let mut id1 = path.to_path_buf();
-            id1.set_extension("id1");
-            candidates.push(id1);
-
-            let mut nam = path.to_path_buf();
-            nam.set_extension("nam");
-            candidates.push(nam);
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && (ext == "i64" || ext == "idb" || ext == "id0")
+    {
+        if ext == "id0" {
+            let mut i64_path = path.to_path_buf();
+            i64_path.set_extension("i64");
+            candidates.push(i64_path);
         }
+
+        let mut id0 = path.to_path_buf();
+        id0.set_extension("id0");
+        candidates.push(id0);
+
+        let mut id1 = path.to_path_buf();
+        id1.set_extension("id1");
+        candidates.push(id1);
+
+        let mut nam = path.to_path_buf();
+        nam.set_extension("nam");
+        candidates.push(nam);
     }
 
     let mut imcp = path.to_path_buf();

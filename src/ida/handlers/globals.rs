@@ -19,10 +19,10 @@ pub fn handle_list_globals(
     let mut total = 0usize;
 
     for name in db.names().iter() {
-        if let Some(f) = &filter_lower {
-            if !name.name().to_lowercase().contains(f) {
-                continue;
-            }
+        if let Some(f) = &filter_lower
+            && !name.name().to_lowercase().contains(f)
+        {
+            continue;
         }
 
         // Only consider named addresses outside of functions

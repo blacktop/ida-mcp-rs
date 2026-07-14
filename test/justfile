@@ -94,7 +94,7 @@ test: fixture
     rm -f "$tmp"
     echo "✅ Stdio test passed"
 
-# Verify the license-expiry preflight runs and reports a healthy license
+# Verify that license validation succeeds during preflight or database open.
 test-license: fixture
     #!/usr/bin/env bash
     set -euo pipefail
@@ -104,26 +104,31 @@ test-license: fixture
     fi
     echo "🧪 Running license preflight test..."
     log="$(mktemp)"
+    output="$(mktemp)"
+    trap 'rm -f "$log" "$output"' EXIT
     printf '%s\n' \
       '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","clientInfo":{"name":"lic","version":"0"},"capabilities":{}}}' \
       '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
       '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"open_idb","arguments":{"path":"{{ test_bin }}"}}}' \
       '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}' \
-      | RUST_LOG="{{ rust_log }}" "{{ server_bin }}" serve >/dev/null 2>"$log" || true
+      | RUST_LOG="{{ rust_log }}" "{{ server_bin }}" serve >"$output" 2>"$log" || true
     if grep -Eq 'IDA license expired|IDA license is invalid' "$log"; then
         echo "❌ License preflight reports an unhealthy license:" >&2
         grep -E 'IDA license' "$log" >&2
-        rm -f "$log"
         exit 1
     fi
-    if ! grep -Eq 'IDA license valid' "$log" && ! grep -Eq 'IDA license expires in' "$log"; then
+    if grep -q 'Skipping IDA license expiry preflight' "$log"; then
+        if ! jq -e 'select(.id == 2) | .result.isError == false' "$output" >/dev/null; then
+            echo "❌ IDA 9.4 database open did not validate the license successfully:" >&2
+            jq -c 'select(.id == 2)' "$output" >&2 || true
+            exit 1
+        fi
+    elif ! grep -Eq 'IDA license valid|IDA license expires in' "$log"; then
         echo "❌ License preflight did not run (no expiry log line). Init log tail:" >&2
         grep -E 'Initializing|runtime version|license' "$log" >&2 || tail -20 "$log" >&2
-        rm -f "$log"
         exit 1
     fi
     grep -E 'IDA license' "$log"
-    rm -f "$log"
     echo "✅ License preflight test passed"
 
 # Run HTTP integration test

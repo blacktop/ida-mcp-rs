@@ -106,13 +106,12 @@ fn raw_input_matches_generated_database(raw: &Path, database: &Path) -> bool {
 
 fn base_input_path_for_database(path: &Path) -> PathBuf {
     let mut base = path.to_path_buf();
-    if let Some(ext) = base.extension().and_then(|e| e.to_str()) {
-        if ext.eq_ignore_ascii_case("i64")
+    if let Some(ext) = base.extension().and_then(|e| e.to_str())
+        && (ext.eq_ignore_ascii_case("i64")
             || ext.eq_ignore_ascii_case("idb")
-            || ext.eq_ignore_ascii_case("id0")
-        {
-            base.set_extension("");
-        }
+            || ext.eq_ignore_ascii_case("id0"))
+    {
+        base.set_extension("");
     }
     base
 }
@@ -297,19 +296,18 @@ pub fn handle_open(
             opts.arg(arg);
         }
         let mut db = opts.open(db_path_to_open);
-        if db.is_err() {
-            if let Some(id0_path) = unpacked_id0_path(db_path_to_open) {
-                if id0_path.exists() {
-                    info!(path = %id0_path.display(), "Falling back to unpacked ID0 database");
-                    opened_path = id0_path.clone();
-                    let mut opts = IDBOpenOptions::new();
-                    opts.auto_analyse(false).save(true);
-                    for arg in &init_args {
-                        opts.arg(arg);
-                    }
-                    db = opts.open(&id0_path);
-                }
+        if db.is_err()
+            && let Some(id0_path) = unpacked_id0_path(db_path_to_open)
+            && id0_path.exists()
+        {
+            info!(path = %id0_path.display(), "Falling back to unpacked ID0 database");
+            opened_path = id0_path.clone();
+            let mut opts = IDBOpenOptions::new();
+            opts.auto_analyse(false).save(true);
+            for arg in &init_args {
+                opts.arg(arg);
             }
+            db = opts.open(&id0_path);
         }
         (db, opened_path)
     } else {
@@ -426,22 +424,23 @@ pub fn handle_open(
                 }
             }
         }
-    } else if !is_idb && should_load_dsym {
-        if let Some(path) = dsym_path.as_ref() {
-            emit_progress(
-                progress_tx.as_ref(),
-                "loading_debug_info",
-                3.0,
-                Some(OPEN_IDB_PROGRESS_TOTAL),
-                "Loading sibling dSYM debug information",
-            );
-            ensure_not_cancelled(cancel.as_ref())?;
-            info!(path = %path.display(), "Loading dSYM debug info");
-            match db.load_debug_info(path, false) {
-                Ok(true) => info!(path = %path.display(), "dSYM debug info loaded"),
-                Ok(false) => warn!(path = %path.display(), "dSYM debug info load failed"),
-                Err(e) => warn!(path = %path.display(), error = %e, "dSYM debug info load error"),
-            }
+    } else if !is_idb
+        && should_load_dsym
+        && let Some(path) = dsym_path.as_ref()
+    {
+        emit_progress(
+            progress_tx.as_ref(),
+            "loading_debug_info",
+            3.0,
+            Some(OPEN_IDB_PROGRESS_TOTAL),
+            "Loading sibling dSYM debug information",
+        );
+        ensure_not_cancelled(cancel.as_ref())?;
+        info!(path = %path.display(), "Loading dSYM debug info");
+        match db.load_debug_info(path, false) {
+            Ok(true) => info!(path = %path.display(), "dSYM debug info loaded"),
+            Ok(false) => warn!(path = %path.display(), "dSYM debug info load failed"),
+            Err(e) => warn!(path = %path.display(), error = %e, "dSYM debug info load error"),
         }
     }
     ensure_not_cancelled(cancel.as_ref())?;
