@@ -391,6 +391,8 @@ publish-beta-cask version ida_version="9.4":
       version "${VERSION}"
       sha256 "${SHA256}"
 
+      depends_on arch: :arm64
+
       url "https://github.com/blacktop/ida-mcp-rs/releases/download/v#{version}/ida-mcp_#{version}_Darwin_arm64.tar.gz"
       name "ida-mcp (beta)"
       desc "Headless IDA Pro MCP Server for AI-powered binary analysis (beta)"
@@ -453,6 +455,8 @@ publish-versioned-cask version ida_version:
     cask "ida-mcp@${IDA_VERSION}" do
       version "${VERSION}"
       sha256 "${SHA256}"
+
+      depends_on arch: :arm64
 
       url "https://github.com/blacktop/ida-mcp-rs/releases/download/v#{version}/ida-mcp_#{version}_Darwin_arm64.tar.gz"
       name "ida-mcp (IDA ${IDA_VERSION})"

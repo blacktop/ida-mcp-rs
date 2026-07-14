@@ -25,6 +25,10 @@
 **macOS / Linux** (via [Homebrew](https://brew.sh))
 ```bash
 brew install blacktop/tap/ida-mcp        # Latest (IDA 9.4)
+```
+
+**macOS (Apple Silicon), older IDA releases** (via versioned Homebrew casks)
+```bash
 brew install blacktop/tap/ida-mcp@9.3    # IDA 9.3/9.3sp1
 brew install blacktop/tap/ida-mcp@9.2    # IDA 9.2
 ```
@@ -43,20 +47,13 @@ nix shell github:blacktop/nur#ida-mcp \
   --extra-experimental-features 'nix-command flakes'
 ```
 
-**Linux** (via [Snap](https://snapcraft.io/ida-mcp))
-```bash
-sudo snap install ida-mcp
-sudo snap connect ida-mcp:dot-idapro   # grant access to ~/.idapro (license)
-```
-> Strict confinement. Requires IDA Pro installed under `$HOME` (installer default `~/ida-pro-9.4`). For IDA in `/opt/` or system paths, use Homebrew or Nix.
-
 **Direct download** — grab the archive for your platform from [GitHub Releases](https://github.com/blacktop/ida-mcp-rs/releases).
 
 **Build from source**
 
 See [docs/BUILDING.md](docs/BUILDING.md).
 
-> ida-mcp versions mirror IDA Pro versions (`v9.4.x` for IDA 9.4, `v9.3.x` for IDA 9.3, and `v9.2.x` for IDA 9.2). A version mismatch is detected at startup with a clear error message. Scoop and NUR publish the latest version. For older IDA versions, use the matching [GitHub Release](https://github.com/blacktop/ida-mcp-rs/releases) or the versioned Homebrew cask.
+> ida-mcp versions mirror IDA Pro versions (`v9.4.x` for IDA 9.4, `v9.3.x` for IDA 9.3, and `v9.2.x` for IDA 9.2). A version mismatch is detected at startup with a clear error message. Scoop and NUR publish the latest version. For older IDA versions, use the matching [GitHub Release](https://github.com/blacktop/ida-mcp-rs/releases) or, on Apple Silicon, the versioned Homebrew cask.
 
 ### Platform Setup
 
@@ -141,7 +138,7 @@ The binary links against IDA's libraries at runtime. Standard installation paths
 
 ### Configure your AI agent
 
-#### [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview)
+#### [Claude Code](https://code.claude.com/docs/en/mcp)
 ```bash
 claude mcp add ida -- ida-mcp
 ```
@@ -273,7 +270,7 @@ All `ida_*` modules, `idc`, and `idautils` are available. See the [IDAPython API
 
 ## Context Optimization
 
-`ida-mcp` exposes 71 tools (~10k tokens of `tools/list` payload). Frontier models with 1M context don't notice; smaller models and agents without lazy tool loading do. Filter the surface to only what you need:
+`ida-mcp` exposes 71 tools (~10k tokens of `tools/list` payload). Clients with dynamic tool discovery defer that cost; clients that preload schemas include it in every session. Filter the surface to only what you need:
 
 | Flag | Env var | Effect |
 |---|---|---|
@@ -286,12 +283,13 @@ No flags = all 71 tools (default). Categories: `core`, `functions`, `disassembly
 
 ### Recommendations by client
 
-- **Claude Code, Cursor:** no action — both clients already lazy-load MCP tool schemas. Claude Code's MCP Tool Search auto-defers when tools exceed 10% of context (Cursor's Dynamic Context Discovery does similar).
-- **Codex CLI, OpenCode:** every session pays the full ~10k tokens. Pick a focused subset:
+- **Claude Code, Cursor:** no action needed for context usage. Both clients defer MCP tool schemas and discover them on demand. Filtering is still useful when you want to constrain the available capabilities.
+- **Codex CLI:** current models with tool-search support defer MCP tools automatically. For models without tool search, or to constrain the available capabilities, pick a focused subset:
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile,xrefs
   ```
-- **Gemini CLI:** the Gemini API caps at 512 function declarations across all MCP servers. Shrink `ida-mcp` so it fits alongside others:
+- **Clients without lazy tool loading:** each session receives the full ~10k-token schema payload. Pick a focused subset as shown above.
+- **Gemini CLI:** filtering is optional, but a smaller surface can reduce tool-selection noise when several MCP servers are enabled:
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile --read-only
   ```
