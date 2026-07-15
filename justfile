@@ -138,6 +138,10 @@ release-sync version="":
 test: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test
 
+# Verify that a licensed Hex-Rays installation can decompile a known function.
+test-decompile: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-decompile
+
 # Run HTTP integration test (debug)
 test-http: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-http

@@ -94,6 +94,13 @@ test: fixture
     rm -f "$tmp"
     echo "✅ Stdio test passed"
 
+# Verify that a licensed Hex-Rays installation can decompile a known function.
+# This catches stale inline SDK compatibility values such as HEXRAYS_API_MAGIC.
+test-decompile: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SERVER_BIN="{{ server_bin }}" bash ./stdio_decompile.sh
+
 # Verify that license validation succeeds during preflight or database open.
 test-license: fixture
     #!/usr/bin/env bash
