@@ -32,6 +32,30 @@ pub struct OpenIdbRequest {
     )]
     pub file_type: Option<String>,
     #[schemars(
+        description = "IDA processor selector for a raw blob (-p), including a variant when the \
+        processor has ambiguous modes (for example arm:ARMv7-M, arm:ARMv8-A, or metapc:80386p)."
+    )]
+    pub processor: Option<String>,
+    #[schemars(
+        description = "Raw blob application bitness (16, 32, or 64). Required when the selected \
+        processor variant does not determine the intended mode, such as AArch32 versus AArch64 or \
+        x86 real/protected/long mode."
+    )]
+    #[schemars(range(min = 16, max = 64))]
+    pub bitness: Option<i64>,
+    #[schemars(
+        description = "Raw blob load base as a string or number. Must be 16-byte aligned because \
+        IDA's -b option uses paragraph units."
+    )]
+    pub base_address: Option<Value>,
+    #[schemars(description = "Optional raw blob entry-point address (IDA -i).")]
+    pub entry_point: Option<Value>,
+    #[schemars(
+        description = "Output database path for a raw input. Defaults to <path>.i64. Empty strings \
+        are ignored."
+    )]
+    pub idb_out: Option<String>,
+    #[schemars(
         description = "Run full auto-analysis before returning (default: false). \
         For raw binaries, false returns fast with analysis incomplete; .i64/.idb ignore this. \
         Inputs >50 MiB may route to a background task (response includes analysis_task_id)."
@@ -55,6 +79,14 @@ impl OpenIdbRequest {
 
     pub fn normalized_file_type(&self) -> Option<String> {
         non_empty_trimmed(self.file_type.as_deref())
+    }
+
+    pub fn normalized_processor(&self) -> Option<String> {
+        non_empty_trimmed(self.processor.as_deref())
+    }
+
+    pub fn normalized_idb_out(&self) -> Option<String> {
+        non_empty_trimmed(self.idb_out.as_deref())
     }
 }
 
@@ -95,6 +127,11 @@ mod tests {
             force: None,
             rebuild: None,
             file_type: file_type.map(str::to_string),
+            processor: None,
+            bitness: None,
+            base_address: None,
+            entry_point: None,
+            idb_out: None,
             auto_analyse: None,
             timeout_secs: None,
             worker_extra_args: Vec::new(),
@@ -111,12 +148,20 @@ mod tests {
 
     #[test]
     fn open_idb_optional_strings_are_trimmed() {
-        let req = open_request(Some(" C:\\symbols\\sample.pdb "), Some(" pe "));
+        let mut req = open_request(Some(" C:\\symbols\\sample.pdb "), Some(" pe "));
+        req.processor = Some(" arm:ARMv7-M ".to_string());
+        req.idb_out = Some(" C:\\work\\firmware.i64 ".to_string());
+
         assert_eq!(
             req.normalized_debug_info_path(),
             Some("C:\\symbols\\sample.pdb".to_string())
         );
         assert_eq!(req.normalized_file_type(), Some("pe".to_string()));
+        assert_eq!(req.normalized_processor(), Some("arm:ARMv7-M".to_string()));
+        assert_eq!(
+            req.normalized_idb_out(),
+            Some("C:\\work\\firmware.i64".to_string())
+        );
     }
 }
 

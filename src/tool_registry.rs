@@ -153,6 +153,13 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     like Mach-O/ELF/PE. Raw binaries are saved as .i64 alongside the input; \
                     if that generated .i64 already exists, ida-mcp opens it directly instead of rebuilding. \
                     Set rebuild=true only when the raw input changed or stale analysis should be overwritten. \
+                    For a headerless blob, set processor to an explicit IDA processor variant and \
+                    bitness to 16, 32, or 64 when that variant does not uniquely select the intended \
+                    mode (for example AArch32 versus AArch64 or x86 real/protected/long mode). Set \
+                    base_address to a 16-byte-aligned load address. Loader auto-detection remains \
+                    enabled unless file_type is supplied. entry_point and idb_out are optional. Bare multi-mode processor \
+                    names such as arm or metapc are rejected because headless IDA can silently choose \
+                    the wrong architecture. \
                     Auto-analysis does NOT run by default — open returns quickly with the database \
                     loaded. Check analysis_status in the response: if auto_is_ok is false and you \
                     need xrefs/decompile, call analyze_funcs(background=true) and poll task_status. \
@@ -167,7 +174,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     In HTTP/SSE mode, open_idb returns a close_token that must be provided to close_idb. \
                     Supports timeout_secs (default 300s, max 600s). Phase transitions are observable via recent_operations. \
                     Returns metadata about the binary: file type, processor, bitness, function count, analysis_status.",
-        example: r#"{"path": "/path/to/binary", "auto_analyse": false}"#,
+        example: r#"{"path": "/path/to/firmware.bin", "processor": "arm:ARMv7-M", "bitness": 32, "base_address": "0x08000000", "idb_out": "/path/to/firmware.i64", "auto_analyse": false}"#,
         default: true,
         keywords: &[
             "open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe",

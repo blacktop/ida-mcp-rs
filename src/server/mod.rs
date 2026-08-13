@@ -190,6 +190,76 @@ fn direct_dsc_temp_i64_path(dsc_path: &std::path::Path) -> Result<std::path::Pat
     Ok(std::env::temp_dir().join(format!("ida-mcp-dsc-{pid}-{now}-{name}.i64")))
 }
 
+fn raw_blob_open_args(
+    processor: Option<&str>,
+    base_address: Option<u64>,
+    entry_point: Option<u64>,
+) -> Result<Vec<String>, ToolError> {
+    let mut args = Vec::new();
+
+    if let Some(processor) = processor.map(str::trim).filter(|value| !value.is_empty()) {
+        if processor.len() > 128 || processor.chars().any(char::is_control) {
+            return Err(ToolError::InvalidParams(
+                "processor must be at most 128 characters and contain no control characters"
+                    .to_string(),
+            ));
+        }
+
+        let processor_lower = processor.to_ascii_lowercase();
+        let ambiguity_hint = match processor_lower.as_str() {
+            "arm" => Some(
+                "\"arm\" is ambiguous for a raw blob in headless mode; use an explicit variant \
+                 such as \"arm:ARMv7-M\" or \"arm:ARMv8-A\", plus bitness=64 for AArch64",
+            ),
+            "metapc" | "pc" => Some(
+                "\"metapc\" is ambiguous for a raw blob in headless mode; use an explicit \
+                 processor variant such as \"metapc:80386p\"",
+            ),
+            "mips" | "mipsl" | "mipsb" => Some(
+                "the selected MIPS processor is ambiguous for a raw blob in headless mode; \
+                 use an explicit processor variant (processor:variant)",
+            ),
+            "ppc" | "riscv" => Some(
+                "the selected processor has ambiguous bitness for a raw blob in headless mode; \
+                 use an explicit processor variant (processor:variant)",
+            ),
+            _ => None,
+        };
+        if let Some(hint) = ambiguity_hint {
+            return Err(ToolError::InvalidParams(hint.to_string()));
+        }
+
+        args.push(format!("-p{processor}"));
+    }
+
+    if let Some(base_address) = base_address {
+        if base_address & 0xf != 0 {
+            return Err(ToolError::InvalidParams(format!(
+                "base_address {base_address:#x} must be 16-byte aligned because IDA's -b option \
+                 uses paragraph units"
+            )));
+        }
+        args.push(format!("-b{:x}", base_address >> 4));
+    }
+
+    if let Some(entry_point) = entry_point {
+        args.push(format!("-i{entry_point:x}"));
+    }
+
+    Ok(args)
+}
+
+fn raw_blob_idb_path(input: &str, idb_out: Option<&str>) -> std::path::PathBuf {
+    if let Some(idb_out) = idb_out {
+        return crate::expand_path(idb_out);
+    }
+
+    let input = crate::expand_path(input);
+    let mut output = std::ffi::OsString::from(input.as_os_str());
+    output.push(".i64");
+    std::path::PathBuf::from(output)
+}
+
 impl TemporaryFileCleanup {
     fn new(path: std::path::PathBuf) -> Self {
         Self { path: Some(path) }
@@ -1413,6 +1483,8 @@ impl IdaMcpServer {
         description = "Open an IDA database (.i64/.idb) or raw binary (Mach-O/ELF/PE). \
         Raw binaries are saved as .i64 alongside the input and later raw-path opens reuse \
         that database unless rebuild=true is set. \
+        For a headerless blob, pass an explicit processor variant plus a 16-byte-aligned \
+        base_address; IDA keeps its normal loader auto-detection unless file_type is explicit. \
         For raw binaries, auto-analysis is OFF by default — check analysis_status; \
         call analyze_funcs(background=true) for full xrefs/decompile. \
         Returns close_token in HTTP/SSE mode (provide to close_idb). \
@@ -1437,24 +1509,97 @@ impl IdaMcpServer {
             "timeout_secs"
         ));
 
+        let input_is_database = Self::is_database_path(&path);
         let debug_info_path = req.normalized_debug_info_path();
+        let processor = req.normalized_processor();
+        let bitness = try_param!(parse_optional_unsigned::<u32>(req.bitness, "bitness"));
+        if bitness.is_some_and(|value| !matches!(value, 16 | 32 | 64)) {
+            return Ok(
+                ToolError::InvalidParams("bitness must be 16, 32, or 64".to_string())
+                    .to_tool_result(),
+            );
+        }
+        let base_address = try_param!(req
+            .base_address
+            .as_ref()
+            .map(|value| Self::value_to_exactly_one_address(value, "base_address"))
+            .transpose());
+        let entry_point = try_param!(req
+            .entry_point
+            .as_ref()
+            .map(|value| Self::value_to_exactly_one_address(value, "entry_point"))
+            .transpose());
+        let public_idb_out = req.normalized_idb_out();
+        let raw_blob_options = processor.is_some()
+            || bitness.is_some()
+            || base_address.is_some()
+            || entry_point.is_some();
+
+        if input_is_database && (raw_blob_options || public_idb_out.is_some()) {
+            return Ok(ToolError::InvalidParams(
+                "processor, bitness, base_address, entry_point, and idb_out apply only when \
+                 creating a database from a raw input"
+                    .to_string(),
+            )
+            .to_tool_result());
+        }
+        if let Some(idb_out) = public_idb_out.as_deref() {
+            let extension = std::path::Path::new(idb_out)
+                .extension()
+                .and_then(|extension| extension.to_str());
+            if idb_out.contains("..")
+                || !extension.is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("i64") || extension.eq_ignore_ascii_case("idb")
+                })
+            {
+                return Ok(ToolError::InvalidParams(
+                    "idb_out must be a traversal-free path ending in .i64 or .idb".to_string(),
+                )
+                .to_tool_result());
+            }
+        }
+        if raw_blob_options
+            && !req.rebuild.unwrap_or(false)
+            && raw_blob_idb_path(&path, public_idb_out.as_deref()).exists()
+        {
+            return Ok(ToolError::InvalidParams(
+                "processor, bitness, base_address, and entry_point only affect new raw-blob \
+                 databases; the output database already exists. Set rebuild=true to recreate it, \
+                 or omit the raw-blob options to reuse it."
+                    .to_string(),
+            )
+            .to_tool_result());
+        }
+
         let file_type = req.normalized_file_type();
-        let worker_extra_args = if matches!(self.mode, ServerMode::Worker) {
+        let mut worker_extra_args = if matches!(self.mode, ServerMode::Worker) {
             req.worker_extra_args.clone()
         } else {
             Vec::new()
         };
+        worker_extra_args.extend(try_param!(raw_blob_open_args(
+            processor.as_deref(),
+            base_address,
+            entry_point,
+        )));
+        if let Some(bitness) = bitness {
+            worker_extra_args.push(crate::ida::handlers::database::raw_bitness_worker_arg(
+                bitness,
+            ));
+        }
         let worker_idb_out = if matches!(self.mode, ServerMode::Worker) {
-            req.worker_idb_out.clone()
+            req.worker_idb_out
+                .clone()
+                .or_else(|| public_idb_out.clone())
         } else {
-            None
+            public_idb_out
         };
         let open_timeout_secs = timeout_secs.unwrap_or(300).min(MAX_TIMEOUT_SECS);
         let foreground_timeout_secs = self.foreground_timeout_secs(timeout_secs, 300);
         let user_auto_analyse = req.auto_analyse.unwrap_or(false);
         let large_input_size = if !matches!(self.mode, ServerMode::Worker)
             && user_auto_analyse
-            && !Self::is_database_path(&path)
+            && !input_is_database
         {
             Self::input_size_above_threshold(&path)
         } else {
@@ -5190,10 +5335,10 @@ mod tests {
     use crate::server::{
         apply_close_metadata, close_hint_for, dsc_open_plan, normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
-        run_script_failure_message, run_script_succeeded, run_script_timeout_message,
-        run_script_truncate_chars, task_payload_result_value, timeout_with_child_grace,
-        tool_params_schema, DscOpenPlan, IdaMcpServer, RecentOperationsRequest, ToolCatalogRequest,
-        ToolHelpRequest, XrefsRequest,
+        raw_blob_idb_path, raw_blob_open_args, run_script_failure_message, run_script_succeeded,
+        run_script_timeout_message, run_script_truncate_chars, task_payload_result_value,
+        timeout_with_child_grace, tool_params_schema, DscOpenPlan, IdaMcpServer,
+        RecentOperationsRequest, ToolCatalogRequest, ToolHelpRequest, XrefsRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::CallToolResult;
@@ -5244,6 +5389,57 @@ mod tests {
     fn xrefs_paging_rejects_negative_values() {
         assert!(IdaMcpServer::parse_xrefs_paging(&xrefs_request(Some(-1), None)).is_err());
         assert!(IdaMcpServer::parse_xrefs_paging(&xrefs_request(None, Some(-1))).is_err());
+    }
+
+    #[test]
+    fn raw_blob_open_args_select_processor_base_and_entry_point() {
+        let args = raw_blob_open_args(Some("arm:ARMv7-M"), Some(0x0800_0000), Some(0x0800_0100))
+            .expect("valid raw blob settings should produce IDA arguments");
+
+        assert_eq!(
+            args,
+            vec![
+                "-parm:ARMv7-M".to_string(),
+                "-b800000".to_string(),
+                "-i8000100".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_blob_open_args_reject_unaligned_base_address() {
+        let err = raw_blob_open_args(Some("aarch64"), Some(0x1003), None)
+            .expect_err("IDA base addresses must be paragraph aligned");
+
+        assert!(matches!(
+            err,
+            ToolError::InvalidParams(message)
+                if message.contains("16-byte aligned") && message.contains("0x1003")
+        ));
+    }
+
+    #[test]
+    fn raw_blob_open_args_reject_ambiguous_headless_processor() {
+        let err = raw_blob_open_args(Some("arm"), Some(0x0800_0000), None)
+            .expect_err("bare ARM is ambiguous for a headerless input");
+
+        assert!(matches!(
+            err,
+            ToolError::InvalidParams(message)
+                if message.contains("ambiguous") && message.contains("arm:ARMv7-M")
+        ));
+    }
+
+    #[test]
+    fn raw_blob_idb_path_uses_sidecar_or_explicit_output() {
+        assert_eq!(
+            raw_blob_idb_path("/tmp/firmware.bin", None),
+            std::path::PathBuf::from("/tmp/firmware.bin.i64")
+        );
+        assert_eq!(
+            raw_blob_idb_path("/tmp/firmware.bin", Some("/tmp/custom.i64")),
+            std::path::PathBuf::from("/tmp/custom.i64")
+        );
     }
 
     #[test]

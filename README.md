@@ -187,6 +187,31 @@ decompile(address: "0x100000f00")
 tool_catalog(query: "find callers")
 ```
 
+#### Raw blob / firmware analysis
+
+Headerless blobs need an explicit IDA processor variant and load address.
+`open_idb` leaves loader selection to IDA; `.bin` inputs are detected as raw
+binaries without forcing a `file_type`:
+
+```
+open_idb(path: "~/firmware.bin",
+         processor: "arm:ARMv7-M",
+         bitness: 32,
+         base_address: "0x08000000",
+         entry_point: "0x08000100",
+         idb_out: "~/firmware.i64")
+```
+
+`bitness` accepts 16, 32, or 64 and is important when the processor variant
+does not fully determine the mode. For example, use `processor: "arm:ARMv8-A"`
+with `bitness: 64` for an AArch64 blob, or select the corresponding x86 bitness
+for `metapc`. `base_address` must be 16-byte aligned because IDA represents the
+`-b` value in paragraphs. Use a specific processor variant for multi-mode
+families; bare names such as `arm`, `metapc`, `mips`, `ppc`, or `riscv` are
+rejected rather than letting headless IDA silently choose the wrong mode. If a
+generated database already exists, set `rebuild: true` to recreate it with
+changed loader settings.
+
 #### HTTP/SSE worker pool
 
 `serve-http` keeps the existing single in-process IDA worker by default. For

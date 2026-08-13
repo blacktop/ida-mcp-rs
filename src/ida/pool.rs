@@ -2229,7 +2229,12 @@ mod tests {
     }
 
     #[test]
-    fn pooled_observed_child_args_forward_timeouts() {
+    fn pooled_observed_child_args_forward_timeouts_and_raw_blob_options() {
+        let raw_blob_args = vec![
+            "-A".to_string(),
+            "-parm:ARMv7-M".to_string(),
+            "-b800000".to_string(),
+        ];
         let open_args = open_idb_child_args(
             "/tmp/a",
             true,
@@ -2237,14 +2242,16 @@ mod tests {
             true,
             false,
             false,
-            Some("pe".to_string()),
+            Some("Binary".to_string()),
             true,
-            vec!["-A".to_string()],
+            raw_blob_args.clone(),
             Some("/tmp/a.out.i64".to_string()),
             Some(600),
         );
         assert_eq!(open_args["timeout_secs"], json!(600));
         assert_eq!(open_args["rebuild"], json!(false));
+        assert_eq!(open_args["file_type"], json!("Binary"));
+        assert_eq!(open_args["_worker_extra_args"], json!(raw_blob_args));
         assert_eq!(open_args["_worker_idb_out"], json!("/tmp/a.out.i64"));
 
         let analyze_args = analyze_funcs_child_args(Some(600), false);

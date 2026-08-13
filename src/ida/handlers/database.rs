@@ -20,6 +20,23 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+const RAW_BITNESS_WORKER_ARG_PREFIX: &str = "--ida-mcp-raw-bitness=";
+
+pub(crate) fn raw_bitness_worker_arg(bitness: u32) -> String {
+    format!("{RAW_BITNESS_WORKER_ARG_PREFIX}{bitness}")
+}
+
+fn database_bitness(db: &IDB) -> u32 {
+    let meta = db.meta();
+    if meta.is_64bit() {
+        64
+    } else if meta.is_32bit_exactly() {
+        32
+    } else {
+        16
+    }
+}
+
 /// Build `DbInfo` from an open IDB.
 fn build_db_info(db: &IDB, path: &str, debug_info: Option<DebugInfoLoad>) -> DbInfo {
     let meta = db.meta();
@@ -27,13 +44,7 @@ fn build_db_info(db: &IDB, path: &str, debug_info: Option<DebugInfoLoad>) -> DbI
         path: path.to_string(),
         file_type: format!("{:?}", meta.filetype()),
         processor: db.processor().long_name(),
-        bits: if meta.is_64bit() {
-            64
-        } else if meta.is_32bit_exactly() {
-            32
-        } else {
-            16
-        },
+        bits: database_bitness(db),
         function_count: db.function_count(),
         debug_info,
         analysis_status: build_analysis_status(db),
@@ -135,8 +146,86 @@ fn init_database_args(extra_args: &[String]) -> Vec<String> {
         args.push("-A".to_string());
     }
 
-    args.extend(extra_args.iter().cloned());
+    args.extend(
+        extra_args
+            .iter()
+            .filter(|arg| !arg.starts_with(RAW_BITNESS_WORKER_ARG_PREFIX))
+            .cloned(),
+    );
     args
+}
+
+fn raw_bitness_from_extra_args(extra_args: &[String]) -> Result<Option<u32>, ToolError> {
+    let mut bitness = None;
+    for arg in extra_args {
+        let Some(value) = arg.strip_prefix(RAW_BITNESS_WORKER_ARG_PREFIX) else {
+            continue;
+        };
+        if bitness.is_some() {
+            return Err(ToolError::InvalidParams(
+                "raw blob bitness was specified more than once".to_string(),
+            ));
+        }
+        let value = value.parse::<u32>().map_err(|_| {
+            ToolError::InvalidParams("raw blob bitness must be 16, 32, or 64".to_string())
+        })?;
+        if !matches!(value, 16 | 32 | 64) {
+            return Err(ToolError::InvalidParams(
+                "raw blob bitness must be 16, 32, or 64".to_string(),
+            ));
+        }
+        bitness = Some(value);
+    }
+    Ok(bitness)
+}
+
+fn raw_bitness_script(bitness: u32) -> Result<String, ToolError> {
+    let segment_mode = match bitness {
+        16 => 0,
+        32 => 1,
+        64 => 2,
+        _ => {
+            return Err(ToolError::InvalidParams(
+                "raw blob bitness must be 16, 32, or 64".to_string(),
+            ));
+        }
+    };
+    Ok(format!(
+        concat!(
+            "import ida_ida\n",
+            "import ida_segment\n",
+            "ida_ida.inf_set_app_bitness({bitness})\n",
+            "for _index in range(ida_segment.get_segm_qty()):\n",
+            "    _segment = ida_segment.getnseg(_index)\n",
+            "    if _segment is not None and not ",
+            "ida_segment.set_segm_addressing(_segment, {segment_mode}):\n",
+            "        raise RuntimeError('failed to set segment addressing mode')\n",
+        ),
+        bitness = bitness,
+        segment_mode = segment_mode,
+    ))
+}
+
+fn configure_raw_bitness(db: &IDB, bitness: u32) -> Result<(), ToolError> {
+    let output = db.run_python(&raw_bitness_script(bitness)?)?;
+    if !output.success {
+        let mut details = output
+            .error
+            .unwrap_or_else(|| output.stderr.trim().to_string());
+        if details.is_empty() {
+            details = "unknown IDAPython failure".to_string();
+        }
+        return Err(ToolError::OpenFailed(format!(
+            "failed to configure raw blob bitness: {details}"
+        )));
+    }
+    let actual = database_bitness(db);
+    if actual != bitness {
+        return Err(ToolError::OpenFailed(format!(
+            "IDA reported {actual}-bit after requesting {bitness}-bit raw blob mode"
+        )));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -160,6 +249,7 @@ pub fn handle_open(
     let expanded = expand_path(path);
     let debug_info_path = non_empty_trimmed(debug_info_path);
     let file_type = non_empty_trimmed(file_type);
+    let raw_bitness = raw_bitness_from_extra_args(extra_args)?;
     ensure_not_cancelled(cancel.as_ref())?;
 
     // Check if a database is already open
@@ -226,6 +316,14 @@ pub fn handle_open(
             }
         }
         raw_out_path = Some(out_path);
+    }
+
+    if raw_bitness.is_some() && (is_idb || existing_raw_idb_path.is_some()) {
+        return Err(ToolError::InvalidParams(
+            "bitness only affects newly created raw-blob databases; set rebuild=true to recreate \
+             the database with a different bitness"
+                .to_string(),
+        ));
     }
 
     let lock_target_path = raw_out_path.as_ref().unwrap_or(&expanded);
@@ -323,7 +421,9 @@ pub fn handle_open(
         );
         let opened_path = out_path.clone();
         let mut opts = IDBOpenOptions::new();
-        opts.auto_analyse(auto_analyse);
+        // IDA must not analyze the raw bytes until the application and segment
+        // bitness have been corrected for modes such as AArch32 and x86-16/32.
+        opts.auto_analyse(auto_analyse && raw_bitness.is_none());
         if let Some(ft) = file_type {
             info!(file_type = ft, "Using file type selector (-T flag)");
             opts.file_type(ft);
@@ -336,7 +436,7 @@ pub fn handle_open(
     };
     let _ = ticker_stop_tx.send(());
     let _ = ticker.join();
-    let db = match db {
+    let mut db = match db {
         Ok(db) => db,
         Err(e) => {
             release_mcp_lock_file(mcp_lock);
@@ -352,6 +452,15 @@ pub fn handle_open(
             )));
         }
     };
+    if let Some(bitness) = raw_bitness {
+        if let Err(error) = configure_raw_bitness(&db, bitness) {
+            release_mcp_lock_file(mcp_lock);
+            return Err(error);
+        }
+        if auto_analyse {
+            db.auto_wait();
+        }
+    }
     ensure_not_cancelled(cancel.as_ref())?;
     if !is_idb && auto_analyse {
         emit_progress(
@@ -502,7 +611,8 @@ mod tests {
     use crate::ida::handlers::database::{
         base_input_path_for_database, database_paths_match, existing_idb_for_raw_binary,
         existing_idb_for_raw_open, has_ida_database_extension, idb_path_for_raw_binary,
-        init_database_args, non_empty_trimmed,
+        init_database_args, non_empty_trimmed, raw_bitness_from_extra_args, raw_bitness_script,
+        raw_bitness_worker_arg,
     };
 
     #[test]
@@ -518,6 +628,29 @@ mod tests {
         let args = init_database_args(&["-Sscript.py".to_string(), "-Tpe".to_string()]);
         assert!(args.iter().any(|arg| arg == "-Sscript.py"));
         assert!(args.iter().any(|arg| arg == "-Tpe"));
+    }
+
+    #[test]
+    fn raw_bitness_worker_arg_is_parsed_but_not_forwarded_to_ida() {
+        let marker = raw_bitness_worker_arg(32);
+        let extra_args = vec!["-parm:ARMv8-A".to_string(), marker.clone()];
+
+        assert_eq!(raw_bitness_from_extra_args(&extra_args).unwrap(), Some(32));
+        assert!(!init_database_args(&extra_args).contains(&marker));
+        assert!(init_database_args(&extra_args).contains(&"-parm:ARMv8-A".to_string()));
+    }
+
+    #[test]
+    fn raw_bitness_script_maps_application_and_segment_modes() {
+        let script_16 = raw_bitness_script(16).unwrap();
+        assert!(script_16.contains("inf_set_app_bitness(16)"));
+        assert!(script_16.contains("set_segm_addressing(_segment, 0)"));
+
+        let script_64 = raw_bitness_script(64).unwrap();
+        assert!(script_64.contains("inf_set_app_bitness(64)"));
+        assert!(script_64.contains("set_segm_addressing(_segment, 2)"));
+        assert!(script_64.contains("\n    _segment ="));
+        assert!(raw_bitness_script(24).is_err());
     }
 
     #[test]
