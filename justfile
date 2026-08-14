@@ -9,12 +9,16 @@ build:
     cargo build
 
 # Build release binary
+# KACHE_DISABLED=1: kache 0.13.0 restore-time mtime bugs can leave a stale
+# binary while reporting success (kunobi-ninja/kache#677/#680/#682, fixed
+# upstream 2026-08-08). Release artifacts bypass the cache until a fixed
+# kache release ships; day-to-day debug builds keep it for disk savings.
 release:
-    cargo build --release
+    KACHE_DISABLED=1 cargo build --release
 
 # Build release binary linked against a specific IDA version (local testing, no publish)
 release-against ida_version="9.4":
-    IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
+    KACHE_DISABLED=1 IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
 
 # Build and publish prerelease (macOS ARM64 only, for local testing)
 prerelease ida_version="9.4": && (update-beta-cask ida_version)
@@ -22,7 +26,7 @@ prerelease ida_version="9.4": && (update-beta-cask ida_version)
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     TARGET=$(git rev-parse HEAD)
-    IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
+    KACHE_DISABLED=1 IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
     mkdir -p dist
     rm -f "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
     tar -czvf "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" -C target/release ida-mcp -C "{{ justfile_directory() }}" README.md LICENSE
@@ -150,6 +154,14 @@ test-http: build
 test-http-recovery: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-http-recovery
 
+# Run legacy-session cancel-on-disconnect test (single-worker HTTP)
+test-session-cancel: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-session-cancel
+
+# Run HTTP startup-failure test (no IDA license or fixture required)
+test-http-startup: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp just test-http-startup
+
 # Run HTTP worker-pool concurrency test (debug)
 test-pool: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-pool
@@ -189,6 +201,10 @@ test-observability: build
 # Run open_idb auto-background elicitation integration test (debug)
 test-elicitation: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-elicitation
+
+# Verify MCP 2026 discover/stateless lifecycle and the pooled legacy boundary.
+test-modern: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-modern
 
 # Run open_idb rebuild semantics test (raw reuse vs rebuild=true overwrite)
 test-rebuild-idb: build

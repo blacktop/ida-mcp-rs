@@ -6,10 +6,8 @@ use crate::ida::pool::PooledSessionState;
 use crate::ida::request::IdaRequest;
 use crate::ida::types::*;
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -44,20 +42,12 @@ pub(crate) enum CloseAuthorization {
 }
 
 /// Internal state for close token ownership.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct CloseTokenState {
     token: Mutex<Option<CloseTokenLease>>,
-    nonce: AtomicU64,
 }
 
 impl CloseTokenState {
-    fn new() -> Self {
-        Self {
-            token: Mutex::new(None),
-            nonce: AtomicU64::new(0),
-        }
-    }
-
     fn lock_token(&self) -> std::sync::MutexGuard<'_, Option<CloseTokenLease>> {
         match self.token.lock() {
             Ok(guard) => guard,
@@ -65,14 +55,8 @@ impl CloseTokenState {
         }
     }
 
-    fn generate_token(&self) -> String {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let nonce = self.nonce.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        format!("{now:x}-{pid:x}-{nonce:x}")
+    fn generate_token() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
     }
 
     fn issue_for_session(&self, session_id: &str) -> Result<CloseTokenGrant, String> {
@@ -88,7 +72,7 @@ impl CloseTokenState {
             return Err(lease.owner_session_id.clone());
         }
 
-        let token = self.generate_token();
+        let token = Self::generate_token();
         let lease = CloseTokenLease {
             token: token.clone(),
             owner_session_id: session_id.to_string(),
@@ -143,7 +127,7 @@ impl IdaWorker {
     pub fn new(tx: mpsc::SyncSender<IdaRequest>) -> Self {
         Self {
             tx,
-            close_token: Arc::new(CloseTokenState::new()),
+            close_token: Arc::new(CloseTokenState::default()),
         }
     }
 
@@ -219,39 +203,6 @@ impl IdaWorker {
         rx.await?
     }
 
-    /// Open an IDA database file.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn open(
-        &self,
-        path: &str,
-        load_debug_info: bool,
-        debug_info_path: Option<String>,
-        debug_info_verbose: bool,
-        force: bool,
-        rebuild: bool,
-        file_type: Option<String>,
-        auto_analyse: bool,
-        extra_args: Vec<String>,
-        idb_out: Option<String>,
-    ) -> Result<DbInfo, ToolError> {
-        self.open_observed(
-            path,
-            load_debug_info,
-            debug_info_path,
-            debug_info_verbose,
-            force,
-            rebuild,
-            file_type,
-            auto_analyse,
-            extra_args,
-            idb_out,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
     /// Open an IDA database file and stream foreground progress updates.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_observed(
@@ -270,6 +221,44 @@ impl IdaWorker {
         progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
     ) -> Result<DbInfo, ToolError> {
+        self.open_observed_with_generation(
+            path,
+            load_debug_info,
+            debug_info_path,
+            debug_info_verbose,
+            force,
+            rebuild,
+            file_type,
+            auto_analyse,
+            extra_args,
+            idb_out,
+            _timeout_secs,
+            progress_tx,
+            cancel,
+        )
+        .await
+        .map(|opened| opened.info)
+    }
+
+    /// Open a database and retain its worker-local lifetime identity for
+    /// generation-checked cleanup by background operations.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_observed_with_generation(
+        &self,
+        path: &str,
+        load_debug_info: bool,
+        debug_info_path: Option<String>,
+        debug_info_verbose: bool,
+        force: bool,
+        rebuild: bool,
+        file_type: Option<String>,
+        auto_analyse: bool,
+        extra_args: Vec<String>,
+        idb_out: Option<String>,
+        _timeout_secs: Option<u64>,
+        progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<OpenedDatabase, ToolError> {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::Open {
             path: path.to_string(),
@@ -287,6 +276,28 @@ impl IdaWorker {
             resp: tx,
         })?;
         Self::recv(rx).await
+    }
+
+    /// Close the database only if it is still the lifetime opened by the
+    /// caller. A mismatch is a successful no-op.
+    pub(crate) async fn close_if_generation(
+        &self,
+        generation: DatabaseGeneration,
+    ) -> Result<ConditionalCloseResult, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.send_with_retry(
+            IdaRequest::CloseIfGeneration {
+                generation,
+                resp: tx,
+            },
+            Some(Duration::from_secs(CLOSE_SEND_TIMEOUT_SECS)),
+        )
+        .await?;
+        let result = rx.await.map_err(|_| ToolError::WorkerClosed)??;
+        if result == ConditionalCloseResult::Closed {
+            self.clear_close_token();
+        }
+        Ok(result)
     }
 
     /// Close the currently open database.
@@ -324,8 +335,20 @@ impl IdaWorker {
 
     /// Report current auto-analysis status.
     pub async fn analysis_status(&self) -> Result<AnalysisStatus, ToolError> {
+        self.analysis_status_for_generation(None).await
+    }
+
+    /// Report analysis status, optionally only while `expected_generation` is
+    /// still the open database (see [`DatabaseGeneration`]).
+    pub async fn analysis_status_for_generation(
+        &self,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<AnalysisStatus, ToolError> {
         let (tx, rx) = oneshot::channel();
-        self.try_send(IdaRequest::AnalysisStatus { resp: tx })?;
+        self.try_send(IdaRequest::AnalysisStatus {
+            expected_generation,
+            resp: tx,
+        })?;
         rx.await?
     }
 
@@ -335,9 +358,22 @@ impl IdaWorker {
         module: &str,
         timeout_secs: Option<u64>,
     ) -> Result<DscImageInfo, ToolError> {
+        self.dsc_load_image_for_generation(module, timeout_secs, None)
+            .await
+    }
+
+    /// Load a DSC image, optionally only while `expected_generation` is still
+    /// the open database (see [`DatabaseGeneration`]).
+    pub async fn dsc_load_image_for_generation(
+        &self,
+        module: &str,
+        timeout_secs: Option<u64>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<DscImageInfo, ToolError> {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::DscLoadImage {
             module: module.to_string(),
+            expected_generation,
             resp: tx,
         })?;
         Self::recv_with_timeout(rx, timeout_secs).await
@@ -1325,54 +1361,6 @@ impl WorkerBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn open(
-        &self,
-        path: &str,
-        load_debug_info: bool,
-        debug_info_path: Option<String>,
-        debug_info_verbose: bool,
-        force: bool,
-        rebuild: bool,
-        file_type: Option<String>,
-        auto_analyse: bool,
-        extra_args: Vec<String>,
-    ) -> Result<DbInfo, ToolError> {
-        match self {
-            Self::Local(worker) => {
-                worker
-                    .open(
-                        path,
-                        load_debug_info,
-                        debug_info_path,
-                        debug_info_verbose,
-                        force,
-                        rebuild,
-                        file_type,
-                        auto_analyse,
-                        extra_args,
-                        None,
-                    )
-                    .await
-            }
-            Self::Pooled(state) => {
-                state
-                    .open(
-                        path,
-                        load_debug_info,
-                        debug_info_path,
-                        debug_info_verbose,
-                        force,
-                        rebuild,
-                        file_type,
-                        auto_analyse,
-                        extra_args,
-                    )
-                    .await
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub async fn open_observed(
         &self,
         path: &str,
@@ -1389,10 +1377,46 @@ impl WorkerBackend {
         progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
     ) -> Result<DbInfo, ToolError> {
+        self.open_observed_with_generation(
+            path,
+            load_debug_info,
+            debug_info_path,
+            debug_info_verbose,
+            force,
+            rebuild,
+            file_type,
+            auto_analyse,
+            extra_args,
+            idb_out,
+            timeout_secs,
+            progress_tx,
+            cancel,
+        )
+        .await
+        .map(|opened| opened.info)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_observed_with_generation(
+        &self,
+        path: &str,
+        load_debug_info: bool,
+        debug_info_path: Option<String>,
+        debug_info_verbose: bool,
+        force: bool,
+        rebuild: bool,
+        file_type: Option<String>,
+        auto_analyse: bool,
+        extra_args: Vec<String>,
+        idb_out: Option<String>,
+        timeout_secs: Option<u64>,
+        progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<OpenedDatabase, ToolError> {
         match self {
             Self::Local(worker) => {
                 worker
-                    .open_observed(
+                    .open_observed_with_generation(
                         path,
                         load_debug_info,
                         debug_info_path,
@@ -1411,7 +1435,7 @@ impl WorkerBackend {
             }
             Self::Pooled(state) => {
                 state
-                    .open_observed(
+                    .open_observed_with_generation(
                         path,
                         load_debug_info,
                         debug_info_path,
@@ -1428,6 +1452,16 @@ impl WorkerBackend {
                     )
                     .await
             }
+        }
+    }
+
+    pub(crate) async fn close_if_generation(
+        &self,
+        generation: DatabaseGeneration,
+    ) -> Result<ConditionalCloseResult, ToolError> {
+        match self {
+            Self::Local(worker) => worker.close_if_generation(generation).await,
+            Self::Pooled(state) => state.close_if_generation(generation).await,
         }
     }
 
@@ -1464,9 +1498,25 @@ impl WorkerBackend {
     }
 
     pub async fn analysis_status(&self) -> Result<AnalysisStatus, ToolError> {
+        self.analysis_status_for_generation(None).await
+    }
+
+    /// See [`IdaWorker::analysis_status_for_generation`].
+    pub async fn analysis_status_for_generation(
+        &self,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<AnalysisStatus, ToolError> {
         match self {
-            Self::Local(worker) => worker.analysis_status().await,
-            Self::Pooled(state) => state.analysis_status().await,
+            Self::Local(worker) => {
+                worker
+                    .analysis_status_for_generation(expected_generation)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .analysis_status_for_generation(expected_generation)
+                    .await
+            }
         }
     }
 
@@ -1475,9 +1525,28 @@ impl WorkerBackend {
         module: &str,
         timeout_secs: Option<u64>,
     ) -> Result<DscImageInfo, ToolError> {
+        self.dsc_load_image_for_generation(module, timeout_secs, None)
+            .await
+    }
+
+    /// See [`IdaWorker::dsc_load_image_for_generation`].
+    pub async fn dsc_load_image_for_generation(
+        &self,
+        module: &str,
+        timeout_secs: Option<u64>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<DscImageInfo, ToolError> {
         match self {
-            Self::Local(worker) => worker.dsc_load_image(module, timeout_secs).await,
-            Self::Pooled(state) => state.dsc_load_image(module, timeout_secs).await,
+            Self::Local(worker) => {
+                worker
+                    .dsc_load_image_for_generation(module, timeout_secs, expected_generation)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .dsc_load_image_for_generation(module, timeout_secs, expected_generation)
+                    .await
+            }
         }
     }
 
@@ -2317,6 +2386,60 @@ mod tests {
         IdaWorker::new(tx)
     }
 
+    /// Wiring oracle: the generation a caller binds must reach the worker
+    /// request, where the loop compares it. Without this, the `_for_generation`
+    /// call sites could silently degrade to unbound and every other test would
+    /// still pass.
+    #[tokio::test]
+    async fn bound_post_open_calls_carry_their_generation_to_the_worker() {
+        use crate::ida::types::DatabaseGeneration;
+
+        let (tx, rx) = mpsc::sync_channel(4);
+        let worker = IdaWorker::new(tx);
+        let generation = DatabaseGeneration(9);
+
+        // The response senders are dropped with rx at the end of the test, so
+        // these calls resolve as worker-closed; only the emitted request matters.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            worker.dsc_load_image_for_generation("libobjc.A.dylib", Some(1), Some(generation)),
+        )
+        .await;
+        match rx.recv().expect("dsc_load_image must reach the worker") {
+            IdaRequest::DscLoadImage {
+                expected_generation,
+                ..
+            } => assert_eq!(expected_generation, Some(generation)),
+            _ => panic!("expected a DscLoadImage request"),
+        }
+
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            worker.analysis_status_for_generation(Some(generation)),
+        )
+        .await;
+        match rx.recv().expect("analysis_status must reach the worker") {
+            IdaRequest::AnalysisStatus {
+                expected_generation,
+                ..
+            } => assert_eq!(expected_generation, Some(generation)),
+            _ => panic!("expected an AnalysisStatus request"),
+        }
+
+        // Foreground callers stay unbound and follow the current database.
+        let _ = tokio::time::timeout(Duration::from_millis(50), worker.analysis_status()).await;
+        match rx
+            .recv()
+            .expect("unbound analysis_status must reach the worker")
+        {
+            IdaRequest::AnalysisStatus {
+                expected_generation,
+                ..
+            } => assert_eq!(expected_generation, None),
+            _ => panic!("expected an AnalysisStatus request"),
+        }
+    }
+
     #[test]
     fn close_token_is_reused_for_same_session() {
         let worker = test_worker();
@@ -2330,6 +2453,26 @@ mod tests {
         assert_eq!(first.token, second.token);
         assert!(!first.reused);
         assert!(second.reused);
+    }
+
+    #[test]
+    fn close_tokens_are_fresh_uuid_v4_bearer_capabilities() {
+        let worker = test_worker();
+        let first = worker
+            .issue_close_token_for_session("session-a")
+            .expect("first issue should succeed");
+        worker.clear_close_token();
+        let second = worker
+            .issue_close_token_for_session("session-a")
+            .expect("second issue should succeed");
+
+        assert_ne!(first.token, second.token);
+        for token in [&first.token, &second.token] {
+            assert_eq!(token.len(), 32);
+            assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            let parsed = uuid::Uuid::parse_str(token).expect("token should parse as a UUID");
+            assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
+        }
     }
 
     #[test]

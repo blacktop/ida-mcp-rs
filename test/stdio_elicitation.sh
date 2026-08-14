@@ -5,6 +5,7 @@ BIN="${MCP_STDIO_BIN:-${SERVER_BIN:-../target/release/ida-mcp}}"
 THRESHOLD_BYTES=$((50 * 1024 * 1024))
 THRESHOLD_MIB=$((THRESHOLD_BYTES / 1024 / 1024))
 EXPECTED_THRESHOLD_MSG="threshold ${THRESHOLD_MIB} MiB"
+MODERN_META='{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"elicitation-modern","version":"0.1"},"io.modelcontextprotocol/clientCapabilities":{"elicitation":{"form":{}}}}'
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required for elicitation test (brew install jq)" >&2
@@ -78,14 +79,14 @@ json_line_matching() {
     done <"$log"
     if ! kill -0 "$server_pid" 2>/dev/null; then
       echo "server process died while waiting for: $filter" >&2
-      cat "$log" >&2
+      dump_server_logs
       return 1
     fi
     sleep 1
     elapsed=$((elapsed + 1))
   done
   echo "timeout waiting for: $filter" >&2
-  cat "$log" >&2
+  dump_server_logs
   return 1
 }
 
@@ -142,10 +143,21 @@ start_server() {
   tmpdir="$(mktemp -d)"
   fifo_in="$tmpdir/in.fifo"
   log="$tmpdir/server.log"
+  errlog="$tmpdir/server.err.log"
   mkfifo "$fifo_in"
-  RUST_LOG="${RUST_LOG:-ida_mcp=trace}" "$BIN" <"$fifo_in" >"$log" 2>&1 &
+  # Keep JSON-RPC stdout separate from tracing stderr: with `2>&1` both
+  # writers share one file offset, and a trace line flushed mid-response
+  # tears the response line in the log, wedging the wait loops until timeout.
+  RUST_LOG="${RUST_LOG:-ida_mcp=trace}" "$BIN" <"$fifo_in" >"$log" 2>"$errlog" &
   server_pid=$!
   exec 3>"$fifo_in"
+}
+
+dump_server_logs() {
+  echo "── server stdout ──" >&2
+  cat "$log" >&2 || true
+  echo "── server stderr ──" >&2
+  cat "$errlog" >&2 || true
 }
 
 run_case() {
@@ -192,8 +204,76 @@ run_case() {
   cleanup_case
 }
 
+run_modern_case() {
+  local label="mrtr-accept"
+  current_large="fixtures/mini-${label}"
+  make_large_fixture "$current_large"
+  start_server
+
+  echo "── $label ──"
+  local first_payload
+  first_payload="$(jq -nc --arg path "$current_large" --argjson meta "$MODERN_META" '
+    {jsonrpc:"2.0", id:10, method:"tools/call", params:{
+      _meta:$meta,
+      name:"open_idb",
+      arguments:{path:$path, auto_analyse:true, timeout_secs:600}
+    }}')"
+  send "$first_payload"
+
+  local first_response request_state
+  first_response="$(wait_response 10 60)"
+  if ! echo "$first_response" | jq -e --arg threshold_msg "$EXPECTED_THRESHOLD_MSG" '
+    .result.resultType == "input_required"
+    and (.result.requestState | type == "string")
+    and .result.inputRequests.background.method == "elicitation/create"
+    and .result.inputRequests.background.params.requestedSchema.properties.background.type == "boolean"
+    and (.result.inputRequests.background.params.message | contains($threshold_msg))' >/dev/null; then
+    echo "❌ modern open_idb did not return the expected MRTR input request" >&2
+    echo "$first_response" | jq . >&2 || echo "$first_response" >&2
+    return 1
+  fi
+  request_state="$(echo "$first_response" | jq -r '.result.requestState')"
+
+  local retry_payload
+  retry_payload="$(jq -nc \
+    --arg path "$current_large" \
+    --arg state "$request_state" \
+    --argjson meta "$MODERN_META" '
+    {jsonrpc:"2.0", id:11, method:"tools/call", params:{
+      _meta:$meta,
+      name:"open_idb",
+      arguments:{path:$path, auto_analyse:true, timeout_secs:600},
+      requestState:$state,
+      inputResponses:{background:{action:"accept", content:{background:true}}}
+    }}')"
+  send "$retry_payload"
+
+  local open_resp task_id status_payload status_resp
+  open_resp="$(wait_response 11 180)"
+  if ! echo "$open_resp" | jq -e '.result.resultType == "complete"' >/dev/null; then
+    echo "❌ modern open_idb retry did not complete" >&2
+    echo "$open_resp" | jq . >&2 || echo "$open_resp" >&2
+    return 1
+  fi
+  task_id="$(assert_background_response "$open_resp" "$label")"
+  echo "   background task: $task_id"
+
+  status_payload="$(jq -nc --arg task "$task_id" --argjson meta "$MODERN_META" '
+    {jsonrpc:"2.0", id:12, method:"tools/call", params:{
+      _meta:$meta,
+      name:"task_status",
+      arguments:{task_id:$task}
+    }}')"
+  send "$status_payload"
+  status_resp="$(wait_response 12 30)"
+  assert_task_status "$status_resp" "$task_id" "$label"
+
+  cleanup_case
+}
+
 run_case "no-elicitation" '{}' "no"
 run_case "elicitation-accept" '{"elicitation":{"form":{}}}' "yes"
 run_case "elicitation-timeout" '{"elicitation":{"form":{}}}' "timeout" 10
+run_modern_case
 
 echo "✅ Elicitation auto-background test passed"

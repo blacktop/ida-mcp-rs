@@ -8,7 +8,7 @@
 - `tools/list` returns the full tool set (currently 73 tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns full documentation and schema
-- Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires close_token from open_idb)
+- Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires the close_token from `open_idb` unless the request is in the owning legacy session)
 
 Note: `open_idb` accepts .i64/.idb or raw binaries (Mach-O/ELF/PE). Raw binaries are
 auto-analyzed and saved as a .i64 alongside the input. If that generated .i64

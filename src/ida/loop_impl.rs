@@ -23,6 +23,7 @@ use crate::ida::observability::{
 #[cfg(target_os = "windows")]
 use crate::ida::registry_isolation::IsolatedWindowsRegistry;
 use crate::ida::request::IdaRequest;
+use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, OpenedDatabase};
 
 const AUTO_USE_LUMINA_REGISTRY_VALUE: &str = "AutoUseLumina";
 
@@ -504,6 +505,8 @@ fn init_ida_library_with_isolated_idausr(
 /// This function blocks until Shutdown is received.
 pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
     let mut idb: Option<IDB> = None;
+    let mut database_generation: Option<DatabaseGeneration> = None;
+    let mut next_database_generation = 0_u64;
     let mut lock_file: Option<File> = None;
     let mut lock_path: Option<PathBuf> = None;
     let mut lib_initialized = init_state.library_initialized;
@@ -595,6 +598,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     continue;
                 }
                 info!(path = %path, force, rebuild, file_type = ?file_type, auto_analyse, "Opening database");
+                let had_open_database = idb.is_some();
                 let result = database::handle_open(
                     &mut idb,
                     &mut lock_file,
@@ -612,20 +616,40 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     progress_tx.clone(),
                     cancel.clone(),
                 );
+                let result = result.and_then(|info| {
+                    let generation = match database_generation {
+                        Some(generation) if had_open_database => generation,
+                        _ => {
+                            let Some(next) = next_database_generation.checked_add(1) else {
+                                drop(idb.take());
+                                release_mcp_lock(&mut lock_file, &mut lock_path);
+                                return Err(ToolError::IdaError(
+                                    "database generation counter exhausted".to_string(),
+                                ));
+                            };
+                            next_database_generation = next;
+                            let generation = DatabaseGeneration(next);
+                            database_generation = Some(generation);
+                            generation
+                        }
+                    };
+                    Ok(OpenedDatabase { info, generation })
+                });
                 match &result {
-                    Ok(info) => {
+                    Ok(opened) => {
                         emit_progress(
                             progress_tx.as_ref(),
                             "completed",
                             OPEN_IDB_PROGRESS_TOTAL,
                             Some(OPEN_IDB_PROGRESS_TOTAL),
-                            format!("Opened database {}", info.path),
+                            format!("Opened database {}", opened.info.path),
                         );
                         info!(
-                            path = %info.path,
-                            processor = %info.processor,
-                            bits = info.bits,
-                            functions = info.function_count,
+                            path = %opened.info.path,
+                            processor = %opened.info.processor,
+                            bits = opened.info.bits,
+                            functions = opened.info.function_count,
+                            database_generation = opened.generation.0,
                             "Database opened"
                         );
                     }
@@ -658,9 +682,29 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     info!(path = %db.path().display(), "Dropping IDB (will call close_database_with(save))");
                 }
                 drop(idb.take());
+                database_generation = None;
                 info!("IDB dropped, database should be packed");
                 release_mcp_lock(&mut lock_file, &mut lock_path);
                 let _ = resp.send(());
+            }
+            IdaRequest::CloseIfGeneration { generation, resp } => {
+                if database_generation == Some(generation) {
+                    info!(
+                        database_generation = generation.0,
+                        "Closing matching database generation"
+                    );
+                    drop(idb.take());
+                    database_generation = None;
+                    release_mcp_lock(&mut lock_file, &mut lock_path);
+                    let _ = resp.send(Ok(ConditionalCloseResult::Closed));
+                } else {
+                    debug!(
+                        expected_generation = generation.0,
+                        current_generation = database_generation.map(|current| current.0),
+                        "Skipping conditional close for a stale database generation"
+                    );
+                    let _ = resp.send(Ok(ConditionalCloseResult::NotCurrent));
+                }
             }
             IdaRequest::LoadDebugInfo {
                 path,
@@ -677,7 +721,14 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::AnalysisStatus { resp } => {
+            IdaRequest::AnalysisStatus {
+                expected_generation,
+                resp,
+            } => {
+                if let Err(err) = require_generation(expected_generation, database_generation) {
+                    let _ = resp.send(Err(err));
+                    continue;
+                }
                 debug!("Reporting analysis status");
                 let result = crate::crash_guard::crash_guarded("handle_analysis_status", || {
                     analysis::handle_analysis_status(&idb)
@@ -693,7 +744,15 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::DscLoadImage { module, resp } => {
+            IdaRequest::DscLoadImage {
+                module,
+                expected_generation,
+                resp,
+            } => {
+                if let Err(err) = require_generation(expected_generation, database_generation) {
+                    let _ = resp.send(Err(err));
+                    continue;
+                }
                 debug!(module = %module, "Loading DSC image");
                 let result = crate::crash_guard::crash_guarded("handle_dsc_load_image", || {
                     dscu::handle_dsc_load_image(&idb, &module)
@@ -1861,6 +1920,31 @@ fn shutdown_cleanup(
 
 /// Send a version-mismatch error for every request variant so the
 /// agent gets a clear message instead of a segfault.
+/// Refuse an operation whose caller opened a database that is no longer the
+/// current one. `None` opts out (foreground tools legitimately target whatever
+/// database is open); `Some` binds the operation to one database lifetime.
+///
+/// This must be evaluated in the same loop iteration that performs the work:
+/// the worker dequeues serially, so an "assert generation" request followed by
+/// a separate operation request would let a close/reopen slip between them.
+fn require_generation(
+    expected: Option<DatabaseGeneration>,
+    current: Option<DatabaseGeneration>,
+) -> Result<(), ToolError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if current == Some(expected) {
+        return Ok(());
+    }
+    warn!(
+        expected_generation = expected.0,
+        current_generation = current.map(|generation| generation.0),
+        "Refusing an operation bound to a replaced database generation"
+    );
+    Err(ToolError::DatabaseReplaced)
+}
+
 fn reject_with_version_error(req: IdaRequest, msg: &str) {
     reject_with_error(req, ToolError::SdkVersionMismatch(msg.to_owned()));
 }
@@ -1878,6 +1962,7 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
         IdaRequest::Close { resp } => {
             let _ = resp.send(());
         }
+        IdaRequest::CloseIfGeneration { resp, .. } => reject!(resp, err),
         IdaRequest::Open { resp, .. } => reject!(resp, err),
         IdaRequest::LoadDebugInfo { resp, .. } => reject!(resp, err),
         IdaRequest::AnalysisStatus { resp, .. } => reject!(resp, err),
@@ -1968,9 +2053,43 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
+    use crate::error::ToolError;
     use crate::ida::loop_impl::{
-        check_version_mismatch, configure_lumina, first_ida_user_dir, should_check_license_expiry,
+        check_version_mismatch, configure_lumina, first_ida_user_dir, require_generation,
+        should_check_license_expiry,
     };
+    use crate::ida::types::DatabaseGeneration;
+
+    #[test]
+    fn unbound_operations_target_whatever_database_is_open() {
+        // Foreground tools legitimately act on the current database.
+        assert!(require_generation(None, Some(DatabaseGeneration(7))).is_ok());
+        assert!(require_generation(None, None).is_ok());
+    }
+
+    #[test]
+    fn bound_operation_runs_against_the_database_it_opened() {
+        assert!(
+            require_generation(Some(DatabaseGeneration(7)), Some(DatabaseGeneration(7))).is_ok()
+        );
+    }
+
+    /// The close/reopen race: a background task opened generation N, another
+    /// request closed it and opened N+1, and the task's remaining work must be
+    /// refused instead of silently redirected onto the new database.
+    #[test]
+    fn bound_operation_is_refused_after_a_close_and_reopen() {
+        let err = require_generation(Some(DatabaseGeneration(1)), Some(DatabaseGeneration(2)))
+            .expect_err("a replaced database must refuse the stale operation");
+        assert!(matches!(err, ToolError::DatabaseReplaced), "{err}");
+    }
+
+    #[test]
+    fn bound_operation_is_refused_after_a_plain_close() {
+        let err = require_generation(Some(DatabaseGeneration(1)), None)
+            .expect_err("a closed database must refuse the stale operation");
+        assert!(matches!(err, ToolError::DatabaseReplaced), "{err}");
+    }
 
     #[test]
     fn matching_ida_94_version_passes() {

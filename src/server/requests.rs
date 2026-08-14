@@ -122,11 +122,13 @@ mod tests {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CloseIdbRequest {
-    #[schemars(description = "Ownership token returned by open_idb (required for HTTP/SSE).")]
+    #[schemars(
+        description = "Ownership token returned by open_idb. Required when an HTTP/SSE request is not in the owning legacy session; sessionless MCP 2026 clients should provide it unless force=true is used for trusted recovery."
+    )]
     #[serde(alias = "close_token", alias = "owner_token")]
     pub token: Option<String>,
     #[schemars(
-        description = "Force-close the database even if the original HTTP owner session or token was lost. Use only for recovery."
+        description = "Force-close the database when the original HTTP close token was lost. Use only from a trusted client for recovery."
     )]
     #[serde(alias = "recover", alias = "override_owner")]
     pub force: Option<bool>,

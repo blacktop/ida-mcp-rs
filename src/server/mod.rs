@@ -12,6 +12,7 @@ pub use requests::*;
 use crate::error::ToolError;
 use crate::ida::observability::{ProgressReceiver, ProgressSender};
 use crate::ida::pool::CHILD_TIMEOUT_GRACE_SECS;
+use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration};
 use crate::ida::worker::{
     CloseAuthorization, CloseTokenGrant, IdaWorker, WorkerBackend, MAX_TIMEOUT_SECS,
 };
@@ -20,7 +21,11 @@ use crate::server::operation::{
 };
 use crate::tool_registry::{self, ToolCategory};
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
+    handler::server::{
+        router::tool::ToolRouter,
+        tool::{InputResponses as ToolInputResponses, RequestState, ToolCallContext},
+        wrapper::Parameters,
+    },
     model::{
         CallToolResult, ContentBlock as Content, ServerCapabilities, ServerInfo, Tool,
         ToolAnnotations,
@@ -29,14 +34,66 @@ use rmcp::{
     tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
 };
 use serde_json::{json, Map, Value};
+use std::borrow::Cow;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
 struct SessionLifetime {
     cancel: tokio_util::sync::CancellationToken,
+}
+
+/// State that must survive across handler instances created for stateless MCP
+/// requests. Long-lived transports use one value per handler; single-worker
+/// HTTP shares one value across legacy sessions and modern sessionless requests
+/// because they all operate on the same IDA context.
+#[derive(Clone)]
+pub struct ServerRuntimeState {
+    task_registry: task::TaskRegistry,
+    operation_registry: OperationRegistry,
+    operation_nonce: Arc<AtomicU64>,
+    /// Parent lifetime for background tasks spawned by sessionless MCP 2026
+    /// requests, whose handlers drop as soon as the response is sent. Cancelled
+    /// only when the runtime state itself drops (process/transport shutdown).
+    runtime_lifetime: Arc<SessionLifetime>,
+    request_state_codec: rmcp::model::RequestStateCodec,
+    /// True when the HTTP transport runs with `--stateless`: rmcp then builds
+    /// a fresh handler per request even for legacy protocol versions, so every
+    /// request must use the shared runtime task owner and lifetime — otherwise
+    /// a legacy client's background task would be cancelled when its handler
+    /// drops and owned by a session identity that never recurs.
+    stateless_http: bool,
+}
+
+impl Default for ServerRuntimeState {
+    fn default() -> Self {
+        let signing_key = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        Self {
+            task_registry: task::TaskRegistry::new(),
+            operation_registry: OperationRegistry::new(),
+            operation_nonce: Arc::new(AtomicU64::new(0)),
+            runtime_lifetime: Arc::new(SessionLifetime::new()),
+            request_state_codec: rmcp::model::RequestStateCodec::new(signing_key.into_bytes()),
+            stateless_http: false,
+        }
+    }
+}
+
+impl ServerRuntimeState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Runtime state for an HTTP transport started with `--stateless` (see
+    /// [`Self::stateless_http`]).
+    pub fn new_stateless_http() -> Self {
+        Self {
+            stateless_http: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl SessionLifetime {
@@ -66,10 +123,24 @@ pub struct IdaMcpServer {
     task_registry: task::TaskRegistry,
     operation_registry: OperationRegistry,
     operation_nonce: Arc<AtomicU64>,
+    /// Shared runtime lifetime (see [`ServerRuntimeState::runtime_lifetime`]).
+    runtime_lifetime: Arc<SessionLifetime>,
+    /// Per-handler lifetime. rmcp keeps a legacy session's handler alive for
+    /// the whole session and drops it on session close, so background tasks
+    /// parented here are cancelled when their legacy session ends. Sessionless
+    /// MCP 2026 handlers drop per request, so their background tasks must use
+    /// `runtime_lifetime` instead (see [`Self::background_lifetime`]).
     session_lifetime: Arc<SessionLifetime>,
-    /// Unique ID for this server instance. Changes on restart, making silent
-    /// auto-restarts (e.g. after a Hex-Rays C++ crash) visible to agents.
+    request_state_codec: rmcp::model::RequestStateCodec,
+    /// Unique ID for this handler context. It is stable for a legacy session,
+    /// while sessionless MCP 2026 HTTP creates a fresh value per request. It is
+    /// also the ownership identity used by the legacy HTTP close-token path.
     session_id: String,
+    /// Stable task owner for requests served through this handler. Sessionless
+    /// MCP 2026 requests instead use the shared runtime owner.
+    session_task_owner: task::TaskOwner,
+    /// See [`ServerRuntimeState::stateless_http`].
+    stateless_http: bool,
     /// Server-side tool filter (applied to tools/list, tools/call, and
     /// surfaced via tool_catalog / tool_help).
     filter: Arc<tool_filter::ToolFilter>,
@@ -95,13 +166,6 @@ where
         Self { call_router }
     }
 
-    async fn call(
-        &self,
-        context: ToolCallContext<'_, S>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.call_router.call(context).await
-    }
-
     fn list_all(&self) -> Vec<Tool> {
         let mut tools = Vec::new();
         for info in tool_registry::all_tools() {
@@ -114,6 +178,69 @@ where
 
     fn get(&self, name: &str) -> Option<&Tool> {
         self.call_router.map.get(name).map(|route| &route.attr)
+    }
+}
+
+/// Tools whose handlers consume MRTR `requestState`/`inputResponses`. Other
+/// tools must reject those fields instead of silently executing a fresh call.
+const MRTR_AWARE_TOOLS: &[&str] = &["open_idb"];
+
+/// True when a request carries the complete MCP 2026 inline-metadata key set.
+/// rmcp routes such requests through the sessionless per-request path
+/// regardless of the protocol version the metadata declares (`is_legacy_request`,
+/// tower.rs), so this is the authoritative "which handler lifetime am I running
+/// under" predicate on HTTP transports.
+fn is_sessionless_request_meta(meta: &rmcp::model::RequestMetaObject) -> bool {
+    meta.missing_required_keys(&ProtocolVersion::V_2026_07_28)
+        .is_empty()
+}
+
+impl ToolMux<IdaMcpServer> {
+    async fn call(
+        &self,
+        context: ToolCallContext<'_, IdaMcpServer>,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        // rmcp routes any request carrying the complete 2026 inline-metadata
+        // key set through the sessionless path even when it declares a legacy
+        // protocol version. Pooled workers bind their IDA lease to a legacy
+        // HTTP session, so a sessionless tool call would mint (and leak) a
+        // fresh worker lease per request. Reject it before it reaches the
+        // worker pool; the version allowlist alone cannot catch this case.
+        if context.service.worker.is_pooled()
+            && is_sessionless_request_meta(&context.request_context().meta)
+        {
+            return Err(McpError::invalid_params(
+                "pooled HTTP (--max-workers > 1) requires the legacy initialize lifecycle; \
+                 sessionless inline request metadata is not supported here",
+                None,
+            ));
+        }
+        if !MRTR_AWARE_TOOLS.contains(&context.name())
+            && (context.request_state.is_some() || context.input_responses.is_some())
+        {
+            return Err(McpError::invalid_params(
+                format!(
+                    "tool '{}' does not accept requestState/inputResponses",
+                    context.name()
+                ),
+                None,
+            ));
+        }
+        // SEP-2663 task handles exist from MCP 2026-07-28; older peers cannot
+        // parse a `resultType: "task"` response even if they declared the
+        // tasks extension capability.
+        let should_materialize_task = context.name() == "open_dsc"
+            && context
+                .request_context()
+                .protocol_version()
+                .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+            && context
+                .request_context()
+                .client_capabilities()
+                .is_some_and(|capabilities| capabilities.supports_tasks());
+        let task_registry = context.service.task_registry.clone();
+        let response = self.call_router.call(context).await?;
+        materialize_task_response(&task_registry, should_materialize_task, response)
     }
 }
 
@@ -151,10 +278,14 @@ enum DscOpenPlan {
 }
 
 fn dsc_open_plan(sdk_version: (i32, i32), i64_exists: bool) -> DscOpenPlan {
-    if sdk_version >= (9, 4) {
-        DscOpenPlan::BackgroundDirectRawDsc
-    } else if i64_exists {
+    // An existing database wins on every SDK: reopening it preserves prior
+    // analysis (renames, comments, loaded modules) and skips the load. On 9.4
+    // that database is the deterministic direct-path cache or a legacy
+    // sibling; pre-9.4 it is the sibling idat produced.
+    if i64_exists {
         DscOpenPlan::DirectExistingI64
+    } else if sdk_version >= (9, 4) {
+        DscOpenPlan::BackgroundDirectRawDsc
     } else {
         DscOpenPlan::LegacyIdatBackground
     }
@@ -176,18 +307,28 @@ fn sanitize_temp_component(value: &str) -> String {
     }
 }
 
-fn direct_dsc_temp_i64_path(dsc_path: &std::path::Path) -> Result<std::path::PathBuf, ToolError> {
-    let name = dsc_path
+/// Deterministic per-DSC database location for the IDA 9.4 direct open path.
+///
+/// DSCs commonly sit on read-only mounts, so the generated database cannot
+/// reliably live next to them the way the legacy idat path's sibling `.i64`
+/// does. Deriving the name from the absolute DSC path — never pid or time —
+/// means every `open_dsc` of the same cache resolves to one file: repeat opens
+/// reuse the analyzed database (with any renames/comments) instead of leaking
+/// a fresh multi-GB orphan per call.
+fn direct_dsc_cache_i64_path(dsc_path: &std::path::Path) -> std::path::PathBuf {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let absolute = dsc_path
+        .canonicalize()
+        .unwrap_or_else(|_| dsc_path.to_path_buf());
+    let name = absolute
         .file_name()
         .and_then(|name| name.to_str())
         .map(sanitize_temp_component)
         .unwrap_or_else(|| "dsc".to_string());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| ToolError::InvalidParams(format!("system clock error: {err}")))?
-        .as_nanos();
-    let pid = std::process::id();
-    Ok(std::env::temp_dir().join(format!("ida-mcp-dsc-{pid}-{now}-{name}.i64")))
+    let mut hasher = DefaultHasher::new();
+    absolute.hash(&mut hasher);
+    let hash = hasher.finish();
+    std::env::temp_dir().join(format!("ida-mcp-dsc-{name}-{hash:016x}.i64"))
 }
 
 impl TemporaryFileCleanup {
@@ -229,6 +370,7 @@ const OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES: u64 = 50 * 1024 * 1024;
 /// Bound the MCP elicitation prompt separately from IDA work. If the client
 /// leaves the prompt unanswered, default to background analysis.
 const OPEN_IDB_ELICITATION_TIMEOUT_SECS: u64 = 30;
+const OPEN_IDB_REQUEST_STATE_TTL_SECS: u64 = 10 * 60;
 /// Give foreground operations a short window to observe cancellation and clean
 /// up owned resources before the MCP timeout/cancel response is returned.
 const FOREGROUND_CANCEL_CLEANUP_TIMEOUT_SECS: u64 = 6;
@@ -249,6 +391,11 @@ enum ForegroundOperationError {
     Cancelled {
         snapshot: OperationSnapshot,
     },
+}
+
+enum OpenIdbBackgroundDecision {
+    Ready(bool),
+    InputRequired(InputRequiredResult),
 }
 
 fn timeout_with_child_grace(timeout_secs: Option<u64>, default_timeout_secs: u64) -> u64 {
@@ -279,25 +426,73 @@ impl IdaMcpServer {
         mode: ServerMode,
         filter: Arc<tool_filter::ToolFilter>,
     ) -> Self {
+        Self::with_filter_and_state(worker, mode, filter, ServerRuntimeState::new())
+    }
+
+    pub fn with_filter_and_state(
+        worker: WorkerBackend,
+        mode: ServerMode,
+        filter: Arc<tool_filter::ToolFilter>,
+        state: ServerRuntimeState,
+    ) -> Self {
         let session_id = uuid::Uuid::new_v4().to_string();
-        info!(
+        let session_task_owner = task::TaskOwner::Session(Arc::from(session_id.as_str()));
+        // debug!: sessionless MCP 2026 HTTP constructs a handler per request,
+        // so this is per-request noise there, not a once-per-server event.
+        debug!(
             session_id = %session_id,
             tool_filter_active = filter.is_active(),
             enabled_tools = filter.enabled_count(),
-            "Creating IDA MCP server"
+            "Creating IDA MCP server handler"
         );
         let call_router = Self::tool_router();
         Self {
             worker,
             tool_mux: ToolMux::new(call_router),
             mode,
-            task_registry: task::TaskRegistry::new(),
-            operation_registry: OperationRegistry::new(),
-            operation_nonce: Arc::new(AtomicU64::new(0)),
+            task_registry: state.task_registry,
+            operation_registry: state.operation_registry,
+            operation_nonce: state.operation_nonce,
+            runtime_lifetime: state.runtime_lifetime,
             session_lifetime: Arc::new(SessionLifetime::new()),
+            request_state_codec: state.request_state_codec,
             session_id,
+            session_task_owner,
+            stateless_http: state.stateless_http,
             filter,
         }
+    }
+
+    /// Parent lifetime for background tasks spawned while serving `meta`'s
+    /// request. Only HTTP uses metadata completeness to select rmcp's
+    /// per-request sessionless route. Stdio always has one connection-scoped
+    /// handler, even when an individual request carries the full key set.
+    fn background_lifetime(&self, meta: &rmcp::model::RequestMetaObject) -> &SessionLifetime {
+        if self.is_sessionless_http_request(meta) {
+            &self.runtime_lifetime
+        } else {
+            &self.session_lifetime
+        }
+    }
+
+    /// Owner identity for task admission and client-facing task operations.
+    /// Sessionless HTTP requests share one owner because MCP 2026 supplies no
+    /// stable session identifier across requests. Stdio remains bound to its
+    /// connection-scoped handler regardless of per-request metadata shape.
+    fn task_owner(&self, meta: &rmcp::model::RequestMetaObject) -> task::TaskOwner {
+        if self.is_sessionless_http_request(meta) {
+            task::TaskOwner::Runtime
+        } else {
+            self.session_task_owner.clone()
+        }
+    }
+
+    fn is_sessionless_http_request(&self, meta: &rmcp::model::RequestMetaObject) -> bool {
+        // Under `--stateless` every HTTP request is per-handler regardless of
+        // protocol version, so legacy requests must also use the runtime
+        // owner and lifetime (see `ServerRuntimeState::stateless_http`).
+        matches!(self.mode, ServerMode::Http)
+            && (self.stateless_http || is_sessionless_request_meta(meta))
     }
 
     pub fn filter(&self) -> &Arc<tool_filter::ToolFilter> {
@@ -899,16 +1094,20 @@ impl IdaMcpServer {
 
     fn start_dsc_background(
         &self,
+        owner: &task::TaskOwner,
         dedup_key: String,
         initial_message: &str,
         ctx: DscBackgroundCtx,
+        cancel_token: tokio_util::sync::CancellationToken,
     ) -> Result<CallToolResult, McpError> {
-        let task_id = match self
-            .task_registry
-            .create_keyed("dsc", &dedup_key, initial_message)
-        {
+        let task_id = match self.task_registry.create_keyed(
+            owner,
+            "dsc",
+            &dedup_key,
+            initial_message,
+        ) {
             Ok(id) => id,
-            Err(existing_id) => {
+            Err(task::TaskCreateError::AlreadyRunning(existing_id)) => {
                 return Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&json!({
                         "status": "already_running",
@@ -918,6 +1117,7 @@ impl IdaMcpServer {
                     .unwrap_or_default(),
                 )]));
             }
+            Err(error) => return Ok(task_create_error_to_tool_error(error).to_tool_result()),
         };
 
         let backend = match &ctx.open {
@@ -925,7 +1125,6 @@ impl IdaMcpServer {
             DscBackgroundOpen::LegacyIdat { .. } => "idat",
         };
         info!(
-            task_id = %task_id,
             module = %ctx.module,
             backend,
             "Spawning background DSC loading"
@@ -935,13 +1134,11 @@ impl IdaMcpServer {
         let worker = self.worker.clone();
         let mode = self.mode;
         let tid = task_id.clone();
-        let cancel_token = self.session_lifetime.child_token();
         let task_cancel_token = cancel_token.clone();
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             Self::run_dsc_background(tid, registry, worker, mode, ctx, task_cancel_token).await;
         });
-        self.task_registry
-            .set_handle_with_cancel_token(&task_id, handle, cancel_token);
+        self.task_registry.set_cancel_token(&task_id, cancel_token);
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&json!({
@@ -964,9 +1161,13 @@ impl IdaMcpServer {
         info!(path = %open_path.display(), file_type, "Opening DSC directly through idalib");
 
         let open_path_str = open_path.display().to_string();
+        // Bind the image loads below to the database this call opened. The IDA
+        // worker serves every session, so another session's close_idb between
+        // the open and a load would otherwise redirect the load — which
+        // mutates the database — into whatever database is current.
         let open_result = self
             .worker
-            .open(
+            .open_observed_with_generation(
                 &open_path_str,
                 false,
                 None,
@@ -976,17 +1177,25 @@ impl IdaMcpServer {
                 file_type.map(str::to_string),
                 false,
                 Vec::new(),
+                None,
+                None,
+                None,
+                None,
             )
             .await;
 
-        let db_info = match open_result {
-            Ok(info) => info,
+        let (db_info, generation) = match open_result {
+            Ok(opened) => (opened.info, Some(opened.generation)),
             Err(e) => return Ok(e.to_tool_result()),
         };
 
         let mut loaded_images = Vec::with_capacity(frameworks.len() + 1);
         let mut dsc_warning = None;
-        match self.worker.dsc_load_image(module, Some(600)).await {
+        match self
+            .worker
+            .dsc_load_image_for_generation(module, Some(600), generation)
+            .await
+        {
             Ok(image) => loaded_images.push(image),
             Err(ToolError::NotSupported(message)) if file_type.is_none() => {
                 dsc_warning = Some(format!(
@@ -997,14 +1206,18 @@ impl IdaMcpServer {
         }
         if dsc_warning.is_none() {
             for framework in frameworks {
-                match self.worker.dsc_load_image(framework, Some(600)).await {
+                match self
+                    .worker
+                    .dsc_load_image_for_generation(framework, Some(600), generation)
+                    .await
+                {
                     Ok(image) => loaded_images.push(image),
                     Err(e) => return Ok(e.to_tool_result()),
                 }
             }
         }
 
-        let analysis_status = match self.worker.analysis_status().await {
+        let analysis_status = match self.worker.analysis_status_for_generation(generation).await {
             Ok(status) => Some(status),
             Err(err) => {
                 warn!(module = %module, error = %err, "failed to fetch analysis_status after open_dsc");
@@ -1060,20 +1273,78 @@ impl IdaMcpServer {
         )]))
     }
 
-    async fn fail_dsc_background_after_open(
+    fn complete_background_tool_error(
+        task_id: &str,
+        registry: &task::TaskRegistry,
+        error: &ToolError,
+        cancel_token: &tokio_util::sync::CancellationToken,
+        cancel_message: &str,
+    ) -> task::TaskSettlement {
+        registry.complete_with_cancel_token(
+            task_id,
+            call_tool_result_to_value(&error.to_tool_result()),
+            cancel_token,
+            cancel_message,
+        )
+    }
+
+    async fn finish_dsc_tool_error_after_open(
         task_id: &str,
         registry: &task::TaskRegistry,
         worker: &WorkerBackend,
-        message: String,
+        generation: DatabaseGeneration,
+        error: ToolError,
+        cancel_token: &tokio_util::sync::CancellationToken,
     ) {
-        if let Err(close_err) = worker.close().await {
-            warn!(
-                task_id,
-                error = %close_err,
-                "failed to close database after background DSC task failure"
-            );
+        match worker.close_if_generation(generation).await {
+            Ok(ConditionalCloseResult::Closed | ConditionalCloseResult::NotCurrent) => {
+                Self::complete_background_tool_error(
+                    task_id,
+                    registry,
+                    &error,
+                    cancel_token,
+                    "Cancelled after the failed DSC operation settled",
+                );
+            }
+            Err(close_error) => {
+                let message = format!(
+                    "{error}; cleanup failed for database generation {}: {close_error}",
+                    generation.0
+                );
+                warn!(error = %message, "background DSC failure cleanup did not settle safely");
+                registry.fail_after_cleanup_error(task_id, &message);
+            }
         }
-        registry.fail(task_id, &message);
+    }
+
+    async fn finish_dsc_cancellation_after_open(
+        task_id: &str,
+        registry: &task::TaskRegistry,
+        worker: &WorkerBackend,
+        generation: DatabaseGeneration,
+    ) {
+        match worker.close_if_generation(generation).await {
+            Ok(ConditionalCloseResult::Closed) => {
+                registry.finish_cancelled(
+                    task_id,
+                    "Cancelled after the active DSC operation settled and its database closed",
+                );
+            }
+            Ok(ConditionalCloseResult::NotCurrent) => {
+                registry.finish_cancelled(
+                    task_id,
+                    "Cancelled after the active DSC operation settled; its database generation was already replaced",
+                );
+            }
+            Err(error) => {
+                let message = format!(
+                    "Cancellation cleanup failed for database generation {}: {error}",
+                    generation.0
+                );
+                warn!(error = %error, "failed to close cancelled DSC database generation");
+                registry.fail_after_cleanup_error(task_id, &message);
+            }
+        }
     }
 
     /// Background task: open a DSC through the selected backend, then load images.
@@ -1100,7 +1371,6 @@ impl IdaMcpServer {
         let (open_path, idb_out, auto_analyse, load_images_with_dscu) = match open {
             DscBackgroundOpen::DirectRawDsc { open_path, idb_out } => {
                 info!(
-                    task_id = %task_id,
                     path = %open_path.display(),
                     idb_out = %idb_out.display(),
                     "Background: opening raw DSC through idalib"
@@ -1118,63 +1388,77 @@ impl IdaMcpServer {
                 let mut script_cleanup = TemporaryFileCleanup::new(script_path);
 
                 // Phase 1: run idat subprocess
-                info!(task_id = %task_id, "Background: running idat");
+                info!("Background: running idat");
                 registry.update_message(&task_id, "Running idat to create .i64...");
 
-                let idat_bin = idat;
-                let module_env = module.clone();
-                let out_i64_clone = out_i64.clone();
-                let log_path_clone = log_path.clone();
+                let mut cmd = tokio::process::Command::new(&idat);
+                cmd.args(&idat_args);
+                // Remove env vars that cause license conflicts when our
+                // process links idalib and also spawns idat.
+                cmd.env_remove("IDADIR");
+                cmd.env_remove("DYLD_LIBRARY_PATH");
+                cmd.env("IDA_DYLD_CACHE_MODULE", &module);
+                // idat's diagnostics go to stderr and the -L log file; stdout
+                // is never read, and leaving it on an undrained pipe could
+                // block idat once the buffer fills.
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::piped());
 
-                let spawn_task = tokio::task::spawn_blocking(move || {
-                    let mut cmd = std::process::Command::new(&idat_bin);
-                    cmd.args(&idat_args);
-                    // Remove env vars that cause license conflicts when our
-                    // process links idalib and also spawns idat.
-                    cmd.env_remove("IDADIR");
-                    cmd.env_remove("DYLD_LIBRARY_PATH");
-                    cmd.env("IDA_DYLD_CACHE_MODULE", &module_env);
-                    cmd.stdout(std::process::Stdio::piped());
-                    cmd.stderr(std::process::Stdio::piped());
-
-                    let output = cmd.output();
-
-                    match output {
-                        Ok(out) => {
-                            let code = out.status.code().unwrap_or(-1);
-                            let stderr = String::from_utf8_lossy(&out.stderr);
-                            (code, stderr.to_string(), out_i64_clone, log_path_clone)
-                        }
-                        Err(e) => (
-                            -1,
-                            format!("Failed to spawn idat: {e}"),
-                            out_i64_clone,
-                            log_path_clone,
-                        ),
+                let (exit_code, stderr) = match cmd.spawn() {
+                    Ok(mut child) => {
+                        let mut stderr_pipe = child.stderr.take();
+                        let mut stderr_buf = Vec::new();
+                        let status = {
+                            let wait = async {
+                                if let Some(pipe) = stderr_pipe.as_mut() {
+                                    use tokio::io::AsyncReadExt as _;
+                                    let _ = pipe.read_to_end(&mut stderr_buf).await;
+                                }
+                                child.wait().await
+                            };
+                            tokio::pin!(wait);
+                            tokio::select! {
+                                status = &mut wait => Some(status),
+                                () = cancel_token.cancelled() => None,
+                            }
+                        };
+                        let Some(status) = status else {
+                            // Kill idat and reap it before publishing the
+                            // terminal state, so no IDA work survives a task
+                            // that reports itself cancelled. A killed idat can
+                            // leave partial database files that dsc_open_plan
+                            // would reuse on the next call — remove them.
+                            stop_idat_and_remove_partial_outputs(&mut child, &out_i64).await;
+                            registry.finish_cancelled(
+                                &task_id,
+                                "Cancelled; the idat subprocess was killed and its partial output removed",
+                            );
+                            return;
+                        };
+                        let exit_code = match status {
+                            Ok(status) => status.code().unwrap_or(-1),
+                            Err(e) => {
+                                stop_idat_and_remove_partial_outputs(&mut child, &out_i64).await;
+                                registry.fail(&task_id, &format!("failed to wait for idat: {e}"));
+                                return;
+                            }
+                        };
+                        (exit_code, String::from_utf8_lossy(&stderr_buf).into_owned())
                     }
-                });
-
-                let spawn_result = tokio::select! {
-                    result = spawn_task => result,
-                    _ = cancel_token.cancelled() => {
-                        registry.finish_cancelled(&task_id, "Cancelled by session shutdown");
-                        return;
-                    }
+                    Err(e) => (-1, format!("Failed to spawn idat: {e}")),
                 };
 
-                let (exit_code, stderr, out_path, log_out) = match spawn_result {
-                    Ok(tuple) => tuple,
-                    Err(e) => {
-                        registry.fail(&task_id, &format!("idat task panicked: {e}"));
-                        return;
-                    }
-                };
+                if cancel_token.is_cancelled() {
+                    registry
+                        .finish_cancelled(&task_id, "Cancelled after the idat subprocess settled");
+                    return;
+                }
 
                 // Clean up the temporary load script now; the guard still covers early returns above.
                 script_cleanup.cleanup_now();
 
-                if exit_code != 0 || !out_path.exists() {
-                    let log_tail = log_out
+                if exit_code != 0 || !out_i64.exists() {
+                    let log_tail = log_path
                         .as_ref()
                         .and_then(|p| std::fs::read_to_string(p).ok())
                         .map(|s| {
@@ -1187,12 +1471,19 @@ impl IdaMcpServer {
                     if let Some(tail) = log_tail {
                         msg.push_str(&format!("\nlog (last 20 lines):\n{tail}"));
                     }
-                    warn!(exit_code, task_id = %task_id, "idat failed");
-                    registry.fail(&task_id, &msg);
+                    remove_partial_idat_outputs(&out_i64);
+                    warn!(exit_code, "idat failed");
+                    Self::complete_background_tool_error(
+                        &task_id,
+                        &registry,
+                        &ToolError::OpenFailed(msg),
+                        &cancel_token,
+                        "Cancelled after the idat subprocess settled",
+                    );
                     return;
                 }
 
-                info!(task_id = %task_id, "idat completed, opening .i64");
+                info!("idat completed, opening .i64");
                 registry.update_message(&task_id, "Opening database with idalib...");
                 (out_i64, None, true, false)
             }
@@ -1201,7 +1492,7 @@ impl IdaMcpServer {
         // Phase 2: open the database with idalib.
         let open_path_str = open_path.display().to_string();
         let open_result = worker
-            .open_observed(
+            .open_observed_with_generation(
                 &open_path_str,
                 false,
                 None,
@@ -1218,13 +1509,33 @@ impl IdaMcpServer {
             )
             .await;
 
-        let db_info = match open_result {
-            Ok(info) => info,
+        let opened = match open_result {
+            Ok(opened) => {
+                if cancel_token.is_cancelled() {
+                    Self::finish_dsc_cancellation_after_open(
+                        &task_id,
+                        &registry,
+                        &worker,
+                        opened.generation,
+                    )
+                    .await;
+                    return;
+                }
+                opened
+            }
             Err(e) => {
-                registry.fail(&task_id, &e.to_string());
+                Self::complete_background_tool_error(
+                    &task_id,
+                    &registry,
+                    &e,
+                    &cancel_token,
+                    "Cancelled after the DSC open operation settled",
+                );
                 return;
             }
         };
+        let db_info = opened.info;
+        let database_generation = opened.generation;
 
         let mut loaded_images = Vec::new();
         let mut analysis_status = None;
@@ -1232,14 +1543,29 @@ impl IdaMcpServer {
         let mut next_steps = None;
         if load_images_with_dscu {
             registry.update_message(&task_id, "Loading DSC module through ida_dscu...");
-            match worker.dsc_load_image(&module, Some(600)).await {
+            let module_result = worker
+                .dsc_load_image_for_generation(&module, Some(600), Some(database_generation))
+                .await;
+            if cancel_token.is_cancelled() {
+                Self::finish_dsc_cancellation_after_open(
+                    &task_id,
+                    &registry,
+                    &worker,
+                    database_generation,
+                )
+                .await;
+                return;
+            }
+            match module_result {
                 Ok(image) => loaded_images.push(image),
                 Err(e) => {
-                    Self::fail_dsc_background_after_open(
+                    Self::finish_dsc_tool_error_after_open(
                         &task_id,
                         &registry,
                         &worker,
-                        format!("Failed to load DSC module {module}: {e}"),
+                        database_generation,
+                        ToolError::IdaError(format!("Failed to load DSC module {module}: {e}")),
+                        &cancel_token,
                     )
                     .await;
                     return;
@@ -1248,18 +1574,41 @@ impl IdaMcpServer {
 
             for framework in &frameworks {
                 if cancel_token.is_cancelled() {
-                    registry.finish_cancelled(&task_id, "Cancelled by session shutdown");
+                    Self::finish_dsc_cancellation_after_open(
+                        &task_id,
+                        &registry,
+                        &worker,
+                        database_generation,
+                    )
+                    .await;
                     return;
                 }
                 registry.update_message(&task_id, &format!("Loading DSC framework {framework}..."));
-                match worker.dsc_load_image(framework, Some(600)).await {
+                let framework_result = worker
+                    .dsc_load_image_for_generation(framework, Some(600), Some(database_generation))
+                    .await;
+                if cancel_token.is_cancelled() {
+                    Self::finish_dsc_cancellation_after_open(
+                        &task_id,
+                        &registry,
+                        &worker,
+                        database_generation,
+                    )
+                    .await;
+                    return;
+                }
+                match framework_result {
                     Ok(image) => loaded_images.push(image),
                     Err(e) => {
-                        Self::fail_dsc_background_after_open(
+                        Self::finish_dsc_tool_error_after_open(
                             &task_id,
                             &registry,
                             &worker,
-                            format!("Failed to load DSC framework {framework}: {e}"),
+                            database_generation,
+                            ToolError::IdaError(format!(
+                                "Failed to load DSC framework {framework}: {e}"
+                            )),
+                            &cancel_token,
                         )
                         .await;
                         return;
@@ -1267,7 +1616,20 @@ impl IdaMcpServer {
                 }
             }
 
-            analysis_status = match worker.analysis_status().await {
+            let analysis_status_result = worker
+                .analysis_status_for_generation(Some(database_generation))
+                .await;
+            if cancel_token.is_cancelled() {
+                Self::finish_dsc_cancellation_after_open(
+                    &task_id,
+                    &registry,
+                    &worker,
+                    database_generation,
+                )
+                .await;
+                return;
+            }
+            analysis_status = match analysis_status_result {
                 Ok(status) => Some(status),
                 Err(err) => {
                     warn!(module = %module, error = %err, "failed to fetch analysis_status after background open_dsc");
@@ -1279,6 +1641,17 @@ impl IdaMcpServer {
                 analysis_ready,
                 "Proceed with xrefs/decompile/list_functions for the loaded DSC module.",
             ));
+        }
+
+        if cancel_token.is_cancelled() {
+            Self::finish_dsc_cancellation_after_open(
+                &task_id,
+                &registry,
+                &worker,
+                database_generation,
+            )
+            .await;
+            return;
         }
 
         let close_token = match (mode, owner_session_id.as_deref()) {
@@ -1308,8 +1681,21 @@ impl IdaMcpServer {
             apply_close_metadata(map, close_token, close_hint_for(mode, worker.is_pooled()));
         }
 
-        info!(task_id = %task_id, "DSC background task completed");
-        registry.complete(&task_id, value);
+        match registry.complete_or_defer_cancellation(&task_id, value, &cancel_token) {
+            task::TaskCompletionDecision::Completed => {
+                info!("DSC background task completed");
+            }
+            task::TaskCompletionDecision::CancellationPending => {
+                Self::finish_dsc_cancellation_after_open(
+                    &task_id,
+                    &registry,
+                    &worker,
+                    database_generation,
+                )
+                .await;
+            }
+            task::TaskCompletionDecision::Unchanged => {}
+        }
     }
 }
 
@@ -1353,10 +1739,42 @@ fn close_hint_for(mode: ServerMode, pooled: bool) -> &'static str {
         }
         (ServerMode::Stdio, _) => "Call close_idb when done to release locks for other sessions.",
         (ServerMode::Http, false) => {
-            "In multi-client (HTTP/SSE) mode, close_idb accepts the close_token returned by open_idb. The owning session can also close without re-sending the token, and close_idb(force=true) can recover from a lost session."
+            "In HTTP/SSE mode, keep the close_token returned by open_idb. Sessionless MCP 2026 and non-owning legacy contexts must pass it to close_idb; the owning legacy session can close directly. If the token is lost, close_idb(force=true) can recover the shared IDA context."
         }
         (ServerMode::Worker, _) => {
             "Child worker mode is managed by the parent router; close_idb is normally called by the parent."
+        }
+    }
+}
+
+/// Stop and reap an idat child before removing database artifacts that cannot
+/// be trusted after cancellation or a wait failure.
+async fn stop_idat_and_remove_partial_outputs(
+    child: &mut tokio::process::Child,
+    out_i64: &std::path::Path,
+) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    remove_partial_idat_outputs(out_i64);
+}
+
+/// Best-effort removal of what an incomplete idat run leaves behind: the packed
+/// `.i64` (which `dsc_open_plan` would reuse as-is on the next `open_dsc`)
+/// and the unpacked database components idat works in before packing.
+fn remove_partial_idat_outputs(out_i64: &std::path::Path) {
+    let mut paths = vec![out_i64.to_path_buf()];
+    for ext in ["id0", "id1", "id2", "nam", "til"] {
+        paths.push(out_i64.with_extension(ext));
+    }
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                info!(path = %path.display(), "removed untrusted partial idat output");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "failed to remove partial idat output");
+            }
         }
     }
 }
@@ -1385,7 +1803,7 @@ fn apply_close_metadata(
             map.insert(
                 "close_hint".to_string(),
                 json!(format!(
-                    "The open database is currently owned by HTTP session {owner_session_id}. Reuse that session to call close_idb, or call close_idb(force=true) to recover if the owning session was lost."
+                    "The open database is currently owned by HTTP context {owner_session_id}. Provide its close_token to close_idb, or call close_idb(force=true) if that token was lost."
                 )),
             );
             map.insert(
@@ -1395,7 +1813,7 @@ fn apply_close_metadata(
             map.insert(
                 "close_recovery_hint".to_string(),
                 json!(
-                    "If the original MCP HTTP session was lost, call close_idb(force=true) from a trusted recovery session."
+                    "If the original close_token was lost, call close_idb(force=true) from a trusted client."
                 ),
             );
         }
@@ -1420,22 +1838,24 @@ impl IdaMcpServer {
         poll task_status(analysis_task_id) when present. \
         Call tool_help('open_idb') for full details."
     )]
-    #[instrument(skip(self), fields(path = %req.path))]
+    #[instrument(skip_all, fields(path = %req.path, mrtr_retry = request_state.is_some()))]
     async fn open_idb(
         &self,
         ctx: RequestContext<RoleServer>,
+        RequestState(request_state): RequestState,
+        ToolInputResponses(input_responses): ToolInputResponses,
         Parameters(req): Parameters<OpenIdbRequest>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         debug!("Tool call: open_idb");
         let path = req.path.trim().to_string();
         // Validate path (prevent directory traversal, check extension)
         if !Self::validate_path(&path) {
-            return Ok(ToolError::InvalidPath(path).to_tool_result());
+            return Ok(ToolError::InvalidPath(path).to_tool_result().into());
         }
-        let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
-            req.timeout_secs,
-            "timeout_secs"
-        ));
+        let timeout_secs = match parse_optional_unsigned::<u64>(req.timeout_secs, "timeout_secs") {
+            Ok(timeout_secs) => timeout_secs,
+            Err(error) => return Ok(error.to_tool_result().into()),
+        };
 
         let debug_info_path = req.normalized_debug_info_path();
         let file_type = req.normalized_file_type();
@@ -1461,9 +1881,25 @@ impl IdaMcpServer {
             None
         };
         let route_to_background = match large_input_size {
-            Some(size) => {
-                self.choose_open_idb_background(&ctx, &path, size, timeout_secs)
-                    .await
+            Some(size) => match self
+                .choose_open_idb_background(
+                    &ctx,
+                    &path,
+                    size,
+                    timeout_secs,
+                    request_state,
+                    input_responses,
+                )
+                .await?
+            {
+                OpenIdbBackgroundDecision::Ready(background) => background,
+                OpenIdbBackgroundDecision::InputRequired(result) => return Ok(result.into()),
+            },
+            None if request_state.is_some() || input_responses.is_some() => {
+                return Err(McpError::invalid_params(
+                    "requestState/inputResponses do not match an active open_idb elicitation",
+                    None,
+                ));
             }
             None => false,
         };
@@ -1502,9 +1938,14 @@ impl IdaMcpServer {
             Ok(info) => {
                 let close_token = self.http_close_grant();
                 let analysis_task = if route_to_background && !info.analysis_status.auto_is_ok {
-                    Some(match self.spawn_analyze_funcs_task() {
-                        Ok(task_id) => (task_id, "started"),
-                        Err(existing_id) => (existing_id, "already_running"),
+                    let cancel_token = self.background_lifetime(&ctx.meta).child_token();
+                    let owner = self.task_owner(&ctx.meta);
+                    Some(match self.spawn_analyze_funcs_task(&owner, cancel_token) {
+                        Ok(task_id) => Ok((task_id, "started")),
+                        Err(task::TaskCreateError::AlreadyRunning(existing_id)) => {
+                            Ok((existing_id, "already_running"))
+                        }
+                        Err(error) => Err(task_create_error_to_tool_error(error).to_string()),
                     })
                 } else {
                     None
@@ -1514,7 +1955,8 @@ impl IdaMcpServer {
                     Err(_) => {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
                             "{info:?}"
-                        ))]));
+                        ))])
+                        .into());
                     }
                 };
                 if let Value::Object(map) = &mut value {
@@ -1535,20 +1977,35 @@ impl IdaMcpServer {
                         map.insert("session_id".to_string(), json!(self.session_id));
                         self.apply_close_metadata(map, close_token);
                     }
-                    if let Some((task_id, status)) = analysis_task {
-                        let reason = format!(
-                            "Input size exceeded {} MiB; auto-analysis routed to a background task. Poll task_status(task_id) for progress.",
-                            OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES / (1024 * 1024)
-                        );
-                        map.insert("analysis_background".to_string(), json!(true));
-                        map.insert("analysis_task_id".to_string(), json!(task_id));
-                        map.insert("analysis_task_status".to_string(), json!(status));
-                        map.insert("analysis_background_reason".to_string(), json!(reason));
+                    if let Some(analysis_task) = analysis_task {
+                        match analysis_task {
+                            Ok((task_id, status)) => {
+                                let reason = format!(
+                                    "Input size exceeded {} MiB; auto-analysis routed to a background task. Poll task_status(task_id) for progress.",
+                                    OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES / (1024 * 1024)
+                                );
+                                map.insert("analysis_background".to_string(), json!(true));
+                                map.insert("analysis_started".to_string(), json!(true));
+                                map.insert("analysis_task_id".to_string(), json!(task_id));
+                                map.insert("analysis_task_status".to_string(), json!(status));
+                                map.insert("analysis_background_reason".to_string(), json!(reason));
+                            }
+                            Err(error) => {
+                                map.insert("analysis_background".to_string(), json!(false));
+                                map.insert("analysis_started".to_string(), json!(false));
+                                map.insert(
+                                    "analysis_task_status".to_string(),
+                                    json!("not_started"),
+                                );
+                                map.insert("analysis_background_error".to_string(), json!(error));
+                            }
+                        }
                     }
                 }
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&value).unwrap_or_else(|_| format!("{value:?}")),
-                )]))
+                )])
+                .into())
             }
             Err(ForegroundOperationError::TimedOut {
                 timeout_secs,
@@ -1559,12 +2016,14 @@ impl IdaMcpServer {
                 &snapshot,
                 None,
             ))
-            .to_tool_result()),
+            .to_tool_result()
+            .into()),
             Err(ForegroundOperationError::Cancelled { snapshot }) => Ok(ToolError::Cancelled(
                 Self::operation_cancelled_message("open_idb", &snapshot),
             )
-            .to_tool_result()),
-            Err(ForegroundOperationError::Tool(error)) => Ok(error.to_tool_result()),
+            .to_tool_result()
+            .into()),
+            Err(ForegroundOperationError::Tool(error)) => Ok(error.to_tool_result().into()),
         }
     }
 
@@ -1598,6 +2057,16 @@ impl IdaMcpServer {
             .min(OPEN_IDB_ELICITATION_TIMEOUT_SECS)
     }
 
+    fn open_idb_background_prompt(path: &str, size_bytes: u64) -> String {
+        let size_mib = size_bytes / (1024 * 1024);
+        let threshold_mib = OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES / (1024 * 1024);
+        format!(
+            "'{path}' is {size_mib} MiB (threshold {threshold_mib} MiB). \
+             Run auto-analysis as a background task with no timeout? \
+             Choosing 'no' runs it inline (capped at the foreground timeout)."
+        )
+    }
+
     /// Decide whether `open_idb` should route auto-analysis to a background
     /// task. Asks the user via MCP elicitation when the client advertises the
     /// capability; falls back to "background" silently otherwise so large
@@ -1610,25 +2079,41 @@ impl IdaMcpServer {
         path: &str,
         size_bytes: u64,
         request_timeout_secs: Option<u64>,
-    ) -> bool {
+        request_state: Option<String>,
+        input_responses: Option<InputResponses>,
+    ) -> Result<OpenIdbBackgroundDecision, McpError> {
         use rmcp::service::{ElicitationError, ServiceError};
 
         let size_mib = size_bytes / (1024 * 1024);
-        let threshold_mib = OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES / (1024 * 1024);
+        let modern_protocol = ctx
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        if modern_protocol {
+            return self.modern_choose_open_idb_background(
+                ctx,
+                path,
+                size_bytes,
+                request_state,
+                input_responses,
+            );
+        }
+
+        if request_state.is_some() || input_responses.is_some() {
+            return Err(McpError::invalid_params(
+                "requestState and inputResponses require MCP 2026-07-28",
+                None,
+            ));
+        }
 
         if ctx.peer.supported_elicitation_modes().is_empty() {
             info!(
                 path,
                 size_mib, "client lacks elicitation; routing open_idb auto-analysis to background"
             );
-            return true;
+            return Ok(OpenIdbBackgroundDecision::Ready(true));
         }
 
-        let prompt = format!(
-            "'{path}' is {size_mib} MiB (threshold {threshold_mib} MiB). \
-            Run auto-analysis as a background task with no timeout? \
-            Choosing 'no' runs it inline (capped at the foreground timeout)."
-        );
+        let prompt = Self::open_idb_background_prompt(path, size_bytes);
 
         let elicitation_timeout_secs =
             Self::open_idb_elicitation_timeout_secs(request_timeout_secs);
@@ -1646,17 +2131,17 @@ impl IdaMcpServer {
                     size_mib,
                     "open_idb elicitation cancelled with client request"
                 );
-                return false;
+                return Ok(OpenIdbBackgroundDecision::Ready(false));
             }
             result = elicitation => result,
         };
 
-        match result {
+        let background = match result {
             Ok(Some(choice)) => choice.background.unwrap_or(true),
             // Some clients return Accept with no content for action-only
             // confirmations; treat that as a "yes, background".
-            // `Ok(None)` is not expected from rmcp 1.5 here, but keep the arm
-            // defensive in case the typed API broadens in a future release.
+            // `Ok(None)` is not expected from the current typed API, but keep
+            // the arm defensive in case that contract broadens later.
             Ok(None) | Err(ElicitationError::NoContent) => true,
             Err(ElicitationError::UserDeclined | ElicitationError::UserCancelled) => false,
             Err(ElicitationError::CapabilityNotSupported) => true,
@@ -1677,14 +2162,137 @@ impl IdaMcpServer {
                 );
                 true
             }
+        };
+        Ok(OpenIdbBackgroundDecision::Ready(background))
+    }
+
+    /// MCP 2026 (MRTR) preamble for the background decision: validates the
+    /// requestState/capability pairing before the sealed-state round-trip.
+    fn modern_choose_open_idb_background(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        path: &str,
+        size_bytes: u64,
+        request_state: Option<String>,
+        input_responses: Option<InputResponses>,
+    ) -> Result<OpenIdbBackgroundDecision, McpError> {
+        if request_state.is_none() && input_responses.is_some() {
+            return Err(McpError::invalid_params(
+                "inputResponses require a matching requestState",
+                None,
+            ));
         }
+        let supports_form_elicitation = ctx
+            .client_capabilities()
+            .and_then(|capabilities| capabilities.elicitation)
+            .and_then(|elicitation| elicitation.form)
+            .is_some();
+        if request_state.is_none() && !supports_form_elicitation {
+            info!(
+                path,
+                size_mib = size_bytes / (1024 * 1024),
+                "client lacks form elicitation; routing open_idb auto-analysis to background"
+            );
+            return Ok(OpenIdbBackgroundDecision::Ready(true));
+        }
+        if !supports_form_elicitation {
+            return Err(McpError::invalid_params(
+                "MRTR retry omitted the form elicitation capability",
+                None,
+            ));
+        }
+        self.modern_open_idb_background_decision(path, size_bytes, request_state, input_responses)
+    }
+
+    fn modern_open_idb_background_decision(
+        &self,
+        path: &str,
+        size_bytes: u64,
+        request_state: Option<String>,
+        input_responses: Option<InputResponses>,
+    ) -> Result<OpenIdbBackgroundDecision, McpError> {
+        const STAGE: &[u8] = b"open_idb/background-confirmation/v1";
+        const INPUT_KEY: &str = "background";
+
+        let associated_data = format!("tools/call:open_idb\0{path}\0{size_bytes}");
+        let Some(sealed) = request_state else {
+            if input_responses.is_some() {
+                return Err(McpError::invalid_params(
+                    "inputResponses require a matching requestState",
+                    None,
+                ));
+            }
+            let sealed = self.request_state_codec.seal_with(
+                STAGE,
+                &SealOptions::new()
+                    .associated_data(associated_data.as_bytes())
+                    .ttl(Duration::from_secs(OPEN_IDB_REQUEST_STATE_TTL_SECS)),
+            );
+            // Reuse the same schema the legacy elicitation path derives from
+            // `OpenIdbBackgroundChoice`, so the two protocols cannot drift.
+            let requested_schema = ElicitationSchema::from_type::<OpenIdbBackgroundChoice>()
+                .map_err(|error| {
+                    McpError::internal_error(
+                        format!("failed to build open_idb elicitation schema: {error}"),
+                        None,
+                    )
+                })?;
+            let mut input_requests = InputRequests::new();
+            input_requests.insert(
+                INPUT_KEY.to_string(),
+                InputRequest::Elicitation(ElicitRequest::new(
+                    ElicitRequestParams::FormElicitationParams {
+                        meta: None,
+                        message: Self::open_idb_background_prompt(path, size_bytes),
+                        requested_schema,
+                    },
+                )),
+            );
+            return Ok(OpenIdbBackgroundDecision::InputRequired(
+                InputRequiredResult::new(Some(input_requests), Some(sealed)),
+            ));
+        };
+
+        let opened = self
+            .request_state_codec
+            .open_with(&sealed, associated_data.as_bytes())
+            .map_err(|_| {
+                McpError::invalid_params("expired, tampered, or unknown requestState", None)
+            })?;
+        if opened != STAGE {
+            return Err(McpError::invalid_params(
+                "requestState belongs to a different MRTR stage",
+                None,
+            ));
+        }
+        let response = input_responses
+            .as_ref()
+            .and_then(|responses| responses.get(INPUT_KEY))
+            .ok_or_else(|| {
+                McpError::invalid_params("missing background elicitation response", None)
+            })?;
+        let response: ElicitResult = serde_json::from_value(response.clone()).map_err(|_| {
+            McpError::invalid_params("invalid background elicitation response action", None)
+        })?;
+        let background = match response.action {
+            ElicitationAction::Accept => response
+                .content
+                .and_then(|content| serde_json::from_value::<OpenIdbBackgroundChoice>(content).ok())
+                .and_then(|choice| choice.background)
+                .unwrap_or(true),
+            ElicitationAction::Decline | ElicitationAction::Cancel => false,
+            // `ElicitationAction` is #[non_exhaustive]; treat unknown future
+            // actions as a decline so we never background without consent.
+            _ => false,
+        };
+        Ok(OpenIdbBackgroundDecision::Ready(background))
     }
 
     #[tool(
         description = "Load external debug info (e.g., DWARF/dSYM) into the current database. \
         If path is omitted, attempts to locate a sibling .dSYM for the currently-open database."
     )]
-    #[instrument(skip(self))]
+    #[instrument(skip_all, fields(has_path = req.path.is_some()))]
     async fn load_debug_info(
         &self,
         Parameters(req): Parameters<LoadDebugInfoRequest>,
@@ -1704,7 +2312,7 @@ impl IdaMcpServer {
 
     #[tool(description = "Report auto-analysis status (auto_is_ok, auto_state). \
         Use this to check whether analysis-dependent tools (xrefs, decompile) are fully ready.")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn analysis_status(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: analysis_status");
         match self.worker.analysis_status().await {
@@ -1726,10 +2334,11 @@ impl IdaMcpServer {
 
     #[tool(description = "Close the currently open IDA database. \
         Call this when you're done analyzing to free resources. \
-        In HTTP/SSE mode, the owning session can close directly, provide the close_token returned by open_idb, \
-        or set force=true to recover from a lost owner session. \
-        The database can also be left open for the duration of the session.")]
-    #[instrument(skip(self))]
+        In legacy HTTP/SSE, the owning session can close directly. Otherwise, \
+        including MCP 2026, provide the close_token returned by open_idb, or \
+        set force=true from a trusted client if that token was lost. \
+        Stdio clients can close directly without a token.")]
+    #[instrument(skip_all, fields(has_token = req.token.is_some(), force = ?req.force))]
     async fn close_idb(
         &self,
         Parameters(req): Parameters<CloseIdbRequest>,
@@ -1757,7 +2366,7 @@ impl IdaMcpServer {
                             "closed": false,
                             "reason": "owner token required",
                             "owner_session_id": owner_session_id,
-                            "hint": "Reuse the owning HTTP session to call close_idb, provide the close_token from open_idb, or call close_idb(force=true) to recover if that session was lost."
+                            "hint": "Provide the close_token from open_idb, or call close_idb(force=true) from a trusted client if that token was lost."
                         }))
                         .unwrap_or_else(|_| "close_idb ignored: owner token required".to_string()),
                     )]));
@@ -1778,7 +2387,7 @@ impl IdaMcpServer {
 
     #[tool(description = "Discover available tools by query or category. \
         Use this to find the right tool for your task before calling tool_help for full details.")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn tool_catalog(
         &self,
         Parameters(req): Parameters<ToolCatalogRequest>,
@@ -1889,7 +2498,7 @@ impl IdaMcpServer {
     #[tool(
         description = "Get full documentation for a tool including description, parameters schema, and example."
     )]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn tool_help(
         &self,
         Parameters(req): Parameters<ToolHelpRequest>,
@@ -1943,7 +2552,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "List all functions in the database (paginated).")]
-    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit))]
+    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit))]
     async fn list_functions(
         &self,
         Parameters(req): Parameters<ListFunctionsRequest>,
@@ -1974,7 +2583,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "List functions (ida-pro-mcp compatible alias).")]
-    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
+    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
     async fn list_funcs(
         &self,
         Parameters(req): Parameters<ListFunctionsRequest>,
@@ -2004,7 +2613,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Resolve a function name to its address")]
-    #[instrument(skip(self), fields(name = %req.name))]
+    #[instrument(skip_all, fields(name = %req.name))]
     async fn resolve_function(
         &self,
         Parameters(req): Parameters<ResolveFunctionRequest>,
@@ -2069,7 +2678,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Get disassembly at an address")]
-    #[instrument(skip(self), fields(address = %req.address, count = req.count))]
+    #[instrument(skip_all, fields(address = %req.address, count = req.count))]
     async fn disasm(
         &self,
         Parameters(req): Parameters<DisasmRequest>,
@@ -2111,7 +2720,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Get disassembly for a function by name")]
-    #[instrument(skip(self), fields(name = %req.name, count = req.count))]
+    #[instrument(skip_all, fields(name = %req.name, count = req.count))]
     async fn disasm_by_name(
         &self,
         Parameters(req): Parameters<DisasmByNameRequest>,
@@ -2154,7 +2763,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Decompile a function using Hex-Rays (if available)")]
-    #[instrument(skip(self), fields(address = %req.address))]
+    #[instrument(skip_all, fields(address = %req.address))]
     async fn decompile(
         &self,
         Parameters(req): Parameters<DecompileRequest>,
@@ -2197,7 +2806,7 @@ impl IdaMcpServer {
         that correspond to the given address(es). Useful for getting pseudocode for a basic block \
         or specific instruction. If end_address is provided, returns statements covering the range."
     )]
-    #[instrument(skip(self), fields(address = %req.address, end_address = ?req.end_address))]
+    #[instrument(skip_all, fields(address = %req.address, end_address = ?req.end_address))]
     async fn pseudocode_at(
         &self,
         Parameters(req): Parameters<PseudocodeAtRequest>,
@@ -2247,7 +2856,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "List all segments in the database with their permissions and types")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn segments(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: segments");
         match self.worker.segments().await {
@@ -2259,7 +2868,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "List strings in the database with pagination and optional filter.")]
-    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
+    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
     async fn strings(
         &self,
         Parameters(req): Parameters<StringsRequest>,
@@ -2367,7 +2976,7 @@ impl IdaMcpServer {
         Paginated (default limit 1000, max 10000); when truncated=true, pass next_offset back \
         as offset to page through high-frequency targets."
     )]
-    #[instrument(skip(self), fields(address = %req.address))]
+    #[instrument(skip_all, fields(address = %req.address))]
     async fn xrefs_to(
         &self,
         Parameters(req): Parameters<XrefsRequest>,
@@ -2381,7 +2990,7 @@ impl IdaMcpServer {
         Paginated (default limit 1000, max 10000); when truncated=true, pass next_offset back \
         as offset to page through the remaining references."
     )]
-    #[instrument(skip(self), fields(address = %req.address))]
+    #[instrument(skip_all, fields(address = %req.address))]
     async fn xrefs_from(
         &self,
         Parameters(req): Parameters<XrefsRequest>,
@@ -2391,7 +3000,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "List imports (external symbols) with pagination")]
-    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit))]
+    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit))]
     async fn imports(
         &self,
         Parameters(req): Parameters<PaginatedRequest>,
@@ -2412,7 +3021,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "List exports/names (public symbols) with pagination")]
-    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit))]
+    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit))]
     async fn exports(
         &self,
         Parameters(req): Parameters<PaginatedRequest>,
@@ -2433,7 +3042,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Get entry point addresses of the binary")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn entrypoints(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: entrypoints");
         match self.worker.entrypoints().await {
@@ -2445,7 +3054,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Read raw bytes from an address as hex string")]
-    #[instrument(skip(self), fields(size = req.size))]
+    #[instrument(skip_all, fields(size = req.size))]
     async fn get_bytes(
         &self,
         Parameters(req): Parameters<GetBytesRequest>,
@@ -2506,7 +3115,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Get basic blocks of a function (control flow graph nodes)")]
-    #[instrument(skip(self), fields(address = %req.address))]
+    #[instrument(skip_all, fields(address = %req.address))]
     async fn basic_blocks(
         &self,
         Parameters(req): Parameters<AddressRequest>,
@@ -2547,7 +3156,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Get functions called BY a function (callees/children in call graph)")]
-    #[instrument(skip(self), fields(address = %req.address))]
+    #[instrument(skip_all, fields(address = %req.address))]
     async fn callees(
         &self,
         Parameters(req): Parameters<AddressRequest>,
@@ -2588,7 +3197,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Get functions that CALL a function (callers/parents in call graph)")]
-    #[instrument(skip(self), fields(address = %req.address))]
+    #[instrument(skip_all, fields(address = %req.address))]
     async fn callers(
         &self,
         Parameters(req): Parameters<AddressRequest>,
@@ -2629,7 +3238,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Get IDB metadata (ida-pro-mcp compatibility)")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn idb_meta(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: idb_meta");
         match self.worker.idb_meta().await {
@@ -2650,7 +3259,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Lookup functions by name or address (batch)")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn lookup_funcs(
         &self,
         Parameters(req): Parameters<LookupFuncsRequest>,
@@ -2669,7 +3278,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "List global names (non-function symbols).")]
-    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, query = ?req.query))]
+    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit, query = ?req.query))]
     async fn list_globals(
         &self,
         Parameters(req): Parameters<ListGlobalsRequest>,
@@ -2697,7 +3306,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Analyze strings with xrefs (ida-pro-mcp compatibility).")]
-    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, query = ?req.query))]
+    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit, query = ?req.query))]
     async fn analyze_strings(
         &self,
         Parameters(req): Parameters<AnalyzeStringsRequest>,
@@ -2725,7 +3334,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Find byte patterns (ida-pro-mcp compatibility).")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn find_bytes(
         &self,
         Parameters(req): Parameters<FindBytesRequest>,
@@ -2801,7 +3410,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Search for text or immediates (ida-pro-mcp compatibility).")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn search(
         &self,
         Parameters(req): Parameters<SearchRequest>,
@@ -2897,7 +3506,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Read u8 values at address(es)")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn get_u8(
         &self,
         Parameters(req): Parameters<AddressRequest>,
@@ -2906,7 +3515,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Read u16 values at address(es)")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn get_u16(
         &self,
         Parameters(req): Parameters<AddressRequest>,
@@ -2915,7 +3524,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Read u32 values at address(es)")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn get_u32(
         &self,
         Parameters(req): Parameters<AddressRequest>,
@@ -2924,7 +3533,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Read u64 values at address(es)")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn get_u64(
         &self,
         Parameters(req): Parameters<AddressRequest>,
@@ -2933,7 +3542,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Read string(s) at address(es)")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn get_string(
         &self,
         Parameters(req): Parameters<GetStringRequest>,
@@ -2977,7 +3586,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Get global value(s) by name or address")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn get_global_value(
         &self,
         Parameters(req): Parameters<GetGlobalValueRequest>,
@@ -3018,7 +3627,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Find paths between two addresses (CFG)")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn find_paths(
         &self,
         Parameters(req): Parameters<FindPathsRequest>,
@@ -3052,7 +3661,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Build a callgraph rooted at an address")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn callgraph(
         &self,
         Parameters(req): Parameters<CallGraphRequest>,
@@ -3099,7 +3708,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Compute xref matrix for a set of addresses")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn xref_matrix(
         &self,
         Parameters(req): Parameters<XrefMatrixRequest>,
@@ -3118,7 +3727,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Export functions (ida-pro-mcp compatibility)")]
-    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit))]
+    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit))]
     async fn export_funcs(
         &self,
         Parameters(req): Parameters<ExportFuncsRequest>,
@@ -3162,7 +3771,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Convert integers between bases")]
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn int_convert(
         &self,
         Parameters(req): Parameters<IntConvertRequest>,
@@ -3261,7 +3870,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Look up Lumina metadata for a function without applying it")]
-    #[instrument(skip(self), fields(target_name = ?req.target_name))]
+    #[instrument(skip_all, fields(target_name = ?req.target_name))]
     async fn lumina_lookup(
         &self,
         Parameters(req): Parameters<LuminaLookupRequest>,
@@ -3289,7 +3898,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Pull and apply Lumina metadata to a function")]
-    #[instrument(skip(self), fields(target_name = ?req.target_name, force = req.force))]
+    #[instrument(skip_all, fields(target_name = ?req.target_name, force = req.force))]
     async fn lumina_apply(
         &self,
         Parameters(req): Parameters<LuminaApplyRequest>,
@@ -3473,7 +4082,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "List structs in the database with pagination and optional filter.")]
-    #[instrument(skip(self), fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
+    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit, filter = ?req.filter))]
     async fn structs(
         &self,
         Parameters(req): Parameters<StructsRequest>,
@@ -3502,7 +4111,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Get info about a struct by ordinal or name")]
-    #[instrument(skip(self), fields(ordinal = req.ordinal, name = ?req.name))]
+    #[instrument(skip_all, fields(ordinal = req.ordinal, name = ?req.name))]
     async fn struct_info(
         &self,
         Parameters(req): Parameters<StructInfoRequest>,
@@ -3518,7 +4127,7 @@ impl IdaMcpServer {
     }
 
     #[tool(description = "Read values of a struct instance at an address")]
-    #[instrument(skip(self), fields(address = %req.address, ordinal = req.ordinal, name = ?req.name))]
+    #[instrument(skip_all, fields(address = %req.address, ordinal = req.ordinal, name = ?req.name))]
     async fn read_struct(
         &self,
         Parameters(req): Parameters<ReadStructRequest>,
@@ -3734,7 +4343,9 @@ impl IdaMcpServer {
             };
         }
         if req.background.unwrap_or(false) {
-            return Ok(self.analyze_funcs_background());
+            let cancel_token = self.background_lifetime(&ctx.meta).child_token();
+            let owner = self.task_owner(&ctx.meta);
+            return Ok(self.analyze_funcs_background(&owner, cancel_token));
         }
 
         let timeout_secs = try_param!(parse_optional_unsigned::<u64>(
@@ -3784,20 +4395,26 @@ impl IdaMcpServer {
     /// Spawn auto-analysis as a background task. Returns a task_id immediately;
     /// the IDA worker thread runs auto_wait() while task_status reads the registry
     /// without going through the worker. Only one analysis runs at a time (single
-    /// worker thread), so a fixed dedup key returns the existing task_id if one
-    /// is already in flight.
-    fn analyze_funcs_background(&self) -> CallToolResult {
-        let payload = match self.spawn_analyze_funcs_task() {
+    /// worker thread), so a fixed dedup key blocks another analysis while one
+    /// is already in flight. Only the same legacy session receives its existing
+    /// task ID; sessionless Runtime requests never do.
+    fn analyze_funcs_background(
+        &self,
+        owner: &task::TaskOwner,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> CallToolResult {
+        let payload = match self.spawn_analyze_funcs_task(owner, cancel_token) {
             Ok(task_id) => json!({
                 "status": "started",
                 "task_id": task_id,
                 "message": "Auto-analysis started in background. Poll task_status(task_id) for progress. Other tool calls will block until the IDA worker thread is free.",
             }),
-            Err(existing_id) => json!({
+            Err(task::TaskCreateError::AlreadyRunning(existing_id)) => json!({
                 "status": "already_running",
                 "task_id": existing_id,
                 "message": "Auto-analysis is already running. Poll task_status(task_id) for progress.",
             }),
+            Err(error) => return task_create_error_to_tool_error(error).to_tool_result(),
         };
         CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&payload).unwrap_or_default(),
@@ -3805,24 +4422,28 @@ impl IdaMcpServer {
     }
 
     /// Create the background auto-analysis task and spawn its worker future.
-    /// Returns `Ok(task_id)` on success, `Err(existing_task_id)` if one is
-    /// already in flight (deduplicated by the fixed key).
-    fn spawn_analyze_funcs_task(&self) -> Result<String, String> {
+    /// Returns `Ok(task_id)` on success or an error if keyed work is already in
+    /// flight. The error carries an existing ID only for the same legacy session.
+    fn spawn_analyze_funcs_task(
+        &self,
+        owner: &task::TaskOwner,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> Result<String, task::TaskCreateError> {
         let task_id = self.task_registry.create_keyed(
+            owner,
             "analyze",
             "analyze_funcs",
             "Waiting for IDA auto-analysis to finish",
         )?;
 
-        info!(task_id = %task_id, "Spawning background auto-analysis");
+        info!("Spawning background auto-analysis");
 
         let registry = self.task_registry.clone();
         let worker = self.worker.clone();
         let tid = task_id.clone();
-        let cancel_token = self.session_lifetime.child_token();
         let worker_cancel_token = cancel_token.clone();
 
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             // Bridge worker progress updates → task registry messages.
             // The drain task ends when tx is dropped after analyze_funcs_observed returns.
             let (tx, mut rx): (ProgressSender, ProgressReceiver) =
@@ -3836,21 +4457,40 @@ impl IdaMcpServer {
             });
 
             match worker
-                .analyze_funcs_unbounded_observed(Some(tx), Some(worker_cancel_token))
+                .analyze_funcs_unbounded_observed(Some(tx), Some(worker_cancel_token.clone()))
                 .await
             {
-                Ok(value) => {
-                    info!(task_id = %tid, "Background auto-analysis completed");
-                    registry.complete(&tid, value);
-                }
-                Err(e) => {
-                    warn!(task_id = %tid, error = %e, "Background auto-analysis failed");
-                    registry.fail(&tid, &e.to_string());
-                }
+                Ok(value) => match registry.complete_with_cancel_token(
+                    &tid,
+                    value,
+                    &worker_cancel_token,
+                    "Cancelled after auto-analysis settled",
+                ) {
+                    task::TaskSettlement::Completed => {
+                        info!("Background auto-analysis completed");
+                    }
+                    task::TaskSettlement::Cancelled => {
+                        info!("Background auto-analysis cancelled after work settled");
+                    }
+                    task::TaskSettlement::Failed | task::TaskSettlement::Unchanged => {}
+                },
+                Err(e) => match registry.complete_with_cancel_token(
+                    &tid,
+                    call_tool_result_to_value(&e.to_tool_result()),
+                    &worker_cancel_token,
+                    "Cancelled after auto-analysis settled",
+                ) {
+                    task::TaskSettlement::Completed => {
+                        warn!(error = %e, "Background auto-analysis completed with a tool error");
+                    }
+                    task::TaskSettlement::Cancelled => {
+                        info!("Background auto-analysis cancelled after work settled");
+                    }
+                    task::TaskSettlement::Failed | task::TaskSettlement::Unchanged => {}
+                },
             }
         });
-        self.task_registry
-            .set_handle_with_cancel_token(&task_id, handle, cancel_token);
+        self.task_registry.set_cancel_token(&task_id, cancel_token);
         Ok(task_id)
     }
 
@@ -3911,15 +4551,18 @@ impl IdaMcpServer {
     #[tool(
         description = "Open a dyld_shared_cache and load a single dylib (e.g. \
         '/usr/lib/libobjc.A.dylib'). Use instead of open_idb for Apple DSCs. \
-        On IDA 9.4, opens the DSC header directly in a background task and loads modules through ida_dscu. \
-        On older IDA builds, if .i64 exists, opens immediately; otherwise returns \
-        task_id and creates it with idat in the background. Poll task_status(task_id). \
+        If a previously generated .i64 exists for this DSC, opens it immediately, \
+        preserving prior analysis. Otherwise on IDA 9.4, opens the DSC header \
+        directly in a background task and loads modules through ida_dscu; on \
+        older IDA builds, returns task_id and creates the .i64 with idat in the \
+        background. Poll task_status(task_id). \
         Use dsc_add_dylib to load more modules, dsc_add_region for raw regions. \
         Call tool_help('open_dsc') for full details."
     )]
-    #[instrument(skip(self), fields(path = %req.path, arch = %req.arch, module = %req.module))]
+    #[instrument(skip_all, fields(path = %req.path, arch = %req.arch, module = %req.module))]
     async fn open_dsc(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(req): Parameters<OpenDscRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: open_dsc");
@@ -3943,12 +4586,27 @@ impl IdaMcpServer {
         let frameworks = req.frameworks.unwrap_or_default();
         let dsc_path = std::path::Path::new(&req.path);
         let out_i64 = dsc_path.with_extension("i64");
+        // Reuse order: a sibling .i64 (legacy idat output or user-provided)
+        // first, then the 9.4 direct-path cache. Pre-9.4 never considers the
+        // cache — those databases were written by a newer IDA and cannot be
+        // opened there.
+        let cache_i64 = direct_dsc_cache_i64_path(dsc_path);
+        let existing_i64 = if out_i64.exists() {
+            Some(out_i64.clone())
+        } else if idalib::SDK_VERSION >= (9, 4) && cache_i64.exists() {
+            Some(cache_i64.clone())
+        } else {
+            None
+        };
 
-        match dsc_open_plan(idalib::SDK_VERSION, out_i64.exists()) {
+        match dsc_open_plan(idalib::SDK_VERSION, existing_i64.is_some()) {
             // Existing .i64 databases are already in IDA's database format.
             DscOpenPlan::DirectExistingI64 => {
+                // `existing_i64` is Some whenever this plan is selected; the
+                // fallback only guards the type system.
+                let existing = existing_i64.unwrap_or(out_i64);
                 return self
-                    .open_dsc_direct(&out_i64, None, &req.module, &frameworks)
+                    .open_dsc_direct(&existing, None, &req.module, &frameworks)
                     .await;
             }
             // IDA 9.4 exposes ida_dscu/dscu_svc_t: the loader can open the DSC
@@ -3957,11 +4615,8 @@ impl IdaMcpServer {
             // Do not pass the legacy -T file-type selector here. IDA 9.4's
             // direct idalib open path rejects it with "Unknown switch '-T'".
             DscOpenPlan::BackgroundDirectRawDsc => {
-                let idb_out = match direct_dsc_temp_i64_path(dsc_path) {
-                    Ok(path) => path,
-                    Err(err) => return Ok(err.to_tool_result()),
-                };
-                let ctx = DscBackgroundCtx {
+                let idb_out = cache_i64;
+                let dsc_ctx = DscBackgroundCtx {
                     open: DscBackgroundOpen::DirectRawDsc {
                         open_path: dsc_path.to_path_buf(),
                         idb_out: idb_out.clone(),
@@ -3972,12 +4627,14 @@ impl IdaMcpServer {
                         .then(|| self.session_id.clone()),
                 };
                 return self.start_dsc_background(
+                    &self.task_owner(&ctx.meta),
                     dsc_path.display().to_string(),
                     &format!(
                         "Opening DSC directly with idalib (idb_out={})...",
                         idb_out.display()
                     ),
-                    ctx,
+                    dsc_ctx,
+                    self.background_lifetime(&ctx.meta).child_token(),
                 );
             }
             DscOpenPlan::LegacyIdatBackground => {}
@@ -4018,7 +4675,7 @@ impl IdaMcpServer {
         );
         let dedup_key = out_i64.display().to_string();
 
-        let ctx = DscBackgroundCtx {
+        let dsc_ctx = DscBackgroundCtx {
             open: DscBackgroundOpen::LegacyIdat {
                 idat,
                 idat_args,
@@ -4031,13 +4688,19 @@ impl IdaMcpServer {
             owner_session_id: matches!(self.mode, ServerMode::Http)
                 .then(|| self.session_id.clone()),
         };
-        self.start_dsc_background(dedup_key, "Running idat to create .i64 from DSC...", ctx)
+        self.start_dsc_background(
+            &self.task_owner(&ctx.meta),
+            dedup_key,
+            "Running idat to create .i64 from DSC...",
+            dsc_ctx,
+            self.background_lifetime(&ctx.meta).child_token(),
+        )
     }
 
     #[tool(description = "Load an additional dylib into an open DSC database \
         (requires prior open_dsc). Skips full auto-analysis for speed; \
         check analysis_status and run analyze_funcs if needed.")]
-    #[instrument(skip(self), fields(module = %req.module))]
+    #[instrument(skip_all, fields(module = %req.module))]
     async fn dsc_add_dylib(
         &self,
         Parameters(req): Parameters<DscAddDylibRequest>,
@@ -4124,7 +4787,7 @@ impl IdaMcpServer {
         (data/GOT/stub areas; one address per call; requires prior open_dsc). \
         Skips full auto-analysis."
     )]
-    #[instrument(skip(self), fields(address = ?req.address))]
+    #[instrument(skip_all, fields(address = ?req.address))]
     async fn dsc_add_region(
         &self,
         Parameters(req): Parameters<DscAddRegionRequest>,
@@ -4216,14 +4879,16 @@ impl IdaMcpServer {
         'failed' (with an error message), or 'cancelled'. \
         Use the task_id returned by open_dsc."
     )]
-    #[instrument(skip(self), fields(task_id = %req.task_id))]
+    #[instrument(skip_all)]
     async fn task_status(
         &self,
+        ctx: RequestContext<RoleServer>,
         Parameters(req): Parameters<TaskStatusRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: task_status");
 
-        let state = match self.task_registry.get(&req.task_id) {
+        let owner = self.task_owner(&ctx.meta);
+        let state = match self.task_registry.get_for_owner(&owner, &req.task_id) {
             Some(s) => s,
             None => {
                 return Ok(
@@ -4278,7 +4943,7 @@ impl IdaMcpServer {
         or 'file' (path to .py), not both. Returns captured stdout/stderr. \
         Full access to ida_*, idc, idautils."
     )]
-    #[instrument(skip(self))]
+    #[instrument(skip_all, fields(code_len = req.code.as_ref().map_or(0, String::len)))]
     async fn run_script(
         &self,
         ctx: RequestContext<RoleServer>,
@@ -4672,8 +5337,29 @@ fn tool_params_schema(name: &str) -> Option<Value> {
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 
-/// Convert our internal `TaskState` to the rmcp `Task` model.
-fn task_state_to_mcp(state: &task::TaskState) -> rmcp::model::Task {
+/// All supported versions, oldest first. The final entry must stay the only
+/// modern (sessionless) protocol: pooled workers advertise everything before
+/// it, because their worker lease is bound to a legacy HTTP session.
+const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2024_11_05,
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+    ProtocolVersion::V_2026_07_28,
+];
+
+fn supported_protocol_versions(pooled: bool) -> Cow<'static, [ProtocolVersion]> {
+    if pooled {
+        let (legacy, _modern) =
+            SUPPORTED_PROTOCOL_VERSIONS.split_at(SUPPORTED_PROTOCOL_VERSIONS.len() - 1);
+        Cow::Borrowed(legacy)
+    } else {
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
+    }
+}
+
+/// Convert our internal `TaskState` to the base rmcp `Task` model.
+fn task_state_to_mcp_task(state: &task::TaskState) -> rmcp::model::Task {
     let status = match state.status {
         task::TaskStatus::Running => rmcp::model::TaskStatus::Working,
         task::TaskStatus::Completed => rmcp::model::TaskStatus::Completed,
@@ -4687,10 +5373,37 @@ fn task_state_to_mcp(state: &task::TaskState) -> rmcp::model::Task {
         state.updated_at_iso.clone(),
     )
     .with_status_message(state.message.clone())
-    // Terminal tasks are retained on a best-effort basis and can be
-    // evicted once the in-memory cap is exceeded.
-    .with_ttl(task::TASK_RETENTION_TTL_MS)
-    .with_poll_interval(5000)
+    .with_ttl_ms(task::TASK_RETENTION_TTL_MS)
+    .with_poll_interval_ms(5000)
+}
+
+fn value_as_json_object(value: Value) -> JsonObject {
+    match value {
+        Value::Object(object) => object,
+        other => {
+            let mut object = JsonObject::new();
+            object.insert("value".to_string(), other);
+            object
+        }
+    }
+}
+
+fn task_state_to_detailed_task(state: task::TaskState) -> DetailedTask {
+    let base = task_state_to_mcp_task(&state);
+    let payload = match state.status {
+        task::TaskStatus::Running => TaskPayload::Working,
+        task::TaskStatus::Completed => TaskPayload::Completed {
+            result: value_as_json_object(task_payload_result_value(state.result)),
+        },
+        task::TaskStatus::Failed => TaskPayload::Failed {
+            error: value_as_json_object(json!({
+                "code": ErrorCode::INTERNAL_ERROR.0,
+                "message": state.message,
+            })),
+        },
+        task::TaskStatus::Cancelled => TaskPayload::Cancelled,
+    };
+    DetailedTask::new(base, payload)
 }
 
 fn call_tool_result_to_value(result: &CallToolResult) -> Value {
@@ -4722,130 +5435,124 @@ fn task_payload_result_value(result: Option<Value>) -> Value {
     }
 }
 
+fn task_id_from_call_tool_result(result: &CallToolResult) -> Option<String> {
+    result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .and_then(|text| serde_json::from_str::<Value>(&text.text).ok())
+        .and_then(|value| value.get("task_id")?.as_str().map(str::to_string))
+}
+
+fn task_create_error_to_tool_error(error: task::TaskCreateError) -> ToolError {
+    match error {
+        task::TaskCreateError::AlreadyRunning(_) => ToolError::Busy,
+        task::TaskCreateError::ExistingTaskIdIsPrivate => ToolError::BackgroundTaskHandlePrivate,
+        task::TaskCreateError::CapacityExceeded { max_entries } => {
+            ToolError::BackgroundTaskRegistryFull { max: max_entries }
+        }
+    }
+}
+
+/// SEP-2663 `tasks/update` semantics: unknown task ids are an invalid-params
+/// error, while responses delivered to a known task are acknowledged with an
+/// empty result even when unknown or superseded. No task here ever enters
+/// input_required (open_idb's MRTR happens at call level), so every delivered
+/// response falls into that ignored-not-error bucket.
+fn apply_task_update(
+    task_registry: &task::TaskRegistry,
+    owner: &task::TaskOwner,
+    task_id: &str,
+) -> Result<(), McpError> {
+    if task_registry.get_for_owner(owner, task_id).is_none() {
+        return Err(McpError::invalid_params(
+            "Unknown task_id",
+            Some(json!({ "task_id": task_id })),
+        ));
+    }
+    Ok(())
+}
+
+fn materialize_task_response(
+    task_registry: &task::TaskRegistry,
+    should_materialize: bool,
+    response: CallToolResponse,
+) -> Result<CallToolResponse, McpError> {
+    if !should_materialize {
+        return Ok(response);
+    }
+    let CallToolResponse::Complete(result) = response else {
+        return Ok(response);
+    };
+    let Some(task_id) = task_id_from_call_tool_result(&result) else {
+        return Ok(CallToolResponse::Complete(result));
+    };
+    let state = task_registry
+        .get(&task_id)
+        .ok_or_else(|| McpError::internal_error(format!("Task {task_id} disappeared"), None))?;
+    Ok(CreateTaskResult::new(task_state_to_mcp_task(&state)).into())
+}
+
 #[tool_handler(router = self.tool_mux)]
 impl ServerHandler for IdaMcpServer {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        supported_protocol_versions(self.worker.is_pooled())
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
-                .enable_tasks_with(rmcp::model::TasksCapability::server_default())
+                .enable_tasks()
                 .build(),
         )
         .with_instructions(self.instructions())
     }
 
-    async fn enqueue_task(
-        &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CreateTaskResult, McpError> {
-        // Delegate to the regular tool handler and wrap the result
-        // into the task protocol.  For most tools the call completes
-        // inline.  For `open_dsc`, the tool creates a background
-        // task and returns a task_id — we re-use that ID.
-        let result = self.call_tool(request, context).await?;
-
-        // Check if the result contains a task_id from open_dsc.
-        let task_id = result
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .and_then(|t| serde_json::from_str::<Value>(&t.text).ok())
-            .and_then(|v| v.get("task_id")?.as_str().map(String::from));
-
-        if let Some(tid) = task_id {
-            let state = self
-                .task_registry
-                .get(&tid)
-                .ok_or_else(|| McpError::internal_error(format!("Task {tid} disappeared"), None))?;
-            Ok(CreateTaskResult::new(task_state_to_mcp(&state)))
-        } else {
-            // Inline completion — no background work, but still register a completed
-            // task so tasks/get and tasks/result remain resolvable for this task_id.
-            let payload = call_tool_result_to_value(&result);
-            let id = self.task_registry.create_completed("Completed", payload);
-            let state = self
-                .task_registry
-                .get(&id)
-                .ok_or_else(|| McpError::internal_error(format!("Task {id} disappeared"), None))?;
-            Ok(CreateTaskResult::new(task_state_to_mcp(&state)))
-        }
-    }
-
-    async fn list_tasks(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListTasksResult, McpError> {
-        let tasks: Vec<rmcp::model::Task> = self
-            .task_registry
-            .list_all()
-            .iter()
-            .map(task_state_to_mcp)
-            .collect();
-        Ok(ListTasksResult::new(tasks))
-    }
-
-    async fn get_task_info(
+    async fn get_task(
         &self,
         request: GetTaskParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        let state = self.task_registry.get(&request.task_id).ok_or_else(|| {
-            McpError::invalid_params(
-                "Unknown task_id",
-                Some(json!({ "task_id": request.task_id })),
-            )
-        })?;
-        Ok(GetTaskResult::new(task_state_to_mcp(&state)))
+        let owner = self.task_owner(&context.meta);
+        let state = self
+            .task_registry
+            .get_for_owner(&owner, &request.task_id)
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Unknown task_id",
+                    Some(json!({ "task_id": request.task_id })),
+                )
+            })?;
+        Ok(GetTaskResult::new(task_state_to_detailed_task(state)))
     }
 
-    async fn get_task_result(
+    async fn update_task(
         &self,
-        request: GetTaskPayloadParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<GetTaskPayloadResult, McpError> {
-        let state = self.task_registry.get(&request.task_id);
-        match state {
-            Some(s) if s.status == task::TaskStatus::Completed => Ok(GetTaskPayloadResult::new(
-                task_payload_result_value(s.result),
-            )),
-            Some(s) if s.status == task::TaskStatus::Failed => {
-                Err(McpError::internal_error(s.message, None))
-            }
-            Some(s) if s.status == task::TaskStatus::Cancelled => {
-                Err(McpError::internal_error("Task was cancelled", None))
-            }
-            Some(_) => Err(McpError::internal_error(
-                "Task is still running; poll tasks/get first",
-                None,
-            )),
-            None => Err(McpError::invalid_params(
-                "Unknown task_id",
-                Some(json!({ "task_id": request.task_id })),
-            )),
-        }
+        request: UpdateTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        let owner = self.task_owner(&context.meta);
+        apply_task_update(&self.task_registry, &owner, &request.task_id)
     }
 
     async fn cancel_task(
         &self,
         request: CancelTaskParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<CancelTaskResult, McpError> {
-        if self.task_registry.cancel(&request.task_id) {
-            let state = self.task_registry.get(&request.task_id).ok_or_else(|| {
-                McpError::internal_error(
-                    format!("Task {} disappeared after cancellation", request.task_id),
-                    None,
-                )
-            })?;
-            Ok(CancelTaskResult::new(task_state_to_mcp(&state)))
-        } else {
-            Err(McpError::invalid_params(
-                "Task not found or not running",
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        let owner = self.task_owner(&context.meta);
+        let Some(state) = self.task_registry.get_for_owner(&owner, &request.task_id) else {
+            return Err(McpError::invalid_params(
+                "Unknown task_id",
                 Some(json!({ "task_id": request.task_id })),
-            ))
+            ));
+        };
+        if state.status == task::TaskStatus::Running {
+            self.task_registry
+                .cancel_for_owner(&owner, &request.task_id);
         }
+        Ok(())
     }
 }
 
@@ -4882,9 +5589,6 @@ impl<S> std::ops::Deref for SanitizedIdaServer<S> {
     }
 }
 
-/// Tools that support task-based invocation (SEP-1686).
-const TASK_CAPABLE_TOOLS: &[&str] = &["open_dsc"];
-
 fn tool_annotations_for(name: &str) -> ToolAnnotations {
     match name {
         "lumina_lookup" => ToolAnnotations::new()
@@ -4917,11 +5621,6 @@ fn tool_annotations_for(name: &str) -> ToolAnnotations {
 
 fn set_tool_metadata(tool: &mut Tool) {
     tool.annotations = Some(tool_annotations_for(&tool.name));
-    if TASK_CAPABLE_TOOLS.contains(&&*tool.name) {
-        tool.execution = Some(
-            rmcp::model::ToolExecution::new().with_task_support(rmcp::model::TaskSupport::Optional),
-        );
-    }
 }
 
 fn apply_tool_metadata(mut tool: Tool) -> Tool {
@@ -5060,18 +5759,13 @@ fn normalize_tool_input_schema(tool: &mut Tool) {
     }
 }
 
-/// Normalize tool input schemas (see [`normalize_schema_value`]) and
-/// annotate task-capable tools with `execution.taskSupport = "optional"`.
+/// Normalize tool input schemas (see [`normalize_schema_value`]) and attach
+/// safety annotations.
 fn normalize_tool_schemas(result: &mut ListToolsResult) {
     for tool in &mut result.tools {
         normalize_tool_input_schema(tool);
         set_tool_metadata(tool);
     }
-}
-
-/// Patch a single tool definition with task support if applicable.
-fn annotate_task_support(tool: Tool) -> Tool {
-    apply_tool_metadata(tool)
 }
 
 /// Error message for a filter-rejected tool/call. Centralized so the
@@ -5085,6 +5779,15 @@ fn disabled_tool_message(name: &str) -> String {
 }
 
 impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        self.inner.supported_protocol_versions()
+    }
+
+    // `discover` is intentionally NOT forwarded to the inner handler: the
+    // trait default builds its result from `self.supported_protocol_versions()`
+    // and `self.get_info()`, so leaving it unoverridden binds those calls to
+    // this sanitizing wrapper instead of bypassing it.
+
     async fn initialize(
         &self,
         params: InitializeRequestParams,
@@ -5112,7 +5815,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         &self,
         params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         if self.filter.is_active() && !self.filter.is_enabled(&params.name) {
             return Err(McpError::invalid_params(
                 disabled_tool_message(&params.name),
@@ -5132,53 +5835,31 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         }
         self.inner.get_tool(name).map(|mut tool| {
             normalize_tool_input_schema(&mut tool);
-            annotate_task_support(tool)
+            apply_tool_metadata(tool)
         })
     }
 
-    async fn enqueue_task(
-        &self,
-        request: CallToolRequestParams,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CreateTaskResult, McpError> {
-        if self.filter.is_active() && !self.filter.is_enabled(&request.name) {
-            return Err(McpError::invalid_params(
-                disabled_tool_message(&request.name),
-                None,
-            ));
-        }
-        self.inner.enqueue_task(request, ctx).await
-    }
-
-    async fn list_tasks(
-        &self,
-        request: Option<PaginatedRequestParams>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<ListTasksResult, McpError> {
-        self.inner.list_tasks(request, ctx).await
-    }
-
-    async fn get_task_info(
+    async fn get_task(
         &self,
         request: GetTaskParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        self.inner.get_task_info(request, ctx).await
+        self.inner.get_task(request, ctx).await
     }
 
-    async fn get_task_result(
+    async fn update_task(
         &self,
-        request: GetTaskPayloadParams,
+        request: UpdateTaskParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<GetTaskPayloadResult, McpError> {
-        self.inner.get_task_result(request, ctx).await
+    ) -> Result<(), McpError> {
+        self.inner.update_task(request, ctx).await
     }
 
     async fn cancel_task(
         &self,
         request: CancelTaskParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CancelTaskResult, McpError> {
+    ) -> Result<(), McpError> {
         self.inner.cancel_task(request, ctx).await
     }
 }
@@ -5186,20 +5867,88 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 #[cfg(test)]
 mod tests {
     use crate::error::ToolError;
-    use crate::ida::worker::CloseTokenGrant;
+    use crate::ida::worker::{CloseTokenGrant, WorkerBackend};
     use crate::server::{
-        apply_close_metadata, close_hint_for, dsc_open_plan, normalize_schema_value,
+        apply_close_metadata, apply_task_update, call_tool_result_to_value, close_hint_for,
+        dsc_open_plan, is_sessionless_request_meta, materialize_task_response,
+        normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
-        run_script_truncate_chars, task_payload_result_value, timeout_with_child_grace,
-        tool_params_schema, DscOpenPlan, IdaMcpServer, RecentOperationsRequest, ToolCatalogRequest,
-        ToolHelpRequest, XrefsRequest,
+        run_script_truncate_chars, supported_protocol_versions, task, task_payload_result_value,
+        task_state_to_detailed_task, task_state_to_mcp_task, timeout_with_child_grace,
+        tool_params_schema, DscOpenPlan, IdaMcpServer, OpenIdbBackgroundDecision,
+        RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest, ToolHelpRequest,
+        XrefsRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
-    use rmcp::model::CallToolResult;
+    use rmcp::model::{CallToolResponse, CallToolResult, InputResponses, ProtocolVersion};
+    use rmcp::ServerHandler;
     use serde_json::{json, Value};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
+
+    const TASK_OWNER: task::TaskOwner = task::TaskOwner::Runtime;
+
+    /// In-memory writer so a test can assert on exactly what the fmt layer
+    /// would have written to stderr, span field prefixes included.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            let guard = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            String::from_utf8_lossy(&guard).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut guard = self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` with a thread-local subscriber at `directives` and return
+    /// everything it logged. `set_default` keeps this off the global
+    /// dispatcher, so tests stay independent.
+    async fn capture_logs<F, Fut>(directives: &str, body: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::Layer as _;
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(captured.clone())
+                .with_filter(tracing_subscriber::EnvFilter::new(directives)),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+        body().await;
+        captured.text()
+    }
 
     fn test_server() -> IdaMcpServer {
         let (tx, _rx) = mpsc::sync_channel(1);
@@ -5207,6 +5956,231 @@ mod tests {
             Arc::new(crate::IdaWorker::new(tx)),
             crate::ServerMode::Stdio,
         )
+    }
+
+    /// Sentinels chosen so a substring hit can only come from the payload we
+    /// passed in, never from incidental log text.
+    const SECRET_CLOSE_TOKEN: &str = "close-token-9d41f2c7";
+    const SECRET_COMMENT: &str = "comment-secret-3a7f11de";
+    const SECRET_RENAME: &str = "rename-secret-5c2b90aa";
+    const SECRET_PATCH_BYTES: &str = "de ad be ef ca fe 41 42";
+
+    /// Drive every unit-invocable handler that receives sensitive payloads.
+    /// Each call fails fast (the test worker has no receiver), which is
+    /// exactly the path that logs — spans render whenever an event fires
+    /// inside them.
+    async fn exercise_sensitive_handlers(server: &IdaMcpServer) {
+        let _ = server
+            .close_idb(Parameters(crate::server::CloseIdbRequest {
+                token: Some(SECRET_CLOSE_TOKEN.to_string()),
+                force: Some(false),
+            }))
+            .await;
+        let _ = server
+            .set_comments(Parameters(crate::server::SetCommentsRequest {
+                address: Some(json!("0x1000")),
+                target_name: None,
+                offset: None,
+                comment: SECRET_COMMENT.to_string(),
+                repeatable: None,
+            }))
+            .await;
+        let _ = server
+            .rename(Parameters(crate::server::RenameRequest {
+                address: Some(json!("0x1000")),
+                current_name: None,
+                name: SECRET_RENAME.to_string(),
+                flags: None,
+            }))
+            .await;
+        let _ = server
+            .patch(Parameters(crate::server::PatchRequest {
+                address: Some(json!("0x1000")),
+                target_name: None,
+                offset: None,
+                bytes: json!(SECRET_PATCH_BYTES),
+            }))
+            .await;
+    }
+
+    fn assert_no_secrets(logs: &str, level: &str) {
+        for (label, secret) in [
+            ("close_idb ownership token", SECRET_CLOSE_TOKEN),
+            ("set_comments payload", SECRET_COMMENT),
+            ("rename payload", SECRET_RENAME),
+            ("patch bytes", SECRET_PATCH_BYTES),
+        ] {
+            assert!(
+                !logs.contains(secret),
+                "{label} leaked into logs at {level}:\n{logs}"
+            );
+        }
+        // The whole-struct render is the mechanism behind every leak; catching
+        // it directly means a future handler cannot regress quietly.
+        for struct_render in [
+            "CloseIdbRequest {",
+            "SetCommentsRequest {",
+            "RenameRequest {",
+            "PatchRequest {",
+            "req=",
+        ] {
+            assert!(
+                !logs.contains(struct_render),
+                "a handler argument was recorded ({struct_render}) at {level}:\n{logs}"
+            );
+        }
+    }
+
+    /// The shipped default is `ida_mcp=info`, and `close_idb` logs at INFO
+    /// unconditionally — so before this fix the ownership bearer token
+    /// rendered on an out-of-the-box server, not just under trace logging.
+    #[tokio::test]
+    async fn spans_never_record_secret_payloads_at_the_shipped_level() {
+        let server = test_server();
+        let logs = capture_logs("ida_mcp=info", || async {
+            exercise_sensitive_handlers(&server).await;
+        })
+        .await;
+
+        // Positive control: prove the capture is wired and the level admits
+        // output, so the absence assertions below cannot pass vacuously.
+        assert!(
+            logs.contains("Tool call: close_idb received"),
+            "expected close_idb to log at ida_mcp=info; got:\n{logs}"
+        );
+        assert_no_secrets(&logs, "ida_mcp=info");
+        assert!(
+            logs.contains("has_token=true"),
+            "expected the sanitized has_token field; got:\n{logs}"
+        );
+    }
+
+    /// Strictly stronger than the shipped level, and the level `just test-*`
+    /// recipes run at: nothing sensitive may appear even at trace.
+    #[tokio::test]
+    async fn spans_never_record_secret_payloads_at_trace() {
+        let server = test_server();
+        let logs = capture_logs("ida_mcp=trace", || async {
+            exercise_sensitive_handlers(&server).await;
+        })
+        .await;
+
+        assert!(
+            logs.contains("Tool call: close_idb received"),
+            "expected handler events at trace; got:\n{logs}"
+        );
+        assert_no_secrets(&logs, "ida_mcp=trace");
+    }
+
+    /// Reassemble every `#[instrument(...)]` attribute in a source file,
+    /// joining continuation lines by paren balance.
+    fn instrument_attributes(source: &str) -> Vec<String> {
+        let mut attributes = Vec::new();
+        let mut current: Option<(String, i32)> = None;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            let start = current.is_none() && trimmed.starts_with("#[instrument");
+            if start || current.is_some() {
+                let (mut text, mut depth) = current.take().unwrap_or_default();
+                text.push_str(trimmed);
+                depth += i32::try_from(trimmed.matches('(').count()).unwrap_or(0);
+                depth -= i32::try_from(trimmed.matches(')').count()).unwrap_or(0);
+                if depth <= 0 {
+                    attributes.push(text);
+                } else {
+                    current = Some((text, depth));
+                }
+            }
+        }
+        attributes
+    }
+
+    /// `skip_all` is the only form that suppresses handler arguments:
+    /// tracing-attributes records every parameter binding via `Debug`, and a
+    /// `fields(...)` entry only suppresses a parameter whose ident exactly
+    /// matches the field name — so `fields(path = %req.path)` still records
+    /// the whole `req`. This is the only coverage for handlers that take a
+    /// `RequestContext` (`open_idb`, `run_script`) since `Peer`'s constructor
+    /// is `pub(crate)` and they cannot be invoked from a unit test.
+    #[test]
+    fn instrument_attributes_never_capture_handler_arguments() {
+        for (path, source) in [
+            ("src/server/mod.rs", include_str!("mod.rs")),
+            ("src/server/task.rs", include_str!("task.rs")),
+            ("src/server/http_config.rs", include_str!("http_config.rs")),
+        ] {
+            let attributes = instrument_attributes(source);
+            for attribute in &attributes {
+                assert!(
+                    attribute.contains("skip_all"),
+                    "{path}: `{attribute}` must use skip_all; \
+                     skip(self) still records every request argument"
+                );
+            }
+            if path == "src/server/mod.rs" {
+                assert!(
+                    attributes.len() >= 50,
+                    "expected the full handler set in {path}, found {}",
+                    attributes.len()
+                );
+            }
+        }
+    }
+
+    /// The two handlers that cannot be exercised at runtime must expose only
+    /// derived facts, never the sensitive binding itself.
+    #[test]
+    fn uninvokable_handlers_record_only_derived_fields() {
+        let attributes = instrument_attributes(include_str!("mod.rs"));
+
+        let open_idb = attributes
+            .iter()
+            .find(|attribute| attribute.contains("mrtr_retry"))
+            .expect("open_idb should record whether this is an MRTR retry");
+        // A bool derived from the sealed state, never the replayable handle
+        // or the raw elicitation answers.
+        assert!(open_idb.contains("request_state.is_some()"), "{open_idb}");
+        assert!(!open_idb.contains("%request_state"), "{open_idb}");
+        assert!(!open_idb.contains("?request_state"), "{open_idb}");
+        assert!(!open_idb.contains("input_responses"), "{open_idb}");
+
+        let run_script = attributes
+            .iter()
+            .find(|attribute| attribute.contains("code_len"))
+            .expect("run_script should record only the source length");
+        assert!(!run_script.contains("%req.code"), "{run_script}");
+        assert!(!run_script.contains("?req.code"), "{run_script}");
+    }
+
+    #[test]
+    fn tracing_never_records_task_bearer_ids() {
+        let bearer_field = ["task", "id"].join("_");
+        for (path, source) in [
+            ("src/server/mod.rs", include_str!("mod.rs")),
+            ("src/server/task.rs", include_str!("task.rs")),
+        ] {
+            for formatter in ['%', '?'] {
+                let forbidden = format!("{bearer_field} = {formatter}");
+                assert!(
+                    !source.contains(&forbidden),
+                    "{path}: task bearer IDs must not be recorded by tracing: found `{forbidden}`"
+                );
+            }
+            for level in ["trace", "debug", "info", "warn", "error"] {
+                let forbidden = format!("{level}!({bearer_field}");
+                assert!(
+                    !source.contains(&forbidden),
+                    "{path}: task bearer IDs must not be recorded by tracing: found `{forbidden}`"
+                );
+            }
+
+            for attribute in instrument_attributes(source) {
+                assert!(
+                    !attribute.contains(&bearer_field),
+                    "{path}: task bearer IDs must not be recorded by instrumentation: `{attribute}`"
+                );
+            }
+        }
     }
 
     fn xrefs_request(limit: Option<i64>, offset: Option<i64>) -> XrefsRequest {
@@ -5270,13 +6244,36 @@ mod tests {
         );
     }
 
+    /// An existing database wins on every SDK: it preserves prior analysis
+    /// and, on 9.4, prevents the direct path from minting a fresh multi-GB
+    /// database per open_dsc call.
     #[test]
-    fn dsc_open_plan_prefers_existing_i64_before_ida_94() {
+    fn dsc_open_plan_prefers_existing_i64_on_every_sdk() {
         assert_eq!(dsc_open_plan((9, 3), true), DscOpenPlan::DirectExistingI64);
-        assert_eq!(
-            dsc_open_plan((9, 4), true),
-            DscOpenPlan::BackgroundDirectRawDsc
-        );
+        assert_eq!(dsc_open_plan((9, 4), true), DscOpenPlan::DirectExistingI64);
+        assert_eq!(dsc_open_plan((10, 0), true), DscOpenPlan::DirectExistingI64);
+    }
+
+    /// The direct-path database name must depend only on the DSC's absolute
+    /// path — never pid or time — so repeat opens resolve to one reusable
+    /// file instead of accumulating orphans.
+    #[test]
+    fn direct_dsc_cache_path_is_deterministic_per_dsc() {
+        let dsc = std::path::Path::new("/nonexistent/A/dyld_shared_cache_arm64e");
+        let first = crate::server::direct_dsc_cache_i64_path(dsc);
+        let second = crate::server::direct_dsc_cache_i64_path(dsc);
+        let other = crate::server::direct_dsc_cache_i64_path(std::path::Path::new(
+            "/nonexistent/B/dyld_shared_cache_arm64e",
+        ));
+
+        assert_eq!(first, second);
+        assert_ne!(first, other, "different DSC paths must not collide");
+        let name = first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("cache path should have a printable file name");
+        assert!(name.starts_with("ida-mcp-dsc-dyld_shared_cache_arm64e-"));
+        assert!(name.ends_with(".i64"));
     }
 
     fn tool_result_text(result: CallToolResult) -> String {
@@ -5647,6 +6644,429 @@ mod tests {
             .map(|t| t.text.as_str())
             .unwrap_or_default();
         assert!(wrapped_text.contains("\"content\""));
+    }
+
+    #[test]
+    fn modern_protocol_is_excluded_from_pooled_workers() {
+        let local = supported_protocol_versions(false);
+        assert!(local.contains(&ProtocolVersion::V_2026_07_28));
+
+        let pooled = supported_protocol_versions(true);
+        assert!(!pooled.contains(&ProtocolVersion::V_2026_07_28));
+        assert!(pooled.contains(&ProtocolVersion::V_2025_11_25));
+    }
+
+    #[test]
+    fn server_advertises_tasks_extension() {
+        assert!(ServerHandler::get_info(&test_server())
+            .capabilities
+            .supports_tasks());
+    }
+
+    #[test]
+    fn task_seed_uses_retention_ttl_and_poll_interval() {
+        let registry = crate::server::task::TaskRegistry::new();
+        let id = registry
+            .create_keyed(&TASK_OWNER, "test", "seed", "Working")
+            .expect("create task");
+        let state = registry.get(&id).expect("task state");
+        let value = serde_json::to_value(task_state_to_mcp_task(&state)).expect("serialize task");
+
+        assert_eq!(value["status"], "working");
+        assert_eq!(value["ttlMs"], task::TASK_RETENTION_TTL_MS);
+        assert_eq!(value["pollIntervalMs"], 5000);
+    }
+
+    #[test]
+    fn completed_task_inlines_original_tool_result() {
+        let registry = crate::server::task::TaskRegistry::new();
+        let tool_result = CallToolResult::success(vec![rmcp::model::ContentBlock::text("done")]);
+        let payload = serde_json::to_value(tool_result).expect("serialize tool result");
+        let id = registry
+            .create_completed(&TASK_OWNER, "Completed", payload)
+            .expect("create completed task");
+        let state = registry.get(&id).expect("task state");
+        let value =
+            serde_json::to_value(task_state_to_detailed_task(state)).expect("serialize task");
+
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["result"]["content"][0]["text"], "done");
+        assert_eq!(value["result"]["isError"], false);
+    }
+
+    #[test]
+    fn tool_error_is_a_completed_task_result_not_a_json_rpc_failure() {
+        let registry = crate::server::task::TaskRegistry::new();
+        let id = registry
+            .create_keyed(&TASK_OWNER, "dsc", "tool-error", "Opening DSC")
+            .expect("create task");
+        let error_result =
+            ToolError::OpenFailed("idat exited with code 4".to_string()).to_tool_result();
+        registry.complete(&id, call_tool_result_to_value(&error_result));
+
+        let state = registry.get(&id).expect("task state");
+        let value =
+            serde_json::to_value(task_state_to_detailed_task(state)).expect("serialize task");
+
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["result"]["isError"], true);
+        assert!(value["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("idat exited with code 4")));
+        assert!(value.get("error").is_none());
+    }
+
+    #[test]
+    fn open_dsc_background_result_materializes_tasks_extension_handle() {
+        let registry = crate::server::task::TaskRegistry::new();
+        let task_id = registry
+            .create_keyed(&TASK_OWNER, "dsc", "/tmp/cache", "Opening DSC")
+            .expect("create task");
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            serde_json::to_string(&json!({"task_id": task_id})).expect("serialize result"),
+        )]);
+        let response =
+            materialize_task_response(&registry, true, CallToolResponse::Complete(result))
+                .expect("materialize task");
+
+        let CallToolResponse::Task(created) = response else {
+            panic!("task-capable open_dsc call must return a task handle");
+        };
+        assert_eq!(created.task.task_id, task_id);
+        assert_eq!(created.task.status, rmcp::model::TaskStatus::Working);
+        assert_eq!(created.task.poll_interval_ms, Some(5000));
+        assert_eq!(created.task.ttl_ms, Some(task::TASK_RETENTION_TTL_MS));
+    }
+
+    #[test]
+    fn update_task_acknowledges_known_tasks_and_rejects_unknown() {
+        let registry = crate::server::task::TaskRegistry::new();
+        let id = registry
+            .create_keyed(&TASK_OWNER, "dsc", "update-task", "Working")
+            .expect("create task");
+
+        // SEP-2663: responses delivered to a known task are ignored with an
+        // empty result, never an error — including after a raced transition
+        // to a terminal state.
+        assert!(apply_task_update(&registry, &TASK_OWNER, &id).is_ok());
+        registry.complete(&id, json!({"ok": true}));
+        assert!(apply_task_update(&registry, &TASK_OWNER, &id).is_ok());
+
+        let other_owner = task::TaskOwner::Session(Arc::from("other-session"));
+        let err = apply_task_update(&registry, &other_owner, &id)
+            .expect_err("another owner must not update the task");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        let err = apply_task_update(&registry, &TASK_OWNER, "missing-1")
+            .expect_err("unknown task must error");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn failed_task_inlines_json_rpc_error() {
+        let registry = crate::server::task::TaskRegistry::new();
+        let id = registry
+            .create_keyed(&TASK_OWNER, "test", "failed", "Working")
+            .expect("create task");
+        registry.fail(&id, "IDA worker exited");
+        let state = registry.get(&id).expect("task state");
+        let value =
+            serde_json::to_value(task_state_to_detailed_task(state)).expect("serialize task");
+
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["error"]["code"], -32603);
+        assert_eq!(value["error"]["message"], "IDA worker exited");
+    }
+
+    #[test]
+    fn runtime_state_survives_handler_recreation() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let backend = WorkerBackend::local(Arc::new(crate::IdaWorker::new(tx)));
+        let filter = Arc::new(crate::server::tool_filter::ToolFilter::unrestricted());
+        let runtime = ServerRuntimeState::new();
+        let first = IdaMcpServer::with_filter_and_state(
+            backend.clone(),
+            crate::ServerMode::Http,
+            filter.clone(),
+            runtime.clone(),
+        );
+        let second =
+            IdaMcpServer::with_filter_and_state(backend, crate::ServerMode::Http, filter, runtime);
+        let id = first
+            .task_registry
+            .create_completed(&first.session_task_owner, "Completed", json!({"ok": true}))
+            .expect("create completed task");
+
+        assert!(second.task_registry.get(&id).is_some());
+        assert!(Arc::ptr_eq(
+            &first.runtime_lifetime,
+            &second.runtime_lifetime
+        ));
+        // Each handler owns its own session lifetime so that dropping a legacy
+        // session's handler cancels only that session's background tasks.
+        assert!(!Arc::ptr_eq(
+            &first.session_lifetime,
+            &second.session_lifetime
+        ));
+    }
+
+    #[test]
+    fn shared_runtime_keeps_legacy_task_ownership_session_scoped() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let backend = WorkerBackend::local(Arc::new(crate::IdaWorker::new(tx)));
+        let filter = Arc::new(crate::server::tool_filter::ToolFilter::unrestricted());
+        let runtime = ServerRuntimeState::new();
+        let first = IdaMcpServer::with_filter_and_state(
+            backend.clone(),
+            crate::ServerMode::Http,
+            filter.clone(),
+            runtime.clone(),
+        );
+        let second =
+            IdaMcpServer::with_filter_and_state(backend, crate::ServerMode::Http, filter, runtime);
+
+        let task_id = first
+            .task_registry
+            .create_keyed(
+                &first.session_task_owner,
+                "dsc",
+                "/tmp/shared-cache",
+                "Opening DSC",
+            )
+            .expect("first session should create the task");
+        assert_eq!(
+            second.task_registry.create_keyed(
+                &second.session_task_owner,
+                "dsc",
+                "/tmp/shared-cache",
+                "Opening DSC",
+            ),
+            Err(task::TaskCreateError::ExistingTaskIdIsPrivate)
+        );
+        assert!(
+            second
+                .task_registry
+                .get_for_owner(&second.session_task_owner, &task_id)
+                .is_none(),
+            "another legacy session must not poll the task"
+        );
+        assert!(!second
+            .task_registry
+            .cancel_for_owner(&second.session_task_owner, &task_id));
+        assert!(first
+            .task_registry
+            .get_for_owner(&first.session_task_owner, &task_id)
+            .is_some());
+    }
+
+    #[test]
+    fn handler_drop_cancels_session_background_tasks_only() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let backend = WorkerBackend::local(Arc::new(crate::IdaWorker::new(tx)));
+        let filter = Arc::new(crate::server::tool_filter::ToolFilter::unrestricted());
+        let runtime = ServerRuntimeState::new();
+        let server = IdaMcpServer::with_filter_and_state(
+            backend,
+            crate::ServerMode::Http,
+            filter,
+            runtime.clone(),
+        );
+
+        let legacy_meta = rmcp::model::RequestMetaObject::new();
+        let mut sessionless_meta = rmcp::model::RequestMetaObject::new();
+        sessionless_meta.set_protocol_version(ProtocolVersion::V_2026_07_28);
+        sessionless_meta.set_client_capabilities(rmcp::model::ClientCapabilities::default());
+
+        let session_token = server.background_lifetime(&legacy_meta).child_token();
+        let runtime_token = server.background_lifetime(&sessionless_meta).child_token();
+        drop(server);
+
+        // Legacy session close (= handler drop) cancels the session's tasks...
+        assert!(session_token.is_cancelled());
+        // ...but sessionless MCP 2026 tasks outlive their per-request handler.
+        assert!(!runtime_token.is_cancelled());
+
+        drop(runtime);
+        assert!(runtime_token.is_cancelled());
+    }
+
+    /// Under `--stateless`, rmcp drops the handler after every request even
+    /// for legacy protocol versions, so legacy requests must also use the
+    /// shared runtime owner and lifetime — otherwise their background tasks
+    /// would be cancelled on response and owned by an unreachable session ID.
+    #[test]
+    fn stateless_http_routes_legacy_requests_to_the_runtime_owner() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let backend = WorkerBackend::local(Arc::new(crate::IdaWorker::new(tx)));
+        let filter = Arc::new(crate::server::tool_filter::ToolFilter::unrestricted());
+        let runtime = ServerRuntimeState::new_stateless_http();
+        let server = IdaMcpServer::with_filter_and_state(
+            backend,
+            crate::ServerMode::Http,
+            filter,
+            runtime.clone(),
+        );
+
+        let legacy_meta = rmcp::model::RequestMetaObject::new();
+        assert_eq!(server.task_owner(&legacy_meta), task::TaskOwner::Runtime);
+        let background_token = server.background_lifetime(&legacy_meta).child_token();
+        drop(server);
+        assert!(
+            !background_token.is_cancelled(),
+            "stateless-mode tasks must outlive their per-request handler"
+        );
+
+        drop(runtime);
+        assert!(background_token.is_cancelled());
+    }
+
+    #[test]
+    fn sessionless_meta_predicate_requires_complete_2026_key_set() {
+        let mut meta = rmcp::model::RequestMetaObject::new();
+        assert!(!is_sessionless_request_meta(&meta));
+
+        meta.set_protocol_version(ProtocolVersion::V_2026_07_28);
+        assert!(!is_sessionless_request_meta(&meta));
+
+        meta.set_client_capabilities(rmcp::model::ClientCapabilities::default());
+        assert!(is_sessionless_request_meta(&meta));
+
+        // rmcp routes on key completeness, not the declared version: a legacy
+        // version with the full key set still dispatches sessionless.
+        let mut legacy_declared = rmcp::model::RequestMetaObject::new();
+        legacy_declared.set_protocol_version(ProtocolVersion::V_2025_11_25);
+        legacy_declared.set_client_capabilities(rmcp::model::ClientCapabilities::default());
+        assert!(is_sessionless_request_meta(&legacy_declared));
+    }
+
+    #[test]
+    fn legacy_stdio_task_owner_stays_stable_when_request_metadata_changes() {
+        let server = test_server();
+        let mut full_meta = rmcp::model::RequestMetaObject::new();
+        full_meta.set_protocol_version(ProtocolVersion::V_2025_11_25);
+        full_meta.set_client_capabilities(rmcp::model::ClientCapabilities::default());
+        let empty_meta = rmcp::model::RequestMetaObject::new();
+
+        let task_id = server
+            .task_registry
+            .create_keyed(
+                &server.task_owner(&full_meta),
+                "analyze",
+                "stdio-owner-regression",
+                "Working",
+            )
+            .expect("full-metadata request should create a task");
+
+        assert!(
+            server
+                .task_registry
+                .get_for_owner(&server.task_owner(&empty_meta), &task_id)
+                .is_some(),
+            "later requests on the same stdio connection must retain ownership"
+        );
+        assert!(std::ptr::eq(
+            server.background_lifetime(&full_meta),
+            server.background_lifetime(&empty_meta)
+        ));
+    }
+
+    #[test]
+    fn modern_open_idb_mrtr_is_bound_and_integrity_checked() {
+        let server = test_server();
+        let path = "/tmp/large-macho";
+        let size = crate::server::OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES + 1;
+        let first = server
+            .modern_open_idb_background_decision(path, size, None, None)
+            .expect("first MRTR round");
+        let OpenIdbBackgroundDecision::InputRequired(input_required) = first else {
+            panic!("first round must request input");
+        };
+        let request_state = input_required.request_state.expect("request state");
+        let requests = input_required.input_requests.expect("input requests");
+        let request = requests.get("background").expect("background request");
+        let request_value = serde_json::to_value(request).expect("serialize request");
+        assert_eq!(
+            request_value["params"]["requestedSchema"]["properties"]["background"]["type"],
+            "boolean"
+        );
+
+        let mut responses = InputResponses::new();
+        responses.insert(
+            "background".to_string(),
+            json!({"action": "accept", "content": {"background": true}}),
+        );
+        let retry = server
+            .modern_open_idb_background_decision(
+                path,
+                size,
+                Some(request_state.clone()),
+                Some(responses),
+            )
+            .expect("valid retry");
+        assert!(matches!(retry, OpenIdbBackgroundDecision::Ready(true)));
+
+        assert!(server
+            .modern_open_idb_background_decision(
+                "/tmp/different-macho",
+                size,
+                Some(request_state.clone()),
+                Some(InputResponses::new()),
+            )
+            .is_err());
+        assert!(server
+            .modern_open_idb_background_decision(
+                path,
+                size,
+                Some(format!("{request_state}tampered")),
+                Some(InputResponses::new()),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn modern_open_idb_mrtr_decline_keeps_foreground_behavior() {
+        let server = test_server();
+        let path = "/tmp/large-macho";
+        let size = crate::server::OPEN_IDB_AUTO_BACKGROUND_THRESHOLD_BYTES + 1;
+        let first = server
+            .modern_open_idb_background_decision(path, size, None, None)
+            .expect("first MRTR round");
+        let OpenIdbBackgroundDecision::InputRequired(input_required) = first else {
+            panic!("first round must request input");
+        };
+        let mut responses = InputResponses::new();
+        responses.insert("background".to_string(), json!({"action": "decline"}));
+        let retry = server
+            .modern_open_idb_background_decision(
+                path,
+                size,
+                input_required.request_state,
+                Some(responses),
+            )
+            .expect("valid decline");
+
+        assert!(matches!(retry, OpenIdbBackgroundDecision::Ready(false)));
+    }
+
+    /// A killed idat leaves partial artifacts that `dsc_open_plan` would
+    /// otherwise reuse; cancellation cleanup must remove exactly those.
+    #[test]
+    fn remove_partial_idat_outputs_deletes_packed_and_unpacked_artifacts() {
+        let dir = std::env::temp_dir().join(format!("ida-mcp-partial-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let out_i64 = dir.join("cache.i64");
+        let unpacked = dir.join("cache.id0");
+        let unrelated = dir.join("keep.txt");
+        std::fs::write(&out_i64, b"partial").expect("write i64");
+        std::fs::write(&unpacked, b"partial").expect("write id0");
+        std::fs::write(&unrelated, b"keep").expect("write unrelated");
+
+        crate::server::remove_partial_idat_outputs(&out_i64);
+
+        assert!(!out_i64.exists(), "packed database must be removed");
+        assert!(!unpacked.exists(), "unpacked component must be removed");
+        assert!(unrelated.exists(), "unrelated files must be untouched");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn create_sparse_test_file(name: &str, len: u64) -> std::io::Result<std::path::PathBuf> {

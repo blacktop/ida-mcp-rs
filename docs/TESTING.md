@@ -5,13 +5,16 @@
 ```bash
 just test         # Stdio JSONL integration test
 just test-http    # HTTP/SSE integration test
+just test-modern  # MCP 2026 discover/stateless lifecycle test
 just test-script  # IDAPython script execution test
 just test-elicitation # open_idb auto-background elicitation test
+just test-session-cancel # legacy-session cancel-on-disconnect test
+just test-http-startup # HTTP bind-failure exit status (no IDA license needed)
 just test-dsc /path/to/dyld_shared_cache_arm64e  # DSC loading test
 just cargo-test   # Unit tests (no IDA required)
 ```
 
-All integration tests require IDA Pro with a valid license. Run `cargo build` first.
+All integration tests require IDA Pro with a valid license. Run `just build` first.
 
 ## What's tested
 
@@ -29,6 +32,17 @@ All integration tests require IDA Pro with a valid license. Run `cargo build` fi
 - `tools/list` returns the full tool list
 - Database operations work over HTTP (`open_idb`, `list_functions`, `close_idb` with close_token)
 
+**MCP 2026 test** (`just test-modern`)
+- Exercises `server/discover`, `tools/list`, and `tools/call` over stdio
+- Rejects MCP 2026 requests with incomplete required request metadata
+- Exercises the same lifecycle over sessionless single-worker HTTP and verifies
+  that no legacy session ID is created
+- Verifies a legacy stdio task remains visible on the same connection when one
+  request carries full routing metadata and the next omits it
+- Verifies pooled HTTP advertises versions only through `2025-11-25`, rejects
+  a `2026-07-28` request, and rejects sessionless inline-metadata tool calls
+  that declare a legacy version
+
 **Script test** (`just test-script`)
 - Opens a binary, then runs inline Python via `run_script`
 - Verifies stdout/stderr capture
@@ -39,6 +53,26 @@ All integration tests require IDA Pro with a valid license. Run `cargo build` fi
 - Creates a sparse Mach-O fixture just over 50 MiB
 - Verifies `open_idb(auto_analyse=true)` silently routes analysis to a background task when the client has no elicitation capability
 - Verifies an elicitation-capable client receives `elicitation/create`, accepts it, and gets `analysis_background=true` plus a pollable `analysis_task_id`
+- Verifies MCP `2026-07-28` returns `input_required`, accepts the echoed
+  integrity-protected `requestState` plus `inputResponses`, and completes the
+  retried tool call
+
+**Startup-failure test** (`just test-http-startup`)
+- Squats a port with a pooled parent (binds in ms, takes no IDA license), then
+  starts each HTTP topology against it
+- Asserts single-worker HTTP exits nonzero, does not wedge (watchdog SIGKILL
+  would show as 137), and releases its IDA worker loop
+- Asserts pooled HTTP exits nonzero and never logs a clean stop it didn't achieve
+- Needs no IDA license, database, or fixture
+
+**Session-cancel test** (`just test-session-cancel`)
+- Single-worker HTTP: a legacy session starts a slow foreground `open_idb`
+  (observed via `recent_operations`), queues a background `analyze_funcs`
+  behind it, then DELETEs the session
+- Verifies a second legacy session cannot reuse the deduplicated task ID or
+  poll the first session's task
+- Verifies the server records owner cancellation only after the background
+  operation settles and never records successful completion for that task
 
 **DSC test** (`just test-dsc <path>`)
 - Requires a real `dyld_shared_cache_arm64e` file
@@ -48,7 +82,8 @@ All integration tests require IDA Pro with a valid license. Run `cargo build` fi
 
 **Unit tests** (`just cargo-test`)
 - `src/dsc.rs` — file type strings, idat args, script generation, Python string escaping
-- `src/server/task.rs` — task registry lifecycle, deduplication, cancellation, ISO timestamps
+- `src/server/task.rs` — task registry lifecycle, owner-scoped access and
+  deduplication, bounded admission, cancellation, and ISO timestamps
 
 ## Test fixture
 

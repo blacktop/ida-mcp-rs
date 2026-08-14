@@ -212,6 +212,43 @@ test-http-recovery: fixture
         ./http_close_recovery.sh
     echo "✅ HTTP close-recovery test passed"
 
+# Verify a server that cannot bind fails loudly instead of wedging or
+# exiting zero. Needs no IDA license, database, or fixture.
+test-http-startup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    echo "🧪 Running HTTP startup failure test..."
+    PORT=$((9990 + RANDOM % 60)) \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_startup_failure.sh
+    echo "✅ HTTP startup failure test passed"
+
+# Verify legacy session DELETE cancels that session's background tasks on
+# single-worker HTTP (cancel-on-disconnect end-to-end oracle).
+test-session-cancel: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'cargo build --release' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for session-cancel test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP session cancel test..."
+    PORT=$((9900 + RANDOM % 90)) \
+        RUST_LOG="{{ rust_log }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        ./http_session_cancel.sh
+    echo "✅ HTTP session-cancel test passed"
+
 # Pool tests use raw fixture copies in tmpdirs instead of the shared mini.i64
 # so killed workers cannot poison later runs with stale packed fixture state.
 
@@ -403,6 +440,19 @@ test-elicitation: fixture
     echo "🧪 Running elicitation auto-background integration test..."
     RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" bash ./stdio_elicitation.sh
     echo "✅ Elicitation test passed"
+
+# Verify the MCP 2026 discover lifecycle over stdio and stateless HTTP, plus
+# the explicit legacy-only pooled HTTP boundary.
+test-modern:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    PORT=$((9400 + RANDOM % 400)) RUST_LOG="{{ rust_log }}" \
+        MCP_BIN="{{ server_bin }}" bash ./modern_protocol.sh
 
 # Run open_idb rebuild semantics test (Cases C and D from the rebuild=bool patch)
 # Phase 1 seeds a tmpdir .i64 with a renamed function via the raw-input path,
@@ -798,7 +848,9 @@ test-dsc dsc_path=dsc_test_path:
     if [ "$fc_after" -gt "$fc_before" ]; then
         echo "   ✓ Function count increased by $((fc_after - fc_before))"
     else
-        echo "⚠️  Function count did not increase (before=$fc_before, after=$fc_after)"
+        # Expected: this test never runs analyze_funcs, and functions only
+        # materialize after analysis. Segment count is the real assertion.
+        echo "   function count unchanged ($fc_before) — expected without analyze_funcs"
     fi
 
     send '{"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"segments","arguments":{}}}'
@@ -808,8 +860,16 @@ test-dsc dsc_path=dsc_test_path:
     echo "   After add: segments=$seg_after (was $seg_before)"
     if [ "$seg_after" -gt "$seg_before" ]; then
         echo "   ✓ Segment count increased by $((seg_after - seg_before))"
+    elif [ -n "$task_id" ]; then
+        # Fresh open: the added dylib was not present, so its segments must
+        # appear. No increase means dsc_add_dylib silently did nothing.
+        echo "❌ Segment count did not increase on a fresh open (before=$seg_before, after=$seg_after)"
+        cat "$log"
+        exit 1
     else
-        echo "⚠️  Segment count did not increase (before=$seg_before, after=$seg_after)"
+        # Reused database: the dylib usually persisted from an earlier run,
+        # so an idempotent re-add legitimately changes nothing.
+        echo "   segment count unchanged ($seg_before) — module already loaded in the reused database"
     fi
 
     # Phase 6: analysis_status sanity check

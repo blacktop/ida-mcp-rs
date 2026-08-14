@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -818,8 +819,15 @@ impl PooledWorkerHandle {
 pub struct PooledSessionState {
     pool: WorkerPool,
     session_id: String,
-    handle: Arc<Mutex<Option<PooledWorkerHandle>>>,
+    handle: Arc<Mutex<Option<PooledDatabaseLease>>>,
+    next_database_generation: AtomicU64,
     runtime: Option<Handle>,
+}
+
+#[derive(Clone)]
+struct PooledDatabaseLease {
+    handle: PooledWorkerHandle,
+    generation: DatabaseGeneration,
 }
 
 impl PooledSessionState {
@@ -828,32 +836,66 @@ impl PooledSessionState {
             pool,
             session_id,
             handle: Arc::new(Mutex::new(None)),
+            next_database_generation: AtomicU64::new(0),
             runtime: Handle::try_current().ok(),
         }
     }
 
-    async fn lease_for_open(&self) -> Result<(PooledWorkerHandle, bool), ToolError> {
+    fn next_database_generation(&self) -> Result<DatabaseGeneration, ToolError> {
+        let previous = self
+            .next_database_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                ToolError::IdaError("database generation counter exhausted".to_string())
+            })?;
+        previous
+            .checked_add(1)
+            .map(DatabaseGeneration)
+            .ok_or_else(|| ToolError::IdaError("database generation counter exhausted".to_string()))
+    }
+
+    async fn lease_for_open(
+        &self,
+    ) -> Result<(PooledWorkerHandle, DatabaseGeneration, bool), ToolError> {
         let mut guard = self.handle.lock().await;
-        if let Some(handle) = guard.as_ref() {
-            return Ok((handle.clone(), false));
+        if let Some(lease) = guard.as_ref() {
+            return Ok((lease.handle.clone(), lease.generation, false));
         }
+        let generation = self.next_database_generation()?;
         let handle = self.pool.lease(&self.session_id).await?;
-        *guard = Some(handle.clone());
-        Ok((handle, true))
+        *guard = Some(PooledDatabaseLease {
+            handle: handle.clone(),
+            generation,
+        });
+        Ok((handle, generation, true))
     }
 
-    async fn required_handle(&self) -> Result<PooledWorkerHandle, ToolError> {
+    /// Resolve the leased worker, optionally only while `expected_generation`
+    /// is still this session's database lifetime.
+    ///
+    /// The generation comparison and the handle clone happen under one lock
+    /// acquisition: a `close_idb` that replaces the lease either loses the race
+    /// (we dispatch against the database we opened) or wins it (we refuse). A
+    /// caller that checked separately could be redirected onto the new lease.
+    async fn required_handle_for_generation(
+        &self,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<PooledWorkerHandle, ToolError> {
         let guard = self.handle.lock().await;
-        guard.as_ref().cloned().ok_or(ToolError::NoDatabaseOpen)
+        let lease = guard.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+        require_lease_generation(lease.generation, expected_generation)?;
+        Ok(lease.handle.clone())
     }
 
-    async fn take_handle(&self) -> Option<PooledWorkerHandle> {
+    async fn take_handle(&self) -> Option<PooledDatabaseLease> {
         self.handle.lock().await.take()
     }
 
     async fn release_current_handle(&self) {
-        if let Some(handle) = self.take_handle().await {
-            let _ = self.pool.release(handle).await;
+        if let Some(lease) = self.take_handle().await {
+            let _ = self.pool.release(lease.handle).await;
         }
     }
 
@@ -861,20 +903,25 @@ impl PooledSessionState {
         let mut guard = self.handle.lock().await;
         if guard
             .as_ref()
-            .is_some_and(|handle| handle.worker_id == worker_id)
+            .is_some_and(|lease| lease.handle.worker_id == worker_id)
         {
             *guard = None;
         }
     }
 
-    async fn call_result(
+    /// Call a child tool, optionally bound to one database lifetime (see
+    /// [`Self::required_handle_for_generation`]).
+    async fn call_result_for_generation(
         &self,
         tool: &'static str,
         args: Value,
         timeout_secs: Option<u64>,
         cancel: Option<CancellationToken>,
+        expected_generation: Option<DatabaseGeneration>,
     ) -> Result<CallToolResult, ToolError> {
-        let handle = self.required_handle().await?;
+        let handle = self
+            .required_handle_for_generation(expected_generation)
+            .await?;
         let timeout = self.pool.worker_op_timeout(timeout_secs);
         match handle
             .call_tool(tool, remote::json_object(args)?, timeout, cancel)
@@ -904,7 +951,21 @@ impl PooledSessionState {
         timeout_secs: Option<u64>,
         cancel: Option<CancellationToken>,
     ) -> Result<T, ToolError> {
-        let result = self.call_result(tool, args, timeout_secs, cancel).await?;
+        self.call_json_for_generation(tool, args, timeout_secs, cancel, None)
+            .await
+    }
+
+    async fn call_json_for_generation<T: DeserializeOwned>(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_secs: Option<u64>,
+        cancel: Option<CancellationToken>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<T, ToolError> {
+        let result = self
+            .call_result_for_generation(tool, args, timeout_secs, cancel, expected_generation)
+            .await?;
         remote::parse_json(result, tool)
     }
 
@@ -915,7 +976,21 @@ impl PooledSessionState {
         timeout_secs: Option<u64>,
         cancel: Option<CancellationToken>,
     ) -> Result<Value, ToolError> {
-        let result = self.call_result(tool, args, timeout_secs, cancel).await?;
+        self.call_value_for_generation(tool, args, timeout_secs, cancel, None)
+            .await
+    }
+
+    async fn call_value_for_generation(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_secs: Option<u64>,
+        cancel: Option<CancellationToken>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<Value, ToolError> {
+        let result = self
+            .call_result_for_generation(tool, args, timeout_secs, cancel, expected_generation)
+            .await?;
         remote::parse_value(result, tool)
     }
 
@@ -926,7 +1001,21 @@ impl PooledSessionState {
         field: &'static str,
         timeout_secs: Option<u64>,
     ) -> Result<T, ToolError> {
-        let value = self.call_value(tool, args, timeout_secs, None).await?;
+        self.call_json_field_for_generation(tool, args, field, timeout_secs, None)
+            .await
+    }
+
+    async fn call_json_field_for_generation<T: DeserializeOwned>(
+        &self,
+        tool: &'static str,
+        args: Value,
+        field: &'static str,
+        timeout_secs: Option<u64>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<T, ToolError> {
+        let value = self
+            .call_value_for_generation(tool, args, timeout_secs, None, expected_generation)
+            .await?;
         let Some(field_value) = value.get(field).cloned() else {
             return Err(ToolError::RemoteProtocol(format!(
                 "child tool {tool} response did not contain `{field}`"
@@ -944,7 +1033,9 @@ impl PooledSessionState {
         timeout_secs: Option<u64>,
         cancel: Option<CancellationToken>,
     ) -> Result<String, ToolError> {
-        let result = self.call_result(tool, args, timeout_secs, cancel).await?;
+        let result = self
+            .call_result_for_generation(tool, args, timeout_secs, cancel, None)
+            .await?;
         remote::result_text(&result, tool)
     }
 
@@ -965,7 +1056,43 @@ impl PooledSessionState {
         _progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
     ) -> Result<DbInfo, ToolError> {
-        let (handle, fresh_lease) = self.lease_for_open().await?;
+        self.open_observed_with_generation(
+            path,
+            load_debug_info,
+            debug_info_path,
+            debug_info_verbose,
+            force,
+            rebuild,
+            file_type,
+            auto_analyse,
+            extra_args,
+            idb_out,
+            timeout_secs,
+            _progress_tx,
+            cancel,
+        )
+        .await
+        .map(|opened| opened.info)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_observed_with_generation(
+        &self,
+        path: &str,
+        load_debug_info: bool,
+        debug_info_path: Option<String>,
+        debug_info_verbose: bool,
+        force: bool,
+        rebuild: bool,
+        file_type: Option<String>,
+        auto_analyse: bool,
+        extra_args: Vec<String>,
+        idb_out: Option<String>,
+        timeout_secs: Option<u64>,
+        _progress_tx: Option<ProgressSender>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<OpenedDatabase, ToolError> {
+        let (handle, generation, fresh_lease) = self.lease_for_open().await?;
         let timeout = self.pool.worker_op_timeout(timeout_secs);
         let result = handle
             .call_tool(
@@ -992,7 +1119,7 @@ impl PooledSessionState {
             Ok(info) => {
                 let mut child = handle.slot.child.lock().await;
                 child.idb_path = Some(PathBuf::from(&info.path));
-                Ok(info)
+                Ok(OpenedDatabase { info, generation })
             }
             Err(err) => {
                 if open_error_releases_lease(fresh_lease, &err) {
@@ -1003,42 +1130,32 @@ impl PooledSessionState {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn open(
-        &self,
-        path: &str,
-        load_debug_info: bool,
-        debug_info_path: Option<String>,
-        debug_info_verbose: bool,
-        force: bool,
-        rebuild: bool,
-        file_type: Option<String>,
-        auto_analyse: bool,
-        extra_args: Vec<String>,
-    ) -> Result<DbInfo, ToolError> {
-        self.open_observed(
-            path,
-            load_debug_info,
-            debug_info_path,
-            debug_info_verbose,
-            force,
-            rebuild,
-            file_type,
-            auto_analyse,
-            extra_args,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
     pub async fn close(&self) -> Result<(), ToolError> {
-        let Some(handle) = self.take_handle().await else {
+        let Some(lease) = self.take_handle().await else {
             return Err(ToolError::NoDatabaseOpen);
         };
-        self.pool.release(handle).await
+        self.pool.release(lease.handle).await
+    }
+
+    pub(crate) async fn close_if_generation(
+        &self,
+        generation: DatabaseGeneration,
+    ) -> Result<ConditionalCloseResult, ToolError> {
+        let lease = {
+            let mut guard = self.handle.lock().await;
+            if guard
+                .as_ref()
+                .is_none_or(|lease| lease.generation != generation)
+            {
+                return Ok(ConditionalCloseResult::NotCurrent);
+            }
+            guard.take()
+        };
+        let Some(lease) = lease else {
+            return Ok(ConditionalCloseResult::NotCurrent);
+        };
+        self.pool.release(lease.handle).await?;
+        Ok(ConditionalCloseResult::Closed)
     }
 
     pub async fn load_debug_info(
@@ -1056,8 +1173,21 @@ impl PooledSessionState {
     }
 
     pub async fn analysis_status(&self) -> Result<AnalysisStatus, ToolError> {
-        self.call_json("analysis_status", json!({}), None, None)
-            .await
+        self.analysis_status_for_generation(None).await
+    }
+
+    pub(crate) async fn analysis_status_for_generation(
+        &self,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<AnalysisStatus, ToolError> {
+        self.call_json_for_generation(
+            "analysis_status",
+            json!({}),
+            None,
+            None,
+            expected_generation,
+        )
+        .await
     }
 
     pub async fn dsc_load_image(
@@ -1065,11 +1195,22 @@ impl PooledSessionState {
         module: &str,
         timeout_secs: Option<u64>,
     ) -> Result<DscImageInfo, ToolError> {
-        self.call_json_field(
+        self.dsc_load_image_for_generation(module, timeout_secs, None)
+            .await
+    }
+
+    pub(crate) async fn dsc_load_image_for_generation(
+        &self,
+        module: &str,
+        timeout_secs: Option<u64>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> Result<DscImageInfo, ToolError> {
+        self.call_json_field_for_generation(
             "dsc_add_dylib",
             json!({ "module": module, "timeout_secs": timeout_secs }),
             "image",
             timeout_secs,
+            expected_generation,
         )
         .await
     }
@@ -1957,10 +2098,10 @@ impl Drop for PooledSessionState {
             return;
         };
         runtime.spawn(async move {
-            let Some(handle) = handle_slot.lock().await.take() else {
+            let Some(lease) = handle_slot.lock().await.take() else {
                 return;
             };
-            let _ = pool.release(handle).await;
+            let _ = pool.release(lease.handle).await;
         });
     }
 }
@@ -2081,6 +2222,32 @@ fn extract_first_matches(value: Value, tool: &'static str) -> Result<Value, Tool
     Ok(json!({ "matches": matches }))
 }
 
+/// Decide whether an operation bound to `expected` may run against the lease
+/// currently held at `current`.
+///
+/// `None` opts out, for foreground tools that legitimately target whatever
+/// database the session has open. `Some` binds the operation to one database
+/// lifetime so a close/reopen refuses it instead of redirecting it onto the
+/// new lease. The caller evaluates this while holding the lease lock, so the
+/// decision cannot be invalidated between here and dispatch.
+fn require_lease_generation(
+    current: DatabaseGeneration,
+    expected: Option<DatabaseGeneration>,
+) -> Result<(), ToolError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if current == expected {
+        return Ok(());
+    }
+    warn!(
+        expected_generation = expected.0,
+        current_generation = current.0,
+        "Refusing a pooled operation bound to a replaced database generation"
+    );
+    Err(ToolError::DatabaseReplaced)
+}
+
 fn release_error_retires_worker(err: &ToolError) -> bool {
     matches!(
         err,
@@ -2171,9 +2338,10 @@ mod tests {
     use crate::ida::pool::{
         analyze_funcs_child_args, child_tool_error_retires_worker, extract_first_matches,
         find_bytes_child_args, lumina_apply_child_args, open_error_releases_lease,
-        open_idb_child_args, release_error_retires_worker, run_script_child_args,
-        search_child_args, WorkerPool, WorkerPoolConfig,
+        open_idb_child_args, release_error_retires_worker, require_lease_generation,
+        run_script_child_args, search_child_args, WorkerPool, WorkerPoolConfig,
     };
+    use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration};
     use serde_json::json;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -2345,6 +2513,64 @@ mod tests {
                 worker_id: 7,
                 last_op: "open_idb".to_string(),
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn conditional_close_without_matching_pooled_generation_is_a_noop() {
+        let state =
+            crate::ida::pool::PooledSessionState::new(test_pool(1), "generation-test".to_string());
+
+        assert_eq!(
+            state
+                .close_if_generation(DatabaseGeneration(1))
+                .await
+                .expect("a missing generation should be a successful no-op"),
+            ConditionalCloseResult::NotCurrent
+        );
+    }
+
+    /// The close/reopen redirect: a background task holds the generation it
+    /// opened, its session closes and reopens, and the task's next post-open
+    /// call must be refused rather than resolved against the new lease.
+    ///
+    /// Every pooled post-open call resolves its worker through
+    /// `required_handle_for_generation`, which applies this decision while
+    /// holding the lease lock, so a concurrent close cannot slip between the
+    /// check and the dispatch.
+    #[test]
+    fn post_open_call_is_refused_after_its_lease_is_replaced() {
+        let opened = DatabaseGeneration(1);
+        let after_reopen = DatabaseGeneration(2);
+
+        // The task's own database: its remaining work proceeds.
+        assert!(require_lease_generation(opened, Some(opened)).is_ok());
+
+        // After a close/reopen the lease names a different database; the stale
+        // task must be refused instead of silently mutating the new one.
+        match require_lease_generation(after_reopen, Some(opened)) {
+            Err(ToolError::DatabaseReplaced) => {}
+            Err(other) => panic!("expected DatabaseReplaced, got {other}"),
+            Ok(()) => panic!("a replaced lease must refuse the stale operation"),
+        }
+
+        // The session that owns the new database is unaffected.
+        assert!(require_lease_generation(after_reopen, Some(after_reopen)).is_ok());
+
+        // Foreground tools opt out and follow the current lease.
+        assert!(require_lease_generation(after_reopen, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn bound_call_reports_no_database_rather_than_a_redirect() {
+        let state =
+            crate::ida::pool::PooledSessionState::new(test_pool(1), "redirect-test".to_string());
+
+        assert!(matches!(
+            state
+                .required_handle_for_generation(Some(DatabaseGeneration(1)))
+                .await,
+            Err(ToolError::NoDatabaseOpen)
         ));
     }
 

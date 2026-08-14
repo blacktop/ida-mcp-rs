@@ -11,11 +11,12 @@ use axum::Router;
 use clap::{Args, Parser, Subcommand};
 use ida_mcp::server::http_access::{HttpAccessPolicy, HttpAccessService};
 use ida_mcp::server::http_config::{
-    build_pooled_session_manager, build_session_manager, build_streamable_config, HttpServerOptions,
+    build_pooled_session_manager, build_session_manager, build_streamable_config,
+    HttpServerOptions, DEFAULT_MAX_REQUEST_BODY_MIB,
 };
 use ida_mcp::server::task::TaskRegistry;
 use ida_mcp::server::tool_filter::ToolFilter;
-use ida_mcp::server::SanitizedIdaServer;
+use ida_mcp::server::{SanitizedIdaServer, ServerRuntimeState};
 use ida_mcp::{
     disasm::generate_disasm_line,
     expand_path, ida,
@@ -157,9 +158,20 @@ struct ServeHttpArgs {
     /// Use stateless mode (POST only; no sessions)
     #[arg(long)]
     stateless: bool,
-    /// Return application/json in stateless mode instead of SSE framing.
+    /// Prefer application/json over SSE framing for sessionless responses
+    /// (--stateless mode and all MCP 2026 requests).
     #[arg(long)]
     json_response: bool,
+    /// Maximum accepted request body, in MiB. Bulk `patch` (binary as hex,
+    /// ~2x the raw size) and large `run_script` sources need headroom; the
+    /// endpoint is unauthenticated and each in-flight request can retain up
+    /// to this much, so raise it deliberately.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_REQUEST_BODY_MIB,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1024),
+    )]
+    max_request_body_mib: usize,
     /// Allowed Origin values (comma-separated). Defaults to localhost only.
     #[arg(
         long,
@@ -299,12 +311,34 @@ fn init_stdio_ida_state(allow_lumina: bool) -> anyhow::Result<ida::IdaInitState>
     }
 }
 
+/// Bounded worker shutdown. If IDA is wedged inside auto_wait() these
+/// requests sit behind it and the process can stay alive indefinitely
+/// (issue #32). After the timeout we forcibly exit so the OS reclaims
+/// IDA's mmap'd memory regardless. 124 matches GNU `timeout`'s "did its
+/// best, timed out" convention.
+async fn shutdown_worker_bounded(worker: &WorkerBackend) {
+    const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+    let close_result =
+        tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, worker.close_for_shutdown()).await;
+    let shutdown_result = tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, worker.shutdown()).await;
+    if close_result.is_err() || shutdown_result.is_err() {
+        warn!(
+            timeout_secs = WORKER_SHUTDOWN_TIMEOUT.as_secs(),
+            close_timed_out = close_result.is_err(),
+            shutdown_timed_out = shutdown_result.is_err(),
+            "IDA worker shutdown timed out (likely wedged in auto_wait); \
+             forcing process exit to release IDA-side memory"
+        );
+        std::process::exit(124);
+    }
+}
+
 fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
-    let cancelled = registry.cancel_all_running(message);
-    if cancelled > 0 {
+    let requested = registry.cancel_all_running(message);
+    if requested > 0 {
         info!(
-            cancelled_tasks = cancelled,
-            message, "Cancelled background tasks"
+            cancellation_requests = requested,
+            message, "Requested background task cancellation"
         );
     }
 }
@@ -346,7 +380,18 @@ fn run_server_with_mode(
             );
             let task_registry = server.task_registry().clone();
             let sanitized = SanitizedIdaServer::with_filter(server, filter_for_server);
-            let mut service = Some(sanitized.serve(stdio()).await?);
+            let mut service = match sanitized.serve(stdio()).await {
+                Ok(running) => Some(running),
+                Err(e) => {
+                    // rmcp fails the serve future without answering the client
+                    // when the first message is not a valid initialize/discover
+                    // request. Shut the IDA worker down so the process exits
+                    // instead of wedging with an unread stdin.
+                    error!(error = %e, "stdio MCP negotiation failed; shutting down IDA worker");
+                    shutdown_worker_bounded(&worker_for_shutdown).await;
+                    return Err(anyhow::anyhow!("stdio MCP negotiation failed: {e}"));
+                }
+            };
             let shutdown_notify = Arc::new(Notify::new());
             let shutdown_signal = shutdown_notify.clone();
 
@@ -400,32 +445,7 @@ fn run_server_with_mode(
                 }
             }
             info!("MCP server shutting down");
-            // Bounded worker shutdown. If IDA is wedged inside auto_wait()
-            // these requests sit behind it and the process can stay alive
-            // indefinitely (issue #32). After the timeout we forcibly exit
-            // so the OS reclaims IDA's mmap'd memory regardless. 124
-            // matches GNU `timeout`'s "did its best, timed out" convention.
-            const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-            let close_result = tokio::time::timeout(
-                WORKER_SHUTDOWN_TIMEOUT,
-                worker_for_shutdown.close_for_shutdown(),
-            )
-            .await;
-            let shutdown_result = tokio::time::timeout(
-                WORKER_SHUTDOWN_TIMEOUT,
-                worker_for_shutdown.shutdown(),
-            )
-            .await;
-            if close_result.is_err() || shutdown_result.is_err() {
-                warn!(
-                    timeout_secs = WORKER_SHUTDOWN_TIMEOUT.as_secs(),
-                    close_timed_out = close_result.is_err(),
-                    shutdown_timed_out = shutdown_result.is_err(),
-                    "IDA worker shutdown timed out (likely wedged in auto_wait); \
-                     forcing process exit to release IDA-side memory"
-                );
-                std::process::exit(124);
-            }
+            shutdown_worker_bounded(&worker_for_shutdown).await;
             Ok::<_, anyhow::Error>(())
         })
     });
@@ -436,10 +456,18 @@ fn run_server_with_mode(
     info!("IDA worker loop finished");
 
     // Wait for server thread to finish
+    // Propagate server-thread failures (e.g. stdio negotiation errors) into
+    // the process exit status so supervisors can tell them from clean shutdown.
     match server_handle.join() {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("Server thread failed: {e}"),
-        Err(e) => error!("Server thread panicked: {:?}", e),
+        Ok(Err(e)) => {
+            error!("Server thread failed: {e}");
+            return Err(e);
+        }
+        Err(e) => {
+            error!("Server thread panicked: {:?}", e);
+            return Err(anyhow::anyhow!("server thread panicked: {e:?}"));
+        }
     }
 
     info!("Server stopped");
@@ -454,7 +482,7 @@ fn run_server_http(
 ) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (streamable HTTP mode)");
     if args.json_response && !args.stateless {
-        info!("--json-response is ignored unless --stateless is also set");
+        info!("--json-response applies to sessionless dispatch (MCP 2026 requests); legacy sessions keep SSE framing for streams");
     }
     if args.max_workers == 0 {
         return Err(anyhow::anyhow!("--max-workers must be at least 1"));
@@ -507,17 +535,17 @@ fn run_server_http(
     let worker_for_factory = backend.clone();
     let worker_for_shutdown = backend.clone();
     let filter_for_factory = filter.clone();
-    let server_handle = thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_multi_thread()
+    let runtime_state = if args.stateless {
+        ServerRuntimeState::new_stateless_http()
+    } else {
+        ServerRuntimeState::new()
+    };
+    let worker_for_startup_failure = backend.clone();
+    let server_handle = thread::spawn(move || -> anyhow::Result<()> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("Failed to create tokio runtime: {e}");
-                return;
-            }
-        };
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
 
         let result = rt.block_on(async move {
             let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -541,16 +569,18 @@ fn run_server_http(
                     sse_keep_alive_secs: args.sse_keep_alive_secs,
                     stateless: args.stateless,
                     json_response: args.json_response,
+                    max_request_body_mib: args.max_request_body_mib,
                 },
                 cancel.clone(),
             );
 
             let service = StreamableHttpService::new(
                 move || {
-                    let inner = IdaMcpServer::with_filter(
+                    let inner = IdaMcpServer::with_filter_and_state(
                         worker_for_factory.clone(),
                         ServerMode::Http,
                         filter_for_factory.clone(),
+                        runtime_state.clone(),
                     );
                     Ok(SanitizedIdaServer::with_filter(
                         inner,
@@ -586,17 +616,32 @@ fn run_server_http(
                 .map_err(|e| anyhow::anyhow!("serve failed: {e}"))?;
             Ok::<_, anyhow::Error>(())
         });
-        if let Err(err) = result {
+        if let Err(err) = &result {
             error!("HTTP server error: {err}");
+            // The main thread is parked in run_ida_loop and nothing else will
+            // send it a shutdown request, so a failed startup would otherwise
+            // wedge the process alive holding an IDA license with no listener.
+            rt.block_on(shutdown_worker_bounded(&worker_for_startup_failure));
         }
+        result
     });
 
     info!("Starting IDA worker loop");
     ida::run_ida_loop(rx, init_state);
     info!("IDA worker loop finished");
 
-    if let Err(e) = server_handle.join() {
-        error!("Server thread panicked: {:?}", e);
+    // Propagate startup/serve failures into the exit status so supervisors can
+    // tell "could not start" from a clean shutdown.
+    match server_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!("Server thread failed: {e}");
+            return Err(e);
+        }
+        Err(e) => {
+            error!("Server thread panicked: {:?}", e);
+            return Err(anyhow::anyhow!("server thread panicked: {e:?}"));
+        }
     }
 
     info!("Server stopped");
@@ -615,17 +660,11 @@ fn run_server_http_pooled(
         min_workers = args.min_workers,
         "Starting pooled HTTP router; parent will not initialize IDA"
     );
-    let server_handle = thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_multi_thread()
+    let server_handle = thread::spawn(move || -> anyhow::Result<()> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("Failed to create tokio runtime: {e}");
-                return;
-            }
-        };
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?;
 
         let result = rt.block_on(async move {
             let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -673,6 +712,7 @@ fn run_server_http_pooled(
                     sse_keep_alive_secs: args.sse_keep_alive_secs,
                     stateless: args.stateless,
                     json_response: args.json_response,
+                    max_request_body_mib: args.max_request_body_mib,
                 },
                 cancel.clone(),
             );
@@ -725,13 +765,24 @@ fn run_server_http_pooled(
             pool.shutdown_all().await;
             Ok::<_, anyhow::Error>(())
         });
-        if let Err(err) = result {
-            error!("HTTP server error: {err}");
+        if let Err(err) = &result {
+            error!("Pooled HTTP server error: {err}");
         }
+        result
     });
 
-    if let Err(e) = server_handle.join() {
-        error!("Server thread panicked: {:?}", e);
+    // Same contract as single-worker HTTP and stdio: a server that never
+    // started must not report success.
+    match server_handle.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            error!("Server thread failed: {e}");
+            return Err(e);
+        }
+        Err(e) => {
+            error!("Server thread panicked: {:?}", e);
+            return Err(anyhow::anyhow!("server thread panicked: {e:?}"));
+        }
     }
 
     info!("Pooled HTTP server stopped");

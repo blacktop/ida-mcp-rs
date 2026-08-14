@@ -75,7 +75,7 @@ fn main() {
     );
     let _ = writeln!(
         out,
-        "- Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires close_token from open_idb)"
+        "- Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires the close_token from `open_idb` unless the request is in the owning legacy session)"
     );
     let _ = writeln!(out);
 

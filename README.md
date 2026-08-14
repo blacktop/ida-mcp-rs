@@ -178,7 +178,7 @@ strings(limit: 10)
 
 # For xrefs/decompile on large binaries, run analysis in background
 analyze_funcs(background: true)   # returns task_id
-task_status(task_id: "analyze-1") # poll progress
+task_status(task_id: "analyze-<random>") # poll progress (ID from the analyze_funcs response)
 
 # Decompile (requires Hex-Rays + completed analysis)
 decompile(address: "0x100000f00")
@@ -210,6 +210,15 @@ immediately, but the child process may stay alive idle for reuse until
 retry later. Pooled mode requires stateful HTTP sessions; `--max-workers > 1`
 is rejected with `--stateless`.
 
+MCP `2026-07-28` uses the sessionless `server/discover` lifecycle. It is
+supported over stdio and the default single-worker HTTP mode, including
+multi-round elicitation and the `io.modelcontextprotocol/tasks` extension for
+background `open_dsc` calls. Pooled HTTP (`--max-workers > 1`) deliberately
+advertises protocol versions only through `2025-11-25`: its worker lease is
+session-affine, and MCP 2026 has no session identifier to preserve that routing
+across requests. MCP 2026 requests to pooled HTTP fail with an unsupported
+protocol-version error instead of risking dispatch to a different IDA worker.
+
 If an SSE-capable client exits without sending `close_idb` or HTTP `DELETE`,
 pooled mode closes the session after its standalone SSE stream disconnects and
 the `--worker-disconnect-grace-secs` reconnect grace elapses.
@@ -227,7 +236,7 @@ open_dsc(path: "/path/to/dyld_shared_cache_arm64e", arch: "arm64e",
          module: "/usr/lib/libobjc.A.dylib")
 
 # If a legacy background task was started, poll until done
-task_status(task_id: "dsc-1")
+task_status(task_id: "dsc-<random>")  # ID from the open_dsc response
 
 # Load additional frameworks for cross-module references
 open_dsc(path: "/path/to/dyld_shared_cache_arm64e", arch: "arm64e",

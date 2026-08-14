@@ -23,6 +23,8 @@ pub struct HttpServerOptions {
     pub stateless: bool,
     /// Return `application/json` instead of SSE in stateless mode.
     pub json_response: bool,
+    /// Request-body cap in MiB (see [`DEFAULT_MAX_REQUEST_BODY_MIB`]).
+    pub max_request_body_mib: usize,
 }
 
 fn session_manager_with_keep_alive(session_keep_alive_secs: u64) -> LocalSessionManager {
@@ -136,7 +138,7 @@ impl SessionManager for PooledSessionManager {
         id: &SessionId,
         last_event_id: String,
     ) -> Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error> {
-        // rmcp 1.7 local::EventId formats request-scoped streams as
+        // rmcp local::EventId formats request-scoped streams as
         // "<index>/<request_id>" and standalone streams as "<index>".
         let close_on_drop = !last_event_id.contains('/');
         let stream = self.inner.resume(id, last_event_id).await?;
@@ -340,6 +342,20 @@ impl<S> Drop for TrackedSessionStream<S> {
     }
 }
 
+const BYTES_PER_MIB: usize = 1024 * 1024;
+
+/// Default request-body cap for HTTP transports, in MiB.
+///
+/// rmcp 3 introduced a 4 MiB default that is too small for this server's bulk
+/// tools: `patch` sends binary as hex (2.0x the raw size) and `run_script`
+/// sends whole IDAPython sources. The HTTP endpoint has no authentication —
+/// only Origin/Host checks — and rmcp grows a per-request buffer up to this
+/// cap before parsing, so concurrent requests each retain up to this much.
+/// 16 MiB covers a ~1.4 MiB binary patch with wide headroom while keeping that
+/// unauthenticated retention surface bounded. Operators who need more (or
+/// less) set `--max-request-body-mib`.
+pub const DEFAULT_MAX_REQUEST_BODY_MIB: usize = 16;
+
 pub fn build_streamable_config(
     opts: HttpServerOptions,
     cancel: CancellationToken,
@@ -351,8 +367,14 @@ pub fn build_streamable_config(
             Some(Duration::from_secs(opts.sse_keep_alive_secs))
         })
         .with_sse_retry(None)
-        .with_stateful_mode(!opts.stateless)
-        .with_json_response(opts.json_response && opts.stateless)
+        .with_legacy_session_mode(!opts.stateless)
+        // Sessionless dispatch is no longer tied to --stateless: MCP 2026
+        // requests always take it, so the flag applies there too instead of
+        // being silently dropped without --stateless.
+        .with_json_response(opts.json_response)
+        // rmcp defaults to a 4 MiB body cap; large patch/run_script payloads
+        // are legitimate here, so raise it to the operator-selected bound.
+        .with_max_request_body_bytes(opts.max_request_body_mib.saturating_mul(BYTES_PER_MIB))
         .with_cancellation_token(cancel)
         // Host validation is handled by HttpAccessService so the CLI can apply
         // bind-aware LAN rules and return actionable 403 messages.
@@ -375,6 +397,7 @@ mod tests {
             sse_keep_alive_secs: 15,
             stateless: false,
             json_response: false,
+            max_request_body_mib: crate::server::http_config::DEFAULT_MAX_REQUEST_BODY_MIB,
         }
     }
 
@@ -388,16 +411,56 @@ mod tests {
     }
 
     #[test]
-    fn json_response_only_enabled_in_stateless_mode() {
+    fn json_response_applies_to_all_sessionless_dispatch() {
         let mut opts = opts();
         opts.json_response = true;
 
+        // MCP 2026 requests are dispatched sessionless even with legacy
+        // sessions enabled, so the flag must not depend on --stateless.
         let stateful = build_streamable_config(opts.clone(), CancellationToken::new());
-        assert!(!stateful.json_response);
+        assert!(stateful.json_response);
 
         opts.stateless = true;
         let stateless = build_streamable_config(opts, CancellationToken::new());
         assert!(stateless.json_response);
+    }
+
+    #[test]
+    fn request_body_cap_default_accepts_bulk_tools_without_the_64_mib_surface() {
+        let config = build_streamable_config(opts(), CancellationToken::new());
+        assert_eq!(config.max_request_body_bytes, 16 * 1024 * 1024);
+        // Large enough for bulk patch/run_script payloads rmcp's 4 MiB
+        // default rejects, small enough that concurrent unauthenticated
+        // requests cannot each retain the previous 64 MiB.
+        assert!(config.max_request_body_bytes > 4 * 1024 * 1024);
+        assert!(config.max_request_body_bytes < 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn request_body_cap_follows_the_operator_value() {
+        let mut opts = opts();
+        opts.max_request_body_mib = 1;
+        let config = build_streamable_config(opts, CancellationToken::new());
+        assert_eq!(config.max_request_body_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn request_body_cap_saturates_instead_of_overflowing() {
+        let mut opts = opts();
+        opts.max_request_body_mib = usize::MAX;
+        let config = build_streamable_config(opts, CancellationToken::new());
+        assert_eq!(config.max_request_body_bytes, usize::MAX);
+    }
+
+    #[test]
+    fn stateless_option_disables_legacy_sessions() {
+        let stateful = build_streamable_config(opts(), CancellationToken::new());
+        assert!(stateful.legacy_session_mode);
+
+        let mut stateless_opts = opts();
+        stateless_opts.stateless = true;
+        let stateless = build_streamable_config(stateless_opts, CancellationToken::new());
+        assert!(!stateless.legacy_session_mode);
     }
 
     #[test]

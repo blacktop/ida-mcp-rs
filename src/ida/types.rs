@@ -14,6 +14,31 @@ pub struct DbInfo {
     pub analysis_status: AnalysisStatus,
 }
 
+/// Opaque identity for one database-open lifetime within a worker backend.
+///
+/// A background task captures this at open and passes it back for every later
+/// operation on that database, so a close/reopen cannot silently redirect the
+/// task's remaining work onto whatever database is current. It scopes both
+/// cleanup (a stale task may close the database it opened, never a newer one)
+/// and post-open work (a stale task must not read or mutate a newer one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseGeneration(pub(crate) u64);
+
+/// Internal open result that carries the database lifetime identity without
+/// exposing it in the public MCP tool response.
+#[derive(Debug, Clone)]
+pub struct OpenedDatabase {
+    pub(crate) info: DbInfo,
+    pub(crate) generation: DatabaseGeneration,
+}
+
+/// Result of closing only when an expected database lifetime is still active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalCloseResult {
+    Closed,
+    NotCurrent,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DebugInfoLoad {
     pub path: String,

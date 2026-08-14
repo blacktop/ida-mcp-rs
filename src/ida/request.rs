@@ -22,10 +22,14 @@ pub enum IdaRequest {
         idb_out: Option<String>,
         progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
-        resp: oneshot::Sender<Result<DbInfo, ToolError>>,
+        resp: oneshot::Sender<Result<OpenedDatabase, ToolError>>,
     },
     Close {
         resp: oneshot::Sender<()>,
+    },
+    CloseIfGeneration {
+        generation: DatabaseGeneration,
+        resp: oneshot::Sender<Result<ConditionalCloseResult, ToolError>>,
     },
     LoadDebugInfo {
         path: Option<String>,
@@ -33,10 +37,18 @@ pub enum IdaRequest {
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
     AnalysisStatus {
+        /// When set, the request is refused unless this database lifetime is
+        /// still current, so a background task cannot observe the database
+        /// that replaced the one it opened.
+        expected_generation: Option<DatabaseGeneration>,
         resp: oneshot::Sender<Result<AnalysisStatus, ToolError>>,
     },
     DscLoadImage {
         module: String,
+        /// See [`IdaRequest::AnalysisStatus::expected_generation`]. Loading an
+        /// image mutates the database, so a stale task must be refused before
+        /// it writes into a database it does not own.
+        expected_generation: Option<DatabaseGeneration>,
         resp: oneshot::Sender<Result<DscImageInfo, ToolError>>,
     },
     DscLoadRegion {

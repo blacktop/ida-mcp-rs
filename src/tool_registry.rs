@@ -164,7 +164,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     (optionally specify debug_info_path). \
                     The database must be opened before using any other analysis tools. \
                     Call close_idb when finished to release database locks; in multi-client servers, coordinate before closing. \
-                    In HTTP/SSE mode, open_idb returns a close_token that must be provided to close_idb. \
+                    In HTTP/SSE mode, keep the close_token returned by open_idb for sessionless MCP 2026 or cross-session close requests; the owning legacy session can close directly. \
                     Supports timeout_secs (default 300s, max 600s). Phase transitions are observable via recent_operations. \
                     Returns metadata about the binary: file type, processor, bitness, function count, analysis_status.",
         example: r#"{"path": "/path/to/binary", "auto_analyse": false}"#,
@@ -178,8 +178,9 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         category: ToolCategory::Core,
         short_desc: "Open a dyld_shared_cache and load one module; use dsc_add_dylib/dsc_add_region for more",
         full_desc: "Open an Apple dyld_shared_cache file and extract a single dylib for analysis. \
-                    On IDA 9.4, opens the DSC header directly and loads images through IDA's native dscu service. \
-                    Older IDA builds keep the legacy idat background flow when a generated .i64 is needed. \
+                    A previously generated .i64 for the same DSC is reopened directly, preserving prior analysis. \
+                    Otherwise IDA 9.4 opens the DSC header directly and loads images through IDA's native dscu service; \
+                    older IDA builds keep the legacy idat background flow when a generated .i64 is needed. \
                     Use this instead of open_idb when working with dyld_shared_cache files. \
                     Optionally load additional frameworks to resolve cross-module references. \
                     To load more code modules after the initial open, call dsc_add_dylib. \
@@ -258,7 +259,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         full_desc: "Close the currently open IDA database, releasing resources. \
                     Call this when done with analysis or before opening a different database. \
                     In multi-client servers, coordinate before closing to avoid interrupting others. \
-                    In HTTP/SSE mode, provide the close_token returned by open_idb.",
+                    In HTTP/SSE mode, provide the close_token returned by open_idb unless the request is in the owning legacy session.",
         example: r#"{"close_token": "token-from-open-idb"}"#,
         default: true,
         keywords: &["close", "unload", "database"],

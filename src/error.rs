@@ -63,6 +63,22 @@ pub enum ToolError {
     Busy,
 
     #[error(
+        "The database this background operation opened was closed and replaced. \
+         Its remaining work was abandoned so it cannot touch the current database."
+    )]
+    DatabaseReplaced,
+
+    #[error(
+        "Matching background work is already running; its task handle stays with the response that started it. Retry after it finishes."
+    )]
+    BackgroundTaskHandlePrivate,
+
+    #[error(
+        "Background task registry is full ({max} retained tasks). Retry after older results expire."
+    )]
+    BackgroundTaskRegistryFull { max: usize },
+
+    #[error(
         "Worker pool exhausted: {active}/{max} workers are leased. Close an IDB or retry later."
     )]
     PoolExhausted { active: usize, max: usize },
