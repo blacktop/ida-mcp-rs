@@ -662,7 +662,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         short_desc: "Build call graph from a function",
         full_desc: "Build a call graph starting from a function. Direction is callees by default \
                     for compatibility, or callers/both when explicitly requested. Returns nodes \
-                    and normalized caller-to-callee edges.",
+                    and normalized caller-to-callee edges. The truncated flag is true when \
+                    max_nodes prevented the complete requested traversal.",
         example: r#"{"roots": "0x1000", "direction": "both", "max_depth": 2, "max_nodes": 256}"#,
         default: false,
         keywords: &["callgraph", "call", "graph", "depth", "tree"],

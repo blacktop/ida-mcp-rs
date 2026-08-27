@@ -5,7 +5,7 @@ use crate::ida::lock::remove_mcp_lock_for_pid;
 use crate::ida::observability::ProgressSender;
 use crate::ida::remote;
 use crate::ida::types::*;
-use crate::ida::worker::MAX_TIMEOUT_SECS;
+use crate::ida::worker::{DEBUG_MODULES_TIMEOUT_SECS, MAX_TIMEOUT_SECS};
 use futures_util::future::join_all;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{CallToolResult, ClientInfo, JsonObject};
@@ -1500,8 +1500,13 @@ impl WorkspaceDatabase {
     }
 
     pub async fn debug_modules(&self) -> Result<Value, ToolError> {
-        self.call_value("debug_modules", json!({}), None, None)
-            .await
+        self.call_value(
+            "debug_modules",
+            json!({}),
+            Some(DEBUG_MODULES_TIMEOUT_SECS),
+            None,
+        )
+        .await
     }
 
     pub async fn debug_stop(

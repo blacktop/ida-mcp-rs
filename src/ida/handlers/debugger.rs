@@ -138,6 +138,20 @@ impl Drop for DebuggerRuntime {
 }
 
 impl DebuggerRuntime {
+    fn session_kind(&self) -> Result<DebugSessionKind, ToolError> {
+        self.session.ok_or_else(|| {
+            ToolError::InvalidParams(
+                "no active debugger session; call debug_launch or debug_attach first".to_string(),
+            )
+        })
+    }
+
+    fn clear_session(&mut self) {
+        self.session = None;
+        self.backend_loaded = false;
+        self.stop_helper();
+    }
+
     fn ensure_backend(&mut self, database: &IDB) -> Result<&'static str, ToolError> {
         let backend = debugger_backend(database)?;
         #[cfg(target_os = "macos")]
@@ -264,9 +278,7 @@ impl DebuggerRuntime {
 
     pub fn close_session(&mut self, idb: &Option<IDB>) -> Result<(), ToolError> {
         let Some(database) = idb.as_ref() else {
-            self.session = None;
-            self.backend_loaded = false;
-            self.stop_helper();
+            self.clear_session();
             return Ok(());
         };
         // An externally exited target can leave our ownership tag stale. IDA's
@@ -279,9 +291,7 @@ impl DebuggerRuntime {
                 DebuggerProcessState::NoProcess
             )
         {
-            self.session = None;
-            self.backend_loaded = false;
-            self.stop_helper();
+            self.clear_session();
             return Ok(());
         }
         // Preserve the session kind until IDA confirms the terminal event.
@@ -293,9 +303,7 @@ impl DebuggerRuntime {
             None => Ok(0),
         }
         .map_err(|error| ToolError::DebuggerTeardown(error.to_string()))?;
-        self.session = None;
-        self.backend_loaded = false;
-        self.stop_helper();
+        self.clear_session();
         Ok(())
     }
 }
@@ -419,6 +427,7 @@ pub fn attach(
 
 pub fn modules(runtime: &mut DebuggerRuntime, idb: &Option<IDB>) -> Result<Value, ToolError> {
     let database = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    runtime.session_kind()?;
     let backend = runtime.ensure_backend(database)?;
     let modules = database.debugger_modules().map_err(debugger_error)?;
     let modules = modules
@@ -453,14 +462,25 @@ pub fn stop(
 ) -> Result<Value, ToolError> {
     validate_timeout(timeout_seconds)?;
     let database = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
-    let backend = runtime.ensure_backend(database)?;
+    let session = runtime.session_kind()?;
     let resolved = match action {
-        DebugStopAction::Auto => match runtime.session {
-            Some(DebugSessionKind::Launched) => DebugStopAction::Terminate,
-            Some(DebugSessionKind::Attached) | None => DebugStopAction::Detach,
+        DebugStopAction::Auto => match session {
+            DebugSessionKind::Launched => DebugStopAction::Terminate,
+            DebugSessionKind::Attached => DebugStopAction::Detach,
         },
         explicit => explicit,
     };
+    if matches!(
+        database.debugger_process_state(),
+        DebuggerProcessState::NoProcess
+    ) {
+        let backend = debugger_backend(database)?;
+        let mut result = session_result(database, backend, "ready", 0, Some(resolved.as_str()));
+        result["already_stopped"] = json!(true);
+        runtime.clear_session();
+        return Ok(result);
+    }
+    let backend = runtime.ensure_backend(database)?;
     let event_code = match resolved {
         DebugStopAction::Detach => database.debugger_detach(timeout_seconds),
         DebugStopAction::Terminate => database.debugger_terminate(timeout_seconds),
@@ -471,14 +491,15 @@ pub fn stop(
         }
     }
     .map_err(debugger_error)?;
-    runtime.session = None;
-    Ok(session_result(
+    let result = session_result(
         database,
         backend,
         "ready",
         event_code,
         Some(resolved.as_str()),
-    ))
+    );
+    runtime.clear_session();
+    Ok(result)
 }
 
 fn validate_timeout(timeout_seconds: u32) -> Result<(), ToolError> {
@@ -585,7 +606,8 @@ mod tests {
     use idalib::meta::FileType;
 
     use crate::ida::handlers::debugger::{
-        debugger_backend_for_target, macos_authorization_failure, TargetArchitecture,
+        debugger_backend_for_target, macos_authorization_failure, DebuggerRuntime,
+        TargetArchitecture,
     };
     use crate::ida::types::DebugStopAction;
 
@@ -600,6 +622,16 @@ mod tests {
             Ok(DebugStopAction::Detach)
         );
         assert!(DebugStopAction::parse(Some("continue")).is_err());
+    }
+
+    #[test]
+    fn inactive_runtime_rejects_session_only_operations() {
+        let runtime = DebuggerRuntime::default();
+
+        let error = runtime
+            .session_kind()
+            .expect_err("a fresh runtime must not claim a debug session");
+        assert!(error.to_string().contains("no active debugger session"));
     }
 
     #[test]

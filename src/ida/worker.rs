@@ -14,6 +14,9 @@ use tokio_util::sync::CancellationToken;
 
 /// Default timeout for IDA operations (2 minutes)
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Debugger module enumeration has no SDK-level timeout, so bound the caller
+/// and pooled-child watchdog explicitly instead of waiting forever.
+pub(crate) const DEBUG_MODULES_TIMEOUT_SECS: u64 = 120;
 /// Maximum allowed timeout (10 minutes)
 pub const MAX_TIMEOUT_SECS: u64 = 600;
 /// Maximum time to retry enqueuing close requests when the queue is full.
@@ -368,7 +371,7 @@ impl IdaWorker {
     pub async fn debug_modules(&self) -> Result<Value, ToolError> {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::DebugModules { resp: tx })?;
-        Self::recv(rx).await
+        Self::recv_with_timeout(rx, Some(DEBUG_MODULES_TIMEOUT_SECS)).await
     }
 
     pub async fn debug_stop(

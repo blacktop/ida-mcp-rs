@@ -166,8 +166,11 @@ fn coalesce_patched_bytes(bytes: &[PatchedByte]) -> Vec<PatchRange> {
             let previous = bytes[end_index - 1];
             let current = bytes[end_index];
             let addresses_touch = current.address == previous.address.saturating_add(1);
-            let offsets_touch = (previous.file_offset < 0 && current.file_offset < 0)
-                || current.file_offset == previous.file_offset.saturating_add(1);
+            let offsets_touch = if previous.file_offset < 0 || current.file_offset < 0 {
+                previous.file_offset < 0 && current.file_offset < 0
+            } else {
+                current.file_offset == previous.file_offset.saturating_add(1)
+            };
             if !addresses_touch || !offsets_touch {
                 break;
             }
@@ -447,5 +450,27 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].file_offset, None);
         assert_eq!(ranges[0].length, 2);
+    }
+
+    #[test]
+    fn unmapped_patch_does_not_coalesce_with_file_offset_zero() {
+        let ranges = coalesce_patched_bytes(&[
+            PatchedByte {
+                address: 0x3000,
+                file_offset: -1,
+                original_value: 0xaa,
+                patched_value: 0x11,
+            },
+            PatchedByte {
+                address: 0x3001,
+                file_offset: 0,
+                original_value: 0xbb,
+                patched_value: 0x22,
+            },
+        ]);
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].file_offset, None);
+        assert_eq!(ranges[1].file_offset, Some(0));
     }
 }

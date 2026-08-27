@@ -109,6 +109,32 @@ assert_ok "open debugger database" "$open_response"
 source_id="$(result_text <<<"$open_response" | jq -r '.database_id // empty')"
 [[ -n "$source_id" ]] || { echo "open_idb did not return a database_id" >&2; exit 1; }
 
+stop_without_session_request="$(jq -cn --arg id "$source_id" \
+  '{jsonrpc:"2.0",id:14,method:"tools/call",params:{name:"debug_stop",arguments:{database_id:$id,timeout_secs:5}}}')"
+send "$stop_without_session_request"
+stop_without_session_response="$(wait_response 14 15)"
+jq -e '
+  .result.isError == true
+  and (.result.content[0].text | contains("no active debugger session"))
+' >/dev/null <<<"$stop_without_session_response" || {
+  echo "debug_stop without a session did not fail before backend setup" >&2
+  jq . <<<"$stop_without_session_response" >&2
+  exit 1
+}
+
+modules_without_session_request="$(jq -cn --arg id "$source_id" \
+  '{jsonrpc:"2.0",id:15,method:"tools/call",params:{name:"debug_modules",arguments:{database_id:$id}}}')"
+send "$modules_without_session_request"
+modules_without_session_response="$(wait_response 15 15)"
+jq -e '
+  .result.isError == true
+  and (.result.content[0].text | contains("no active debugger session"))
+' >/dev/null <<<"$modules_without_session_response" || {
+  echo "debug_modules without a session did not fail before backend setup" >&2
+  jq . <<<"$modules_without_session_response" >&2
+  exit 1
+}
+
 launch_request="$(jq -cn --arg id "$source_id" --arg path "$fixture_path" \
   '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"debug_launch",arguments:{database_id:$id,path:$path,timeout_secs:10}}}')"
 send "$launch_request"
@@ -125,9 +151,14 @@ case "$launch_status" in
     send "$modules_request"
     modules_response="$(wait_response 4 30)"
     assert_ok "enumerate runtime modules" "$modules_response"
+    modules_text="$(result_text <<<"$modules_response")"
     jq -e --arg path "$fixture_path" \
       '.module_count > 0 and any(.modules[]; .path == $path)' \
-      >/dev/null <<<"$(result_text <<<"$modules_response")"
+      >/dev/null <<<"$modules_text" || {
+      echo "FAIL: runtime modules did not include the launched fixture" >&2
+      printf '%s\n' "$modules_text" >&2
+      exit 1
+    }
 
     module_output="$tmpdir/runtime-module.i64"
     open_module_request="$(jq -cn \
@@ -148,14 +179,23 @@ case "$launch_status" in
       and .module.path == $module
       and (.preferred_base_value | type == "number")
       and (.runtime_slide.signed | type == "string")
-    ' >/dev/null <<<"$module_text"
+    ' >/dev/null <<<"$module_text" || {
+      echo "FAIL: debug_open_module result shape mismatch" >&2
+      printf '%s\n' "$module_text" >&2
+      exit 1
+    }
     resolve_request="$(jq -cn --arg id "$module_id" \
       '{jsonrpc:"2.0",id:6,method:"tools/call",params:{name:"resolve_function",arguments:{database_id:$id,name:"interesting_function"}}}')"
     send "$resolve_request"
     resolve_response="$(wait_response 6 30)"
     assert_ok "resolve symbol in runtime module database" "$resolve_response"
+    resolve_text="$(result_text <<<"$resolve_response")"
     jq -e '.name == "interesting_function" and (.address | startswith("0x"))' \
-      >/dev/null <<<"$(result_text <<<"$resolve_response")"
+      >/dev/null <<<"$resolve_text" || {
+      echo "FAIL: interesting_function did not resolve in the module database" >&2
+      printf '%s\n' "$resolve_text" >&2
+      exit 1
+    }
 
     modules_after_request="$(jq -cn --arg id "$source_id" \
       '{jsonrpc:"2.0",id:7,method:"tools/call",params:{name:"debug_modules",arguments:{database_id:$id}}}')"
@@ -168,8 +208,13 @@ case "$launch_status" in
     send "$stop_request"
     stop_response="$(wait_response 8 30)"
     assert_ok "ownership-aware debugger stop" "$stop_response"
+    stop_text="$(result_text <<<"$stop_response")"
     jq -e '.status == "ready" and .action == "terminate" and .process_state == "no_process"' \
-      >/dev/null <<<"$(result_text <<<"$stop_response")"
+      >/dev/null <<<"$stop_text" || {
+      echo "FAIL: ownership-aware stop result shape mismatch" >&2
+      printf '%s\n' "$stop_text" >&2
+      exit 1
+    }
 
     missing_attach_request="$(jq -cn --arg id "$source_id" \
       '{jsonrpc:"2.0",id:11,method:"tools/call",params:{name:"debug_attach",arguments:{database_id:$id,pid:2000000000,timeout_secs:5}}}')"
@@ -199,8 +244,13 @@ case "$launch_status" in
     send "$external_launch_request"
     external_launch_response="$(wait_response 12 30)"
     assert_ok "launch target for external-exit recovery" "$external_launch_response"
-    jq -e '.status == "ready"' >/dev/null \
-      <<<"$(result_text <<<"$external_launch_response")"
+    external_launch_text="$(result_text <<<"$external_launch_response")"
+    jq -e '.status == "ready"' >/dev/null <<<"$external_launch_text" || {
+      echo "FAIL: external-exit recovery launch did not reach ready" \
+        "(a second Take Control prompt for the copied debuggee may need approval)" >&2
+      printf '%s\n' "$external_launch_text" >&2
+      exit 1
+    }
 
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       debuggee_pid="$(find_debuggee_pid || true)"
@@ -214,18 +264,42 @@ case "$launch_status" in
     kill -KILL "$debuggee_pid"
     sleep 1
 
+    stop_source_after_kill="$(jq -cn --arg id "$source_id" \
+      '{jsonrpc:"2.0",id:13,method:"tools/call",params:{name:"debug_stop",arguments:{database_id:$id,action:"auto",timeout_secs:10}}}')"
+    send "$stop_source_after_kill"
+    stop_after_kill_response="$(wait_response 13 30)"
+    assert_ok "stop debugger after external target exit" "$stop_after_kill_response"
+    stop_after_kill_text="$(result_text <<<"$stop_after_kill_response")"
+    # Whether IDA has already processed the external exit when stop() polls is
+    # a race: the NoProcess short-circuit reports already_stopped=true, while a
+    # terminate that drains the pending exit event omits it. Both are correct
+    # recoveries; the contract is that stop succeeds and ends with no process.
+    jq -e '
+      .status == "ready"
+      and .action == "terminate"
+      and .process_state == "no_process"
+    ' >/dev/null <<<"$stop_after_kill_text" || {
+      echo "FAIL: stop after external exit did not end ready/no_process" >&2
+      printf '%s\n' "$stop_after_kill_text" >&2
+      exit 1
+    }
+
     close_source_after_kill="$(jq -cn --arg id "$source_id" \
-      '{jsonrpc:"2.0",id:13,method:"tools/call",params:{name:"close_idb",arguments:{database_id:$id}}}')"
+      '{jsonrpc:"2.0",id:16,method:"tools/call",params:{name:"close_idb",arguments:{database_id:$id}}}')"
     send "$close_source_after_kill"
-    assert_ok "close debugger database after external target exit" "$(wait_response 13 30)"
+    assert_ok "close debugger database after external target exit" "$(wait_response 16 30)"
     source_closed=1
     debuggee_pid=""
-    echo "   debugger launch, module-to-IDB open, terminal stop, and external-exit recovery passed"
+    echo "   debugger launch, module-to-IDB open, terminal stop, and external-exit stop/close recovery passed"
     ;;
   user_action_required)
-    jq -e '.message | contains("Take Control")' >/dev/null \
-      <<<"$(result_text <<<"$launch_response")"
-    launch_error="$(result_text <<<"$launch_response" | jq -r '.error // "unknown error"')"
+    launch_text="$(result_text <<<"$launch_response")"
+    jq -e '.message | contains("Take Control")' >/dev/null <<<"$launch_text" || {
+      echo "FAIL: user_action_required response did not mention Take Control" >&2
+      printf '%s\n' "$launch_text" >&2
+      exit 1
+    }
+    launch_error="$(jq -r '.error // "unknown error"' <<<"$launch_text")"
     echo "   signed helper reached macOS authorization gate and returned user_action_required: $launch_error"
     ;;
   *)

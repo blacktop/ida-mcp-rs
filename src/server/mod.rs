@@ -339,17 +339,6 @@ impl ToolMux<IdaMcpServer> {
         {
             let _ = registry.remove(database_id);
         }
-        // WorkspaceDatabase::close consumes its worker lease before dispatching
-        // child teardown. Even when teardown returns an error and the pool
-        // retires that worker, this handle can no longer route another call.
-        // Remove it unconditionally so a debug pin cannot preserve a dead UUID.
-        if tool_name == "close_idb"
-            && let (Some(registry), Some(database_id)) =
-                (workspace_registry.as_ref(), selected_database_id.as_deref())
-        {
-            let _ = registry.remove(database_id);
-        }
-
         materialize_task_response(&task_registry, should_materialize_task, response)
     }
 }
@@ -382,18 +371,31 @@ fn attach_workspace_database_id(response: &mut CallToolResponse, database_id: &s
         return false;
     }
 
-    let replacement = result
+    let parsed = result
         .content
         .first()
         .and_then(|content| content.as_text())
-        .and_then(|text| serde_json::from_str::<Value>(&text.text).ok())
-        .and_then(|mut value| {
-            let Value::Object(map) = &mut value else {
-                return None;
-            };
-            map.insert("database_id".to_string(), json!(database_id));
-            serde_json::to_string_pretty(&value).ok()
-        });
+        .and_then(|text| serde_json::from_str::<Value>(&text.text).ok());
+    // A deduplicated open_dsc did not start work on this newly allocated
+    // workspace database. Its existing task will eventually report the
+    // original database_id, so attaching this phantom allocation would mint a
+    // handle that can never open.
+    if parsed
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("already_running")
+    {
+        return false;
+    }
+
+    let replacement = parsed.and_then(|mut value| {
+        let Value::Object(map) = &mut value else {
+            return None;
+        };
+        map.insert("database_id".to_string(), json!(database_id));
+        serde_json::to_string_pretty(&value).ok()
+    });
     if let (Some(text), Some(first)) = (replacement, result.content.first_mut()) {
         *first = Content::text(text);
     } else {
@@ -402,6 +404,14 @@ fn attach_workspace_database_id(response: &mut CallToolResponse, database_id: &s
         ));
     }
     true
+}
+
+fn workspace_close_should_remove_entry(result: &Result<(), ToolError>) -> bool {
+    // WorkspaceDatabase::close takes its worker lease before dispatching the
+    // child close. Every later result consumes that lease, including teardown
+    // errors that retire the child. NoDatabaseOpen is the one pre-dispatch
+    // result and can mean a pinned background open has not installed its lease.
+    !matches!(result, Err(ToolError::NoDatabaseOpen))
 }
 
 /// Parameters for the background DSC loading task.
@@ -3160,7 +3170,16 @@ impl IdaMcpServer {
                 }
             }
         }
-        match self.worker.close().await {
+        let result = self.worker.close().await;
+        if workspace_close_should_remove_entry(&result)
+            && let (Some(registry), Some(database_id)) = (
+                self.workspace_registry.as_ref(),
+                self.workspace_database_id.as_deref(),
+            )
+        {
+            let _ = registry.remove(database_id);
+        }
+        match result {
             Ok(()) => {
                 self.worker.clear_close_token();
                 info!("Tool call: close_idb completed successfully");
@@ -6775,7 +6794,8 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        if !self.filter.is_enabled(&params.name) {
+        if tool_registry::get_tool(&params.name).is_some() && !self.filter.is_enabled(&params.name)
+        {
             return Err(McpError::invalid_params(
                 disabled_tool_message(&params.name, self.workspace),
                 None,
@@ -6843,16 +6863,17 @@ mod tests {
     use crate::ida::worker::{CloseTokenGrant, WorkerBackend};
     use crate::server::{
         add_workspace_database_id_schema, add_workspace_schema, apply_close_metadata,
-        apply_task_update, call_tool_result_to_value, checked_runtime_slide, close_hint_for,
-        dsc_open_plan, is_sessionless_request_meta, materialize_task_response,
-        normalize_schema_value,
+        apply_task_update, attach_workspace_database_id, call_tool_result_to_value,
+        checked_runtime_slide, close_hint_for, dsc_open_plan, is_sessionless_request_meta,
+        materialize_task_response, normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
         run_script_truncate_chars, select_runtime_module, supported_protocol_versions, task,
         task_payload_result_value, task_state_to_detailed_task, task_state_to_mcp_task,
-        timeout_with_child_grace, tool_annotations_for, tool_params_schema, DscOpenPlan,
-        IdaMcpServer, OpenIdbBackgroundDecision, RecentOperationsRequest, ServerRuntimeState,
-        ToolCatalogRequest, ToolHelpRequest, XrefsRequest,
+        timeout_with_child_grace, tool_annotations_for, tool_params_schema,
+        workspace_close_should_remove_entry, DscOpenPlan, IdaMcpServer, OpenIdbBackgroundDecision,
+        RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest, ToolHelpRequest,
+        XrefsRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::{CallToolResponse, CallToolResult, InputResponses, ProtocolVersion};
@@ -7255,6 +7276,55 @@ mod tests {
     fn dsc_task_key_is_output_scoped_not_workspace_scoped() {
         let output = std::path::Path::new("/tmp/shared-dsc.i64");
         assert_eq!(crate::server::dsc_task_key(output), "/tmp/shared-dsc.i64");
+    }
+
+    #[test]
+    fn workspace_open_dsc_dedup_does_not_attach_a_phantom_database_id() {
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            json!({"status": "already_running", "task_id": "dsc-existing"}).to_string(),
+        )]);
+        let mut response = CallToolResponse::Complete(result);
+
+        assert!(!attach_workspace_database_id(
+            &mut response,
+            "phantom-database"
+        ));
+        let CallToolResponse::Complete(result) = response else {
+            panic!("response should remain complete");
+        };
+        let value: Value = serde_json::from_str(&tool_result_text(result))
+            .expect("dedup response should remain JSON");
+        assert!(value.get("database_id").is_none());
+    }
+
+    #[test]
+    fn workspace_open_dsc_started_task_receives_its_database_id() {
+        let result = CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+            json!({"status": "started", "task_id": "dsc-new"}).to_string(),
+        )]);
+        let mut response = CallToolResponse::Complete(result);
+
+        assert!(attach_workspace_database_id(&mut response, "new-database"));
+        let CallToolResponse::Complete(result) = response else {
+            panic!("response should remain complete");
+        };
+        let value: Value = serde_json::from_str(&tool_result_text(result))
+            .expect("started response should remain JSON");
+        assert_eq!(value["database_id"], "new-database");
+    }
+
+    #[test]
+    fn workspace_close_retains_entry_before_background_open_installs_a_lease() {
+        let result = Err(ToolError::NoDatabaseOpen);
+
+        assert!(!workspace_close_should_remove_entry(&result));
+    }
+
+    #[test]
+    fn workspace_close_removes_entry_after_teardown_consumes_its_lease() {
+        let result = Err(ToolError::DebuggerTeardown("incomplete".to_string()));
+
+        assert!(workspace_close_should_remove_entry(&result));
     }
 
     fn tool_result_text(result: CallToolResult) -> String {

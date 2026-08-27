@@ -108,6 +108,25 @@ echo "$err_msg" | grep -qi "disabled by current filter" || {
 }
 echo "   ✓ run_script returned disabled-tool error"
 
+# Unknown names must reach the router's unknown-tool path. A registry miss is
+# not evidence that the user configured a filter.
+send '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"not_a_real_tool","arguments":{}}}'
+unknown_resp=$(wait_response 30 10)
+unknown_msg=$(echo "$unknown_resp" | jq -r '.error.message // empty')
+[[ -n "$unknown_msg" ]] || {
+  echo "FAIL: expected JSON-RPC error for unknown tool, got $unknown_resp" >&2
+  exit 1
+}
+if grep -qi "disabled by current filter" <<<"$unknown_msg"; then
+  echo "FAIL: unknown tool was misreported as filter-disabled: $unknown_msg" >&2
+  exit 1
+fi
+grep -qiE "unknown|not found" <<<"$unknown_msg" || {
+  echo "FAIL: unknown tool error should identify the registry miss; got: $unknown_msg" >&2
+  exit 1
+}
+echo "   ✓ unknown tool reached the router's not-found path"
+
 # tool_catalog must report filtering_active and an enabled count.
 send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"tool_catalog","arguments":{}}}'
 cat_text=$(wait_response 4 10 | text)

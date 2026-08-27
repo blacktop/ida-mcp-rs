@@ -183,11 +183,24 @@ callgraph_response="$(wait_response 21 30)"
 assert_ok "bidirectional callgraph" "$callgraph_response"
 jq -e '
   .direction == "both"
+  and .truncated == false
   and (.nodes | length >= 2)
   and (.edges | length >= 1)
   and all(.edges[]; (.from | startswith("0x")) and (.to | startswith("0x")))
 ' >/dev/null <<<"$(result_text <<<"$callgraph_response")"
 echo "   caller/callee traversal returned normalized caller-to-callee edges"
+
+capped_callgraph_request="$(jq -cn --arg id "$first_id" --arg root "$first_address" \
+  '{jsonrpc:"2.0",id:25,method:"tools/call",params:{name:"callgraph",arguments:{database_id:$id,roots:$root,direction:"both",max_depth:2,max_nodes:1}}}')"
+send "$capped_callgraph_request"
+capped_callgraph_response="$(wait_response 25 30)"
+assert_ok "capped bidirectional callgraph" "$capped_callgraph_response"
+jq -e '
+  .truncated == true
+  and (.nodes | length == 1)
+  and (.edges | length == 0)
+' >/dev/null <<<"$(result_text <<<"$capped_callgraph_response")"
+echo "   capped callgraph reports truncation instead of looking complete"
 
 patch_request="$(jq -cn --arg id "$first_id" --arg address "$first_address" \
   '{jsonrpc:"2.0",id:22,method:"tools/call",params:{name:"patch",arguments:{database_id:$id,address:$address,bytes:"de ad"}}}')"

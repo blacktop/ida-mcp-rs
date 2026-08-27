@@ -325,6 +325,7 @@ pub fn handle_callgraph(
     let mut nodes: BTreeMap<u64, FunctionInfo> = BTreeMap::new();
     let mut edges: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
+    let mut truncated = false;
     let max_depth = max_depth.max(1);
     let max_nodes = max_nodes.max(1);
 
@@ -345,10 +346,6 @@ pub fn handle_callgraph(
         if depth >= max_depth {
             continue;
         }
-        if nodes.len() >= max_nodes {
-            break;
-        }
-
         let mut relations = Vec::new();
         if matches!(
             direction,
@@ -375,6 +372,7 @@ pub fn handle_callgraph(
         for (from, to, discovered_addr, discovered) in relations {
             if !nodes.contains_key(&discovered_addr) {
                 if nodes.len() >= max_nodes {
+                    truncated = true;
                     continue;
                 }
                 nodes.insert(discovered_addr, discovered);
@@ -397,6 +395,7 @@ pub fn handle_callgraph(
         "direction": direction.as_str(),
         "nodes": nodes_vec,
         "edges": edges_vec,
+        "truncated": truncated,
     }))
 }
 
