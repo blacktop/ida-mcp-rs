@@ -81,6 +81,14 @@ impl OpenIdbRequest {
     pub fn normalized_idb_out(&self) -> Option<String> {
         non_empty_trimmed(self.idb_out.as_deref())
     }
+
+    pub fn effective_idb_out(&self, worker_mode: bool) -> Option<String> {
+        if worker_mode {
+            non_empty_trimmed(self.worker_idb_out.as_deref()).or_else(|| self.normalized_idb_out())
+        } else {
+            self.normalized_idb_out()
+        }
+    }
 }
 
 fn non_empty_trimmed(value: Option<&str>) -> Option<String> {
@@ -162,6 +170,22 @@ mod tests {
 
         req.idb_out = Some("  ".to_string());
         assert_eq!(req.normalized_idb_out(), None);
+    }
+
+    #[test]
+    fn worker_output_path_drives_the_effective_raw_target() {
+        let mut req = open_request(None, None);
+        req.idb_out = Some("/tmp/public.i64".to_string());
+        req.worker_idb_out = Some("  /tmp/worker.i64  ".to_string());
+
+        assert_eq!(
+            req.effective_idb_out(true),
+            Some("/tmp/worker.i64".to_string())
+        );
+        assert_eq!(
+            req.effective_idb_out(false),
+            Some("/tmp/public.i64".to_string())
+        );
     }
 }
 

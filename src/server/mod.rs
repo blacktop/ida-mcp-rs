@@ -491,6 +491,10 @@ fn direct_dsc_cache_i64_path(dsc_path: &std::path::Path) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("ida-mcp-dsc-{name}-{hash:016x}.i64"))
 }
 
+fn dsc_task_key(output: &std::path::Path) -> String {
+    output.display().to_string()
+}
+
 fn validate_raw_processor(processor: &str) -> Result<(), ToolError> {
     if processor.len() > 128 || processor.chars().any(char::is_control) {
         return Err(ToolError::InvalidParams(
@@ -1641,6 +1645,16 @@ impl IdaMcpServer {
                     "Background: opening raw DSC through idalib"
                 );
                 registry.update_message(&task_id, "Opening DSC directly with idalib...");
+                if let Err(error) = remove_orphaned_dsc_output_artifacts(&idb_out) {
+                    Self::complete_background_tool_error(
+                        &task_id,
+                        &registry,
+                        &error,
+                        &cancel_token,
+                        "Cancelled while preparing the DSC output",
+                    );
+                    return;
+                }
                 (open_path, Some(idb_out), false, true)
             }
             DscBackgroundOpen::LegacyIdat {
@@ -1651,6 +1665,17 @@ impl IdaMcpServer {
                 out_i64,
             } => {
                 let mut script_cleanup = TemporaryFileCleanup::new(script_path);
+
+                if let Err(error) = remove_orphaned_dsc_output_artifacts(&out_i64) {
+                    Self::complete_background_tool_error(
+                        &task_id,
+                        &registry,
+                        &error,
+                        &cancel_token,
+                        "Cancelled while preparing the DSC output",
+                    );
+                    return;
+                }
 
                 // Phase 1: run idat subprocess
                 info!("Background: running idat");
@@ -2139,6 +2164,47 @@ fn remove_partial_idat_outputs(out_i64: &std::path::Path) {
     }
 }
 
+/// Remove non-primary artifacts left by an interrupted DSC generation after
+/// proving no other ida-mcp process owns the output lock. A packed `.i64` or
+/// unpacked `.id0` is never removed here; open_dsc will try to preserve it.
+fn remove_orphaned_dsc_output_artifacts(out_i64: &std::path::Path) -> Result<(), ToolError> {
+    if crate::ida::handlers::database::ida_database_output_exists(out_i64) {
+        return Err(ToolError::DatabaseLocked(format!(
+            "{} appeared while preparing DSC generation; retry open_dsc to reuse it",
+            out_i64.display()
+        )));
+    }
+    let lock = crate::ida::lock::acquire_mcp_lock(out_i64)?;
+    if crate::ida::handlers::database::ida_database_output_exists(out_i64) {
+        crate::ida::lock::release_mcp_lock_file(lock);
+        return Err(ToolError::DatabaseLocked(format!(
+            "{} appeared while preparing DSC generation; retry open_dsc to reuse it",
+            out_i64.display()
+        )));
+    }
+    let mut paths = Vec::new();
+    for extension in ["id1", "id2", "nam", "til"] {
+        let mut path = out_i64.to_path_buf();
+        path.set_extension(extension);
+        paths.push(path);
+    }
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(path = %path.display(), "removed orphaned DSC database artifact"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                crate::ida::lock::release_mcp_lock_file(lock);
+                return Err(ToolError::OpenFailed(format!(
+                    "failed to remove orphaned DSC database artifact {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    crate::ida::lock::release_mcp_lock_file(lock);
+    Ok(())
+}
+
 /// Insert close-ownership metadata onto a tool result, identical for foreground
 /// `open_idb` and the DSC background task so clients see one shape via both
 /// paths.
@@ -2269,14 +2335,14 @@ impl IdaMcpServer {
             Ok(value) => value,
             Err(error) => return Ok(error.to_tool_result().into()),
         };
-        let public_idb_out = req.normalized_idb_out();
+        let idb_out = req.effective_idb_out(matches!(self.mode, ServerMode::Worker));
         let raw_target = RawBinaryTarget {
             processor,
             bitness,
             base_address,
             entry_point,
         };
-        if input_is_database && (public_idb_out.is_some() || !raw_target.is_empty()) {
+        if input_is_database && (idb_out.is_some() || !raw_target.is_empty()) {
             return Ok(ToolError::InvalidParams(
                 "processor, bitness, base_address, entry_point, and idb_out are only valid when opening a raw input"
                     .to_string(),
@@ -2286,7 +2352,7 @@ impl IdaMcpServer {
         }
         if !raw_target.is_empty()
             && !req.rebuild.unwrap_or(false)
-            && raw_blob_idb_path(&path, public_idb_out.as_deref()).exists()
+            && raw_blob_idb_path(&path, idb_out.as_deref()).exists()
         {
             return Ok(ToolError::InvalidParams(
                 "raw target options only affect a newly-created database; the output already exists. Set rebuild=true to recreate it, or omit processor/bitness/base_address/entry_point to reuse the verified database."
@@ -2299,11 +2365,6 @@ impl IdaMcpServer {
             req.worker_extra_args.clone()
         } else {
             Vec::new()
-        };
-        let idb_out = if matches!(self.mode, ServerMode::Worker) {
-            req.worker_idb_out.clone().or(public_idb_out)
-        } else {
-            public_idb_out
         };
         let open_timeout_secs = timeout_secs.unwrap_or(300).min(MAX_TIMEOUT_SECS);
         let foreground_timeout_secs = self.foreground_timeout_secs(timeout_secs, 300);
@@ -5402,14 +5463,15 @@ impl IdaMcpServer {
         // cache — those databases were written by a newer IDA and cannot be
         // opened there.
         let cache_i64 = direct_dsc_cache_i64_path(dsc_path);
-        let existing_i64 = if out_i64.exists() {
+        let existing_i64 = if crate::ida::handlers::database::ida_database_output_exists(&out_i64) {
             Some(out_i64.clone())
-        } else if idalib::SDK_VERSION >= (9, 4) && cache_i64.exists() {
+        } else if idalib::SDK_VERSION >= (9, 4)
+            && crate::ida::handlers::database::ida_database_output_exists(&cache_i64)
+        {
             Some(cache_i64.clone())
         } else {
             None
         };
-
         match dsc_open_plan(idalib::SDK_VERSION, existing_i64.is_some()) {
             // Existing .i64 databases are already in IDA's database format.
             DscOpenPlan::DirectExistingI64 => {
@@ -5439,7 +5501,7 @@ impl IdaMcpServer {
                 };
                 return self.start_dsc_background(
                     &self.task_owner(&ctx.meta),
-                    self.workspace_task_key(&dsc_path.display().to_string()),
+                    dsc_task_key(&idb_out),
                     &format!(
                         "Opening DSC directly with idalib (idb_out={})...",
                         idb_out.display()
@@ -5484,7 +5546,7 @@ impl IdaMcpServer {
             &file_type,
             log_path.as_deref(),
         );
-        let dedup_key = self.workspace_task_key(&out_i64.display().to_string());
+        let dedup_key = dsc_task_key(&out_i64);
 
         let dsc_ctx = DscBackgroundCtx {
             open: DscBackgroundOpen::LegacyIdat {
@@ -7189,6 +7251,12 @@ mod tests {
         assert!(name.ends_with(".i64"));
     }
 
+    #[test]
+    fn dsc_task_key_is_output_scoped_not_workspace_scoped() {
+        let output = std::path::Path::new("/tmp/shared-dsc.i64");
+        assert_eq!(crate::server::dsc_task_key(output), "/tmp/shared-dsc.i64");
+    }
+
     fn tool_result_text(result: CallToolResult) -> String {
         result
             .content
@@ -8138,6 +8206,31 @@ mod tests {
         assert!(!unpacked.exists(), "unpacked component must be removed");
         assert!(unrelated.exists(), "unrelated files must be untouched");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orphaned_dsc_cleanup_preserves_primary_databases() {
+        let dir =
+            std::env::temp_dir().join(format!("ida-mcp-orphaned-dsc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp directory");
+        let out_i64 = dir.join("cache.i64");
+        let id1 = dir.join("cache.id1");
+        std::fs::write(&id1, b"partial").expect("write orphaned sidecar");
+
+        crate::server::remove_orphaned_dsc_output_artifacts(&out_i64)
+            .expect("remove orphaned sidecars");
+        assert!(!id1.exists());
+
+        std::fs::write(&out_i64, b"primary").expect("write primary database");
+        std::fs::write(&id1, b"analysis").expect("write associated sidecar");
+        assert!(matches!(
+            crate::server::remove_orphaned_dsc_output_artifacts(&out_i64),
+            Err(ToolError::DatabaseLocked(_))
+        ));
+        assert!(out_i64.exists());
+        assert!(id1.exists());
+
+        std::fs::remove_dir_all(dir).expect("remove temp directory");
     }
 
     fn create_sparse_test_file(name: &str, len: u64) -> std::io::Result<std::path::PathBuf> {

@@ -269,6 +269,24 @@ impl DebuggerRuntime {
             self.stop_helper();
             return Ok(());
         };
+        // An externally exited target can leave our ownership tag stale. IDA's
+        // NoProcess state is an affirmative observation that no debuggee is
+        // attached, so database closure is safe without inventing a terminal
+        // event. Never infer this state merely from a teardown error.
+        if self.session.is_some()
+            && matches!(
+                database.debugger_process_state(),
+                DebuggerProcessState::NoProcess
+            )
+        {
+            self.session = None;
+            self.backend_loaded = false;
+            self.stop_helper();
+            return Ok(());
+        }
+        // Preserve the session kind until IDA confirms the terminal event.
+        // Clearing it on an inconclusive teardown would make a later close
+        // appear successful and allow the database to be reused unsafely.
         match self.session {
             Some(DebugSessionKind::Launched) => database.debugger_terminate(5),
             Some(DebugSessionKind::Attached) => database.debugger_detach(5),
@@ -505,16 +523,30 @@ fn debugger_error(error: idalib::IDAError) -> ToolError {
 }
 
 fn macos_authorization_failure(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    [
-        "authorization",
-        "cancelled",
-        "canceled",
-        "task_for_pid",
-        "take control",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
+    let message = message.trim().to_ascii_lowercase();
+    if message.contains("task_for_pid") || message.contains("take control") {
+        return true;
+    }
+
+    let authorization_outcome = message.contains("denied")
+        || message.contains("failed")
+        || message.contains("required")
+        || message.contains("cancelled")
+        || message.contains("canceled");
+    if message.contains("authorization") && authorization_outcome {
+        return true;
+    }
+
+    // IDA's signed macOS helper reports a dismissed Take Control prompt with
+    // one of these exact operation-level messages. Do not substring-match
+    // generic cancellation text from transports, targets, or scripts.
+    matches!(
+        message.as_str(),
+        "debug launch was cancelled"
+            | "debug launch was canceled"
+            | "debug attach was cancelled"
+            | "debug attach was canceled"
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -587,6 +619,10 @@ mod tests {
         assert!(!macos_authorization_failure(
             "remote debugger protocol mismatch"
         ));
+        assert!(!macos_authorization_failure(
+            "debug launch canceled because the remote transport disconnected"
+        ));
+        assert!(macos_authorization_failure("debug launch was cancelled"));
     }
 
     #[cfg(target_os = "macos")]

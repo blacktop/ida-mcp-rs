@@ -105,7 +105,7 @@ fn database_artifact_paths(output: &Path) -> Vec<PathBuf> {
     candidates
 }
 
-fn ida_database_output_exists(output: &Path) -> bool {
+pub(crate) fn ida_database_output_exists(output: &Path) -> bool {
     output.exists()
         || unpacked_id0_path(output)
             .as_deref()
@@ -433,7 +433,10 @@ pub fn handle_open(
     }
 
     // Check file exists
-    if !expanded.exists() {
+    // A packed database can legitimately be absent while its unpacked `.id0`
+    // form exists. `open_existing_idb` already knows how to fall back to that
+    // path, so keep the fallback reachable from direct `.i64`/`.idb` opens.
+    if !ida_database_output_exists(&expanded) {
         return Err(ToolError::InvalidPath(format!(
             "File not found: {}",
             expanded.display()
@@ -509,12 +512,19 @@ pub fn handle_open(
     let mcp_lock = acquire_mcp_lock(lock_target_path)?;
 
     let init_args = init_database_args(extra_args);
-    let mut existing_raw_idb_path = None;
+    let mut existing_raw_idb = None;
     if let Some(candidate_path) = existing_raw_idb_candidate.as_ref() {
-        let (candidate, _) = match open_existing_idb(candidate_path, &init_args, false) {
+        let (mut candidate, opened_candidate_path) = match open_existing_idb(
+            candidate_path,
+            &init_args,
+            false,
+        ) {
             Ok(candidate) => candidate,
             Err(error) => {
                 release_mcp_lock_file(mcp_lock);
+                if let Some(lock_message) = detect_db_lock(candidate_path, &error) {
+                    return Err(ToolError::DatabaseLocked(lock_message));
+                }
                 return Err(ToolError::OpenFailed(format!(
                     "refusing to reuse or overwrite {} because its input provenance could not be read: {error}",
                     candidate_path.display()
@@ -523,14 +533,15 @@ pub fn handle_open(
         };
         let recorded_hash = candidate.meta().input_file_sha256();
         let recorded_path = candidate.meta().input_file_path();
-        drop(candidate);
         if let Err(error) = ensure_not_cancelled(cancel.as_ref()) {
+            drop(candidate);
             release_mcp_lock_file(mcp_lock);
             return Err(error);
         }
         let input_hash = match sha256_file(&expanded) {
             Ok(hash) => hash,
             Err(error) => {
+                drop(candidate);
                 release_mcp_lock_file(mcp_lock);
                 return Err(error);
             }
@@ -545,9 +556,11 @@ pub fn handle_open(
                     auto_analyse,
                     "Reusing SHA-256-verified IDA database for raw input"
                 );
-                existing_raw_idb_path = Some(candidate_path.clone());
+                candidate.save_on_close(true);
+                existing_raw_idb = Some((candidate, opened_candidate_path));
             }
             Some(ExistingRawIdbAction::Rebuild) => {
+                drop(candidate);
                 warn!(
                     input = %expanded.display(),
                     idb = %candidate_path.display(),
@@ -558,17 +571,18 @@ pub fn handle_open(
                 );
             }
             None => {
+                drop(candidate);
                 release_mcp_lock_file(mcp_lock);
                 let recorded_hash_available = recorded_hash.iter().any(|byte| *byte != 0);
                 let message = if !rebuild && path_matches {
                     if recorded_hash_available {
                         format!(
-                            "{} was created from this input path, but its recorded SHA-256 does not match the current file; retry with rebuild=true to replace stale analysis",
+                            "{} was created from this input path, but its recorded SHA-256 does not match the current file; open that database path directly to preserve its analysis, choose a different idb_out, or retry with rebuild=true to replace stale analysis",
                             candidate_path.display()
                         )
                     } else {
                         format!(
-                            "{} has no recorded input SHA-256 and cannot be reused automatically; retry with rebuild=true to replace it because its recorded input path matches",
+                            "{} has no recorded input SHA-256 and cannot be reused automatically; open that database path directly to preserve its analysis, choose a different idb_out, or retry with rebuild=true to replace it because its recorded input path matches",
                             candidate_path.display()
                         )
                     }
@@ -590,7 +604,7 @@ pub fn handle_open(
     // operation fails, leaving its partially-written output behind would make
     // a later call treat an incomplete database as reusable. Reopening a
     // verified existing database does not take ownership of its artifacts.
-    let created_raw_database = !is_idb && existing_raw_idb_path.is_none();
+    let created_raw_database = !is_idb && existing_raw_idb.is_none();
 
     // Open database
     let path_display = expanded.display().to_string();
@@ -612,7 +626,7 @@ pub fn handle_open(
     });
 
     let open_start = Instant::now();
-    let open_existing_database = is_idb || existing_raw_idb_path.is_some();
+    let open_existing_database = is_idb || existing_raw_idb.is_some();
     let open_message = if open_existing_database {
         "Opening existing IDA database"
     } else if auto_analyse {
@@ -628,12 +642,13 @@ pub fn handle_open(
         Some(OPEN_IDB_PROGRESS_TOTAL),
         open_message,
     );
-    let db_path_to_open = existing_raw_idb_path.as_ref().unwrap_or(&expanded);
-    let (db, opened_path) = if open_existing_database {
+    let (db, opened_path) = if let Some((database, opened_path)) = existing_raw_idb.take() {
+        (Ok(database), opened_path)
+    } else if is_idb {
         // Open existing IDA database (no auto-analysis needed, but save=true to pack on close)
-        match open_existing_idb(db_path_to_open, &init_args, true) {
+        match open_existing_idb(&expanded, &init_args, true) {
             Ok((database, opened_path)) => (Ok(database), opened_path),
-            Err(error) => (Err(error), db_path_to_open.clone()),
+            Err(error) => (Err(error), expanded.clone()),
         }
     } else {
         // Raw binary - open with auto-analysis and save to .i64

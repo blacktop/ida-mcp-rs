@@ -4,9 +4,11 @@ set -euo pipefail
 
 BIN="${MCP_STDIO_BIN:-${SERVER_BIN:-../target/debug/ida-mcp}}"
 FIXTURE="${WORKSPACE_FIXTURE:-fixtures/mini.i64}"
+RAW_FIXTURE="${WORKSPACE_RAW_FIXTURE:-${FIXTURE%.i64}}"
 
 [[ -x "$BIN" ]] || { echo "missing server binary: $BIN" >&2; exit 1; }
 [[ -f "$FIXTURE" ]] || { echo "missing workspace fixture: $FIXTURE" >&2; exit 1; }
+[[ -f "$RAW_FIXTURE" ]] || { echo "missing workspace raw fixture: $RAW_FIXTURE" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "jq is required for workspace test" >&2; exit 1; }
 
 tmpdir="$(mktemp -d)"
@@ -235,4 +237,26 @@ send "$close_second"
 assert_ok "close second database" "$(wait_response 13 30)"
 
 echo "   close invalidated only the selected handle"
+
+# The fixture's sibling mini.i64 deliberately exists. With an explicit output,
+# the parent and pooled child must both precheck that requested output rather
+# than falsely rejecting the open because the unrelated sibling exists.
+raw_output="$tmpdir/explicit-raw-output.i64"
+raw_open="$(jq -cn --arg path "$RAW_FIXTURE" --arg output "$raw_output" \
+  '{jsonrpc:"2.0",id:14,method:"tools/call",params:{name:"open_idb",arguments:{path:$path,idb_out:$output,processor:"arm:ARMv8-A",auto_analyse:false}}}')"
+send "$raw_open"
+raw_response="$(wait_response 14 120)"
+assert_ok "workspace raw open with explicit output" "$raw_response"
+raw_text="$(result_text <<<"$raw_response")"
+raw_id="$(jq -r '.database_id // empty' <<<"$raw_text")"
+jq -e --arg output "$raw_output" '.path == $output' >/dev/null <<<"$raw_text"
+[[ -n "$raw_id" ]] || { echo "raw workspace open did not return a database_id" >&2; exit 1; }
+
+close_raw="$(jq -cn --arg id "$raw_id" \
+  '{jsonrpc:"2.0",id:15,method:"tools/call",params:{name:"close_idb",arguments:{database_id:$id}}}')"
+send "$close_raw"
+assert_ok "close raw workspace database" "$(wait_response 15 30)"
+[[ -f "$raw_output" ]] || { echo "explicit raw output was not materialized" >&2; exit 1; }
+echo "   pooled raw-target precheck honored the explicit output path"
+
 echo "workspace stdio integration passed"

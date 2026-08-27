@@ -25,9 +25,14 @@ fifo="$tmpdir/in.fifo"
 stdout_log="$tmpdir/server.out"
 stderr_log="$tmpdir/server.err"
 server_pid=""
+debuggee_pid=""
+source_closed=0
 
 cleanup() {
   { exec 3>&-; } 2>/dev/null || true
+  if [[ -n "${debuggee_pid:-}" ]]; then
+    kill -KILL "$debuggee_pid" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${server_pid:-}" ]]; then
     kill "$server_pid" >/dev/null 2>&1 || true
     wait "$server_pid" >/dev/null 2>&1 || true
@@ -37,7 +42,10 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cp "$FIXTURE_IDB" "$tmpdir/debugger.i64"
-fixture_path="$(cd "$(dirname "$FIXTURE")" && pwd)/$(basename "$FIXTURE")"
+fixture_path="$(cd "$(dirname "$FIXTURE")" && pwd -P)/$(basename "$FIXTURE")"
+cp "$FIXTURE" "$tmpdir/external-debuggee"
+chmod 0755 "$tmpdir/external-debuggee"
+external_fixture_path="$(cd "$tmpdir" && pwd -P)/external-debuggee"
 mkfifo "$fifo"
 RUST_LOG="${RUST_LOG:-ida_mcp=info}" "$BIN" --workspace --workspace-max-workers 2 \
   --enable-debugger \
@@ -59,6 +67,11 @@ assert_ok() {
 
 result_text() {
   jq -r '.result.content[0].text // empty'
+}
+
+find_debuggee_pid() {
+  ps -axo pid=,command= 2>/dev/null \
+    | awk -v target="$external_fixture_path" '$2 == target { print $1; exit }'
 }
 
 wait_response() {
@@ -180,7 +193,34 @@ case "$launch_status" in
       echo "closing the runtime module database did not materialize the requested IDB output" >&2
       exit 1
     }
-    echo "   debugger launch, module-to-IDB open, symbol resolution, and terminal stop passed"
+
+    external_launch_request="$(jq -cn --arg id "$source_id" --arg path "$external_fixture_path" \
+      '{jsonrpc:"2.0",id:12,method:"tools/call",params:{name:"debug_launch",arguments:{database_id:$id,path:$path,timeout_secs:10}}}')"
+    send "$external_launch_request"
+    external_launch_response="$(wait_response 12 30)"
+    assert_ok "launch target for external-exit recovery" "$external_launch_response"
+    jq -e '.status == "ready"' >/dev/null \
+      <<<"$(result_text <<<"$external_launch_response")"
+
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      debuggee_pid="$(find_debuggee_pid || true)"
+      [[ -n "$debuggee_pid" ]] && break
+      sleep 0.1
+    done
+    [[ -n "$debuggee_pid" ]] || {
+      echo "could not identify the uniquely-copied debuggee process" >&2
+      exit 1
+    }
+    kill -KILL "$debuggee_pid"
+    sleep 1
+
+    close_source_after_kill="$(jq -cn --arg id "$source_id" \
+      '{jsonrpc:"2.0",id:13,method:"tools/call",params:{name:"close_idb",arguments:{database_id:$id}}}')"
+    send "$close_source_after_kill"
+    assert_ok "close debugger database after external target exit" "$(wait_response 13 30)"
+    source_closed=1
+    debuggee_pid=""
+    echo "   debugger launch, module-to-IDB open, terminal stop, and external-exit recovery passed"
     ;;
   user_action_required)
     jq -e '.message | contains("Take Control")' >/dev/null \
@@ -195,10 +235,12 @@ case "$launch_status" in
     ;;
 esac
 
-close_source_request="$(jq -cn --arg id "$source_id" \
-  '{jsonrpc:"2.0",id:10,method:"tools/call",params:{name:"close_idb",arguments:{database_id:$id}}}')"
-send "$close_source_request"
-assert_ok "close debugger database" "$(wait_response 10 30)"
+if [[ "$source_closed" == "0" ]]; then
+  close_source_request="$(jq -cn --arg id "$source_id" \
+    '{jsonrpc:"2.0",id:10,method:"tools/call",params:{name:"close_idb",arguments:{database_id:$id}}}')"
+  send "$close_source_request"
+  assert_ok "close debugger database" "$(wait_response 10 30)"
+fi
 if [[ "$REQUIRE_READY" == "1" && "$ready" != "1" ]]; then
   echo "debugger live integration requires an authorized ready lifecycle" >&2
   exit 1

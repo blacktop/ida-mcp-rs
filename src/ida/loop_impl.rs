@@ -605,13 +605,10 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     continue;
                 }
                 info!(path = %path, force, rebuild, file_type = ?file_type, auto_analyse, "Opening database");
-                if idb.is_some()
-                    && let Err(error) = debugger_runtime.close_session(&idb)
-                {
-                    error!(path = %path, error = %error, "Refusing to replace database while debugger teardown is incomplete");
-                    let _ = resp.send(Err(error));
-                    continue;
-                }
+                // `handle_open` never replaces an open database: the same
+                // path is a no-op and a different path returns
+                // DatabaseAlreadyOpen. Debugger teardown therefore belongs to
+                // close_idb, not an Open request that cannot mutate the IDB.
                 let had_open_database = idb.is_some();
                 let result = database::handle_open(
                     &mut idb,

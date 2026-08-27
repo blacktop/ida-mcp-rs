@@ -354,7 +354,7 @@ pub fn handle_callgraph(
             direction,
             CallGraphDirection::Callees | CallGraphDirection::Both
         ) {
-            for callee in handle_callees(idb, cur_addr)? {
+            for callee in callgraph_frontier(handle_callees(idb, cur_addr))? {
                 if let Ok(target_addr) = parse_address_str(&callee.address) {
                     relations.push((cur_addr, target_addr, target_addr, callee));
                 }
@@ -364,7 +364,7 @@ pub fn handle_callgraph(
             direction,
             CallGraphDirection::Callers | CallGraphDirection::Both
         ) {
-            for caller in handle_callers(idb, cur_addr)? {
+            for caller in callgraph_frontier(handle_callers(idb, cur_addr))? {
                 if let Ok(caller_addr) = parse_address_str(&caller.address) {
                     relations.push((caller_addr, cur_addr, caller_addr, caller));
                 }
@@ -400,9 +400,22 @@ pub fn handle_callgraph(
     }))
 }
 
+/// Imported symbols and extern stubs can be graph nodes without being IDA
+/// functions. They are valid leaves, but every other expansion error remains
+/// actionable and must reach the caller.
+fn callgraph_frontier(
+    result: Result<Vec<FunctionInfo>, ToolError>,
+) -> Result<Vec<FunctionInfo>, ToolError> {
+    match result {
+        Err(ToolError::FunctionNotFound(_)) => Ok(Vec::new()),
+        result => result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::ida::handlers::controlflow::is_direct_branch_operand;
+    use crate::error::ToolError;
+    use crate::ida::handlers::controlflow::{callgraph_frontier, is_direct_branch_operand};
     use crate::ida::types::CallGraphDirection;
     use idalib::insn::OperandType;
 
@@ -440,5 +453,16 @@ mod tests {
             Ok(CallGraphDirection::Both)
         );
         assert!(CallGraphDirection::parse(Some("sideways")).is_err());
+    }
+
+    #[test]
+    fn callgraph_treats_non_function_frontier_nodes_as_leaves() {
+        assert!(callgraph_frontier(Err(ToolError::FunctionNotFound(0x1000)))
+            .expect("non-function frontier should be a leaf")
+            .is_empty());
+        assert!(matches!(
+            callgraph_frontier(Err(ToolError::NoDatabaseOpen)),
+            Err(ToolError::NoDatabaseOpen)
+        ));
     }
 }
