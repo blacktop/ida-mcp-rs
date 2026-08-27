@@ -35,6 +35,9 @@ pub const READ_ONLY_DENY_LIST: &[&str] = &[
     "dsc_add_dylib",
     "dsc_add_region",
     "analyze_funcs",
+    "debug_launch",
+    "debug_attach",
+    "debug_stop",
 ];
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -56,6 +59,7 @@ pub struct ToolFilter {
     /// True when *any* user input narrowed the set (used by tool_catalog
     /// to surface the `filtering_active` field).
     is_active: bool,
+    debugger_enabled: bool,
 }
 
 impl ToolFilter {
@@ -117,6 +121,7 @@ impl ToolFilter {
         Ok(Self {
             enabled,
             is_active: any_input,
+            debugger_enabled: false,
         })
     }
 
@@ -126,11 +131,23 @@ impl ToolFilter {
         Self {
             enabled: tool_registry::all_tools().map(|t| t.name).collect(),
             is_active: false,
+            debugger_enabled: false,
         }
+    }
+
+    pub fn with_debugger_enabled(mut self, requested: bool) -> Result<Self, ToolFilterError> {
+        self.debugger_enabled =
+            requested && cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        if self.enabled_count() == 0 {
+            return Err(ToolFilterError::EmptyFinalSet);
+        }
+        Ok(self)
     }
 
     pub fn is_enabled(&self, name: &str) -> bool {
         self.enabled.contains(name)
+            && tool_registry::get_tool(name)
+                .is_some_and(|tool| !tool.requirements.debugger || self.debugger_enabled)
     }
 
     pub fn is_active(&self) -> bool {
@@ -138,7 +155,10 @@ impl ToolFilter {
     }
 
     pub fn enabled_count(&self) -> usize {
-        self.enabled.len()
+        self.enabled
+            .iter()
+            .filter(|name| self.is_enabled(name))
+            .count()
     }
 }
 
@@ -168,7 +188,52 @@ mod tests {
         assert!(f.is_enabled("decompile"));
         assert!(f.is_enabled("run_script"));
         assert!(f.is_enabled("patch"));
-        assert_eq!(f.enabled_count(), tool_registry::all_tools().count());
+        assert!(!f.is_enabled("debug_status"));
+        assert_eq!(
+            f.enabled_count(),
+            tool_registry::all_tools()
+                .filter(|tool| !tool.requirements.debugger)
+                .count()
+        );
+    }
+
+    #[test]
+    fn debugger_tools_require_explicit_platform_gate() {
+        let disabled = ToolFilter::from_inputs(&[], &[], &[], false)
+            .unwrap()
+            .with_debugger_enabled(false)
+            .unwrap();
+        assert!(!disabled.is_enabled("debug_status"));
+        assert!(disabled.is_enabled("open_idb"));
+
+        let requested = ToolFilter::from_inputs(&[], &[], &[], false)
+            .unwrap()
+            .with_debugger_enabled(true)
+            .unwrap();
+        assert_eq!(
+            requested.is_enabled("debug_status"),
+            cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        );
+    }
+
+    #[test]
+    fn read_only_removes_debugger_process_control() {
+        let filter = ToolFilter::from_inputs(&[], &[], &[], true)
+            .expect("read-only filter")
+            .with_debugger_enabled(true)
+            .expect("debugger gate");
+
+        assert!(!filter.is_enabled("debug_launch"));
+        assert!(!filter.is_enabled("debug_attach"));
+        assert!(!filter.is_enabled("debug_stop"));
+        assert_eq!(
+            filter.is_enabled("debug_status"),
+            cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        );
+        assert_eq!(
+            filter.is_enabled("debug_modules"),
+            cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        );
     }
 
     #[test]

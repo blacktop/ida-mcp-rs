@@ -1164,6 +1164,77 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         default: false,
         keywords: &["rename", "symbol", "edit"],
     },
+    // === DEBUGGER (explicit --enable-debugger opt-in) ===
+    ToolInfo {
+        name: "debug_status",
+        category: ToolCategory::Debug,
+        scope: ToolScope::Runtime,
+        requirements: ToolRequirements::DEBUGGER,
+        short_desc: "Report debugger backend and authorization readiness",
+        full_desc: "Report whether headless debugger support is ready, requires a supported user authorization action, or is unavailable. On macOS ida-mcp uses IDA's signed loopback helper and never requests root, disables SIP, changes authorizationdb, or re-signs binaries.",
+        example: r#"{}"#,
+        default: false,
+        keywords: &["debugger", "status", "availability", "authorization", "backend"],
+    },
+    ToolInfo {
+        name: "debug_launch",
+        category: ToolCategory::Debug,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::DEBUGGER,
+        short_desc: "Launch and suspend a local debug target",
+        full_desc: "Launch an executable through IDA's native debugger backend and wait for the initial suspended event. Requires an open database and explicit server startup with --enable-debugger.",
+        example: r#"{"path":"/absolute/path/to/program","arguments":"--help","timeout_secs":30}"#,
+        default: false,
+        keywords: &["debugger", "launch", "process", "suspend", "runtime"],
+    },
+    ToolInfo {
+        name: "debug_attach",
+        category: ToolCategory::Debug,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::DEBUGGER,
+        short_desc: "Attach and suspend a local process",
+        full_desc: "Attach IDA's native debugger to a positive operating-system process ID. Platform policy may require an explicit user authorization action.",
+        example: r#"{"pid":1234,"timeout_secs":30}"#,
+        default: false,
+        keywords: &["debugger", "attach", "pid", "process", "suspend"],
+    },
+    ToolInfo {
+        name: "debug_modules",
+        category: ToolCategory::Debug,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::DEBUGGER,
+        short_desc: "List runtime modules from the suspended debuggee",
+        full_desc: "List modules loaded in the active debuggee with runtime base, end, size, and IDA rebase target. The process must already be launched or attached.",
+        example: r#"{}"#,
+        default: false,
+        keywords: &["debugger", "modules", "images", "libraries", "runtime", "base"],
+    },
+    ToolInfo {
+        name: "debug_stop",
+        category: ToolCategory::Debug,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::DEBUGGER,
+        short_desc: "Detach or terminate the active debug target",
+        full_desc: "Stop the active debug session. action=auto terminates targets launched by ida-mcp and detaches targets it attached; detach and terminate are available as explicit overrides.",
+        example: r#"{"action":"auto","timeout_secs":10}"#,
+        default: false,
+        keywords: &["debugger", "stop", "detach", "terminate", "process"],
+    },
+    ToolInfo {
+        name: "debug_open_module",
+        category: ToolCategory::Debug,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements {
+            workspace: true,
+            debugger: true,
+            experimental: false,
+        },
+        short_desc: "Open a runtime module in a separate workspace database",
+        full_desc: "Resolve a module from debug_modules and open its on-disk image in a newly allocated workspace database. idb_out is always required because runtime modules commonly live in read-only system directories. Returns the new database_id and a checked runtime slide; it does not replace the active debug database.",
+        example: r#"{"database_id":"source UUID","module":"/usr/lib/libobjc.A.dylib","idb_out":"/tmp/libobjc.i64"}"#,
+        default: false,
+        keywords: &["debugger", "module", "open", "workspace", "slide", "database"],
+    },
     // === SCRIPTING ===
     ToolInfo {
         name: "run_script",
@@ -1282,6 +1353,8 @@ pub fn search_tools(query: &str, limit: usize) -> Vec<(&'static ToolInfo, Vec<&'
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use crate::tool_registry::*;
 
     #[test]
@@ -1305,5 +1378,41 @@ mod tests {
     fn test_get_tool() {
         assert!(get_tool("disasm").is_some());
         assert!(get_tool("nonexistent").is_none());
+    }
+
+    #[test]
+    fn registry_names_are_unique_and_contracts_are_explicit() {
+        let mut names = HashSet::new();
+        for tool in all_tools() {
+            assert!(names.insert(tool.name), "duplicate tool: {}", tool.name);
+            if tool.category == ToolCategory::Debug {
+                assert!(tool.requirements.debugger);
+                assert!(!tool.requirements.experimental);
+                assert_eq!(
+                    tool.requirements.workspace,
+                    tool.name == "debug_open_module"
+                );
+            } else {
+                assert_eq!(tool.requirements, ToolRequirements::BASELINE);
+            }
+        }
+
+        let runtime_tools: HashSet<_> = all_tools()
+            .filter(|tool| tool.scope == ToolScope::Runtime)
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(
+            runtime_tools,
+            HashSet::from([
+                "open_idb",
+                "open_dsc",
+                "tool_catalog",
+                "tool_help",
+                "recent_operations",
+                "task_status",
+                "int_convert",
+                "debug_status",
+            ])
+        );
     }
 }

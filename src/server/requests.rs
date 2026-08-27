@@ -190,6 +190,63 @@ pub struct LoadDebugInfoRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct DebugLaunchRequest {
+    #[schemars(description = "Absolute path to the executable to launch. No shell is used.")]
+    pub path: String,
+    #[schemars(description = "Optional debugger command-line string passed directly to IDA.")]
+    pub arguments: Option<String>,
+    #[schemars(description = "Optional absolute working directory for the debuggee.")]
+    pub start_directory: Option<String>,
+    #[schemars(
+        description = "Seconds to wait for the initial suspended event (default: 30, max: 120)."
+    )]
+    #[schemars(range(min = 1, max = 120))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DebugAttachRequest {
+    #[schemars(description = "Positive operating-system process ID to attach.")]
+    #[schemars(range(min = 1, max = 4294967295_i64))]
+    pub pid: i64,
+    #[schemars(
+        description = "Seconds to wait for the initial suspended event (default: 30, max: 120)."
+    )]
+    #[schemars(range(min = 1, max = 120))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DebugStopRequest {
+    #[schemars(
+        description = "Stop policy: auto, detach, or terminate. auto terminates launched targets and detaches attached targets."
+    )]
+    pub action: Option<String>,
+    #[schemars(description = "Seconds to wait for the stop event (default: 10, max: 120).")]
+    #[schemars(range(min = 1, max = 120))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DebugOpenModuleRequest {
+    #[schemars(
+        description = "Exact runtime module path, or an unambiguous module basename returned by debug_modules."
+    )]
+    pub module: String,
+    #[schemars(
+        description = "Required output .i64/.idb path. Runtime modules commonly live in read-only system directories, so no implicit sibling output is allowed."
+    )]
+    pub idb_out: String,
+    #[schemars(
+        description = "Rebuild a provenance-matched existing output database (default: false)."
+    )]
+    pub rebuild: Option<bool>,
+    #[schemars(description = "Open timeout in seconds (default: 300, max: 600).")]
+    #[schemars(range(min = 1, max = 600))]
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct EmptyParams {}
 
 #[derive(Debug, Deserialize, JsonSchema)]

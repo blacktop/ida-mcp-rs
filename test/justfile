@@ -464,6 +464,18 @@ test-workspace: test-bootstrap
         MCP_HTTP_BIN="{{ server_bin }}" WORKSPACE_FIXTURE="{{ test_i64 }}" \
         bash ./http_workspace.sh
 
+# Verify debugger opt-in advertisement/status without launching a target.
+test-debugger:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SERVER_BIN="{{ server_bin }}" bash ./debugger_integration.sh
+
+# Exercise the real signed-helper launch path using the local fixture.
+test-debugger-live: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SERVER_BIN="{{ server_bin }}" bash ./debugger_live.sh
+
 # Run open_idb rebuild semantics test (Cases C and D from the rebuild=bool patch)
 # Phase 1 seeds a tmpdir .i64 with a renamed function via the raw-input path,
 # Phase 2 re-opens the raw path and asserts the rename survives (reuse),

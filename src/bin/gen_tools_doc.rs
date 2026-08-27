@@ -24,11 +24,7 @@ fn category_title(cat: ToolCategory) -> &'static str {
 fn is_headless_unsupported(cat: ToolCategory) -> bool {
     matches!(
         cat,
-        ToolCategory::Types
-            | ToolCategory::Editing
-            | ToolCategory::Debug
-            | ToolCategory::Ui
-            | ToolCategory::Scripting
+        ToolCategory::Types | ToolCategory::Editing | ToolCategory::Ui | ToolCategory::Scripting
     )
 }
 
@@ -48,6 +44,10 @@ fn main() {
     }
 
     let tool_count = TOOL_REGISTRY.len();
+    let baseline_tool_count = TOOL_REGISTRY
+        .iter()
+        .filter(|tool| !tool.requirements.debugger)
+        .count();
 
     let mut out = String::new();
     let _ = writeln!(out, "# Tools\n");
@@ -55,15 +55,12 @@ fn main() {
         out,
         "> Auto-generated from `src/tool_registry.rs`. Do not edit by hand."
     );
-    let _ = writeln!(
-        out,
-        "> Regenerate with: `cargo run --bin gen_tools_doc -- docs/TOOLS.md`.\n"
-    );
+    let _ = writeln!(out, "> Regenerate with: `just tools-doc`.\n");
 
     let _ = writeln!(out, "## Discovery Workflow\n");
     let _ = writeln!(
         out,
-        "- `tools/list` returns the full tool set (currently {tool_count} tools)"
+        "- `tools/list` returns {baseline_tool_count} baseline tools by default ({tool_count} registered including opt-in debugger tools)"
     );
     let _ = writeln!(
         out,
@@ -72,6 +69,10 @@ fn main() {
     let _ = writeln!(
         out,
         "- `tool_help(name=...)` returns full documentation and schema"
+    );
+    let _ = writeln!(
+        out,
+        "- Debugger tools require `--enable-debugger`; `debug_open_module` also requires `--workspace`"
     );
     let _ = writeln!(
         out,
@@ -85,15 +86,19 @@ fn main() {
     );
     let _ = writeln!(
         out,
-        "auto-analyzed and saved as a .i64 alongside the input. If that generated .i64"
+        "saved as a .i64 alongside the input by default; analysis is off by default and `idb_out` selects another"
     );
     let _ = writeln!(
         out,
-        "already exists, it is opened directly instead of rebuilding the raw input. Set rebuild=true"
+        "output path. Existing output databases are reused only when their recorded input SHA-256 matches."
     );
     let _ = writeln!(
         out,
-        "only when the input changed or stale analysis should be overwritten. If a sibling .dSYM"
+        "Set `rebuild=true` only when the input changed or stale analysis should be overwritten; an"
+    );
+    let _ = writeln!(
+        out,
+        "existing database is overwritten only when its hash or recorded path proves provenance. If a sibling .dSYM"
     );
     let _ = writeln!(
         out,
@@ -135,7 +140,11 @@ fn main() {
     let _ = writeln!(out, "- Addresses accept hex (`0x1000`) or decimal (`4096`)");
     let _ = writeln!(
         out,
-        "- Raw binaries are auto-analyzed on first open; `.i64` is saved alongside the input and reused on later raw-path opens unless `rebuild=true`"
+        "- Raw binaries default to `<input>.i64`; use `idb_out` for read-only input locations. Existing output is reused only after input SHA-256 verification"
+    );
+    let _ = writeln!(
+        out,
+        "- `debug_open_module` always requires `idb_out` and opens a separate workspace database"
     );
 
     let args: Vec<String> = std::env::args().collect();

@@ -51,6 +51,8 @@ struct Cli {
     #[command(flatten)]
     ida_network: IdaNetworkArgs,
     #[command(flatten)]
+    debugger: DebuggerArgs,
+    #[command(flatten)]
     workspace: WorkspaceArgs,
     #[command(subcommand)]
     command: Option<Command>,
@@ -130,14 +132,39 @@ struct ToolFilterArgs {
 }
 
 impl ToolFilterArgs {
-    fn build(&self) -> Result<ToolFilter, String> {
+    fn build(&self, debugger_enabled: bool) -> Result<ToolFilter, String> {
         ToolFilter::from_inputs(
             &self.toolsets,
             &self.tools,
             &self.exclude_tools,
             self.read_only,
         )
+        .and_then(|filter| filter.with_debugger_enabled(debugger_enabled))
         .map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Args, Debug, Clone, Default)]
+#[command(next_help_heading = "Debugger (experimental opt-in)")]
+struct DebuggerArgs {
+    /// Advertise the headless debugger lifecycle tools on platforms whose
+    /// native integration gate has passed. Currently enabled on Apple Silicon macOS only.
+    #[arg(
+        long,
+        env = "IDA_MCP_ENABLE_DEBUGGER",
+        global = true,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    enable_debugger: bool,
+}
+
+impl DebuggerArgs {
+    fn worker_args(&self) -> Vec<OsString> {
+        if self.enable_debugger {
+            vec![OsString::from("--enable-debugger")]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -273,14 +300,16 @@ fn main() -> anyhow::Result<()> {
     // Filter is only used by the MCP server paths. Probe doesn't load any
     // tools, so don't reject probe runs because a bad IDA_MCP_TOOLSETS is
     // sitting in the inherited env from a sibling mcpServers.json config.
+    let debugger_enabled = cli.debugger.enable_debugger;
     let build_filter = || {
         cli.filter
-            .build()
+            .build(debugger_enabled)
             .map(Arc::new)
             .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))
     };
     let allow_lumina = cli.ida_network.allow_lumina;
-    let worker_args = cli.ida_network.worker_args();
+    let mut worker_args = cli.ida_network.worker_args();
+    worker_args.extend(cli.debugger.worker_args());
     let workspace = cli.workspace.clone();
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve if workspace.workspace => {
@@ -1335,5 +1364,19 @@ mod tests {
         assert!(after_subcommand.ida_network.allow_lumina);
         let worker_args = vec![OsString::from("--allow-lumina")];
         assert_eq!(before_subcommand.ida_network.worker_args(), worker_args);
+    }
+
+    #[test]
+    fn debugger_opt_in_is_forwarded_to_private_workers() {
+        let default = Cli::parse_from(["ida-mcp", "worker"]);
+        assert!(!default.debugger.enable_debugger);
+        assert!(default.debugger.worker_args().is_empty());
+
+        let enabled = Cli::parse_from(["ida-mcp", "worker", "--enable-debugger"]);
+        assert!(enabled.debugger.enable_debugger);
+        assert_eq!(
+            enabled.debugger.worker_args(),
+            vec![OsString::from("--enable-debugger")]
+        );
     }
 }

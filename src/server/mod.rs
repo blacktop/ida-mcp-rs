@@ -13,7 +13,8 @@ use crate::error::ToolError;
 use crate::ida::observability::{ProgressReceiver, ProgressSender};
 use crate::ida::pool::{WorkspacePin, WorkspaceRegistry, CHILD_TIMEOUT_GRACE_SECS};
 use crate::ida::types::{
-    CallGraphDirection, ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget,
+    CallGraphDirection, ConditionalCloseResult, DatabaseGeneration, DebugStopAction,
+    RawBinaryTarget,
 };
 use crate::ida::worker::{
     CloseAuthorization, CloseTokenGrant, IdaWorker, WorkerBackend, MAX_TIMEOUT_SECS,
@@ -72,12 +73,24 @@ pub struct ServerRuntimeState {
 impl Default for ServerRuntimeState {
     fn default() -> Self {
         let signing_key = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let request_state_codec =
+            match rmcp::model::RequestStateCodec::try_new(signing_key.into_bytes()) {
+                Ok(codec) => codec,
+                Err(error) => {
+                    // Two textual UUIDs are always well above rmcp's minimum key
+                    // length. Keep this branch non-panicking if that invariant or
+                    // the SDK validation changes in a future release.
+                    warn!(%error, "generated request-state signing key was rejected; regenerating");
+                    let fallback_key = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+                    rmcp::model::RequestStateCodec::new_unchecked(fallback_key.into_bytes())
+                }
+            };
         Self {
             task_registry: task::TaskRegistry::new(),
             operation_registry: OperationRegistry::new(),
             operation_nonce: Arc::new(AtomicU64::new(0)),
             runtime_lifetime: Arc::new(SessionLifetime::new()),
-            request_state_codec: rmcp::model::RequestStateCodec::new(signing_key.into_bytes()),
+            request_state_codec,
             stateless_http: false,
         }
     }
@@ -674,6 +687,21 @@ impl IdaMcpServer {
         let registry = self.workspace_registry.as_ref()?;
         let database_id = self.workspace_database_id.as_deref()?;
         registry.pin(database_id)
+    }
+
+    fn set_workspace_debug_pin(&self, pinned: bool) {
+        let (Some(registry), Some(database_id)) = (
+            self.workspace_registry.as_ref(),
+            self.workspace_database_id.as_deref(),
+        ) else {
+            return;
+        };
+        if !registry.set_debug_pin(database_id, pinned) {
+            warn!(
+                database_id,
+                pinned, "debugger workspace pin target disappeared"
+            );
+        }
     }
 
     fn workspace_task_key(&self, key: &str) -> String {
@@ -1964,6 +1992,90 @@ where
     }
 }
 
+fn parse_debug_timeout(value: Option<i64>, default: u32) -> Result<u32, ToolError> {
+    let timeout = parse_optional_unsigned::<u32>(value, "timeout_secs")?.unwrap_or(default);
+    if !(1..=120).contains(&timeout) {
+        return Err(ToolError::InvalidParams(
+            "timeout_secs must be between 1 and 120".to_string(),
+        ));
+    }
+    Ok(timeout)
+}
+
+fn select_runtime_module(modules: &Value, query: &str) -> Result<Value, ToolError> {
+    if query.is_empty() {
+        return Err(ToolError::InvalidParams(
+            "module must be an exact runtime path or unambiguous basename".to_string(),
+        ));
+    }
+    let candidates = modules
+        .get("modules")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ToolError::RemoteProtocol(
+                "debug_modules response did not contain a modules array".to_string(),
+            )
+        })?;
+    let exact = candidates
+        .iter()
+        .filter(|module| module.get("path").and_then(Value::as_str) == Some(query))
+        .cloned()
+        .collect::<Vec<_>>();
+    if exact.len() == 1 {
+        return exact.into_iter().next().ok_or_else(|| {
+            ToolError::RemoteProtocol("selected runtime module disappeared".to_string())
+        });
+    }
+
+    let basename = std::path::Path::new(query)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(query);
+    let matching = candidates
+        .iter()
+        .filter(|module| {
+            module
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|path| std::path::Path::new(path).file_name())
+                .and_then(|name| name.to_str())
+                == Some(basename)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matching.len() {
+        1 => matching.into_iter().next().ok_or_else(|| {
+            ToolError::RemoteProtocol("selected runtime module disappeared".to_string())
+        }),
+        0 => Err(ToolError::InvalidParams(format!(
+            "runtime module not found: {query}"
+        ))),
+        count => Err(ToolError::InvalidParams(format!(
+            "runtime module basename is ambiguous ({count} matches); use the exact path from debug_modules"
+        ))),
+    }
+}
+
+fn checked_runtime_slide(runtime_base: u64, preferred_base: u64) -> Value {
+    if runtime_base >= preferred_base {
+        let magnitude = runtime_base - preferred_base;
+        json!({
+            "direction": "add",
+            "magnitude": format!("{magnitude:#x}"),
+            "magnitude_value": magnitude,
+            "signed": format!("+{magnitude:#x}"),
+        })
+    } else {
+        let magnitude = preferred_base - runtime_base;
+        json!({
+            "direction": "subtract",
+            "magnitude": format!("{magnitude:#x}"),
+            "magnitude_value": magnitude,
+            "signed": format!("-{magnitude:#x}"),
+        })
+    }
+}
+
 /// Short-circuit on a `Result<_, ToolError>` from within a `#[tool]` async fn,
 /// surfacing the error to the client as an `is_error: true` CallToolResult
 /// (matching the existing `Err(e) => Ok(e.to_tool_result())` pattern used by
@@ -2633,6 +2745,292 @@ impl IdaMcpServer {
             )])),
             Err(e) => Ok(e.to_tool_result()),
         }
+    }
+
+    #[tool(
+        description = "Report opt-in headless debugger backend, transport, and authorization readiness."
+    )]
+    #[instrument(skip_all)]
+    async fn debug_status(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_status");
+        let status = crate::ida::handlers::debugger::runtime_status();
+        Ok(CallToolResult::success(vec![Content::text(pretty_json(
+            &status,
+        ))]))
+    }
+
+    #[tool(
+        description = "Launch an executable through IDA's native debugger and wait for its initial suspended event."
+    )]
+    #[instrument(skip_all, fields(path = %req.path))]
+    async fn debug_launch(
+        &self,
+        Parameters(req): Parameters<DebugLaunchRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_launch");
+        let expanded = crate::expand_path(req.path.trim());
+        if !expanded.is_absolute() || !expanded.is_file() {
+            return Ok(ToolError::InvalidPath(expanded.display().to_string()).to_tool_result());
+        }
+        if req
+            .arguments
+            .as_deref()
+            .is_some_and(|value| value.contains('\0'))
+        {
+            return Ok(ToolError::InvalidParams(
+                "arguments must not contain a NUL byte".to_string(),
+            )
+            .to_tool_result());
+        }
+        let start_directory = req
+            .start_directory
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(crate::expand_path);
+        if let Some(directory) = start_directory.as_ref()
+            && (!directory.is_absolute() || !directory.is_dir())
+        {
+            return Ok(ToolError::InvalidPath(directory.display().to_string()).to_tool_result());
+        }
+        let timeout_seconds = match parse_debug_timeout(req.timeout_secs, 30) {
+            Ok(timeout) => timeout,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        match self
+            .worker
+            .debug_launch(
+                &expanded.display().to_string(),
+                req.arguments,
+                start_directory.map(|path| path.display().to_string()),
+                timeout_seconds,
+            )
+            .await
+        {
+            Ok(result) => {
+                if result.get("status").and_then(Value::as_str) == Some("ready") {
+                    self.set_workspace_debug_pin(true);
+                }
+                Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                    &result,
+                ))]))
+            }
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Attach IDA's native debugger to a process and wait for its initial suspended event."
+    )]
+    #[instrument(skip_all, fields(pid = req.pid))]
+    async fn debug_attach(
+        &self,
+        Parameters(req): Parameters<DebugAttachRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_attach");
+        let pid = match u32::try_from(req.pid) {
+            Ok(pid) if pid > 0 => pid,
+            _ => {
+                return Ok(ToolError::InvalidParams(
+                    "pid must be a positive 32-bit process ID".to_string(),
+                )
+                .to_tool_result());
+            }
+        };
+        let timeout_seconds = match parse_debug_timeout(req.timeout_secs, 30) {
+            Ok(timeout) => timeout,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        match self.worker.debug_attach(pid, timeout_seconds).await {
+            Ok(result) => {
+                if result.get("status").and_then(Value::as_str) == Some("ready") {
+                    self.set_workspace_debug_pin(true);
+                }
+                Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                    &result,
+                ))]))
+            }
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "List modules loaded in the active debuggee with runtime base, end, and size."
+    )]
+    #[instrument(skip_all)]
+    async fn debug_modules(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_modules");
+        match self.worker.debug_modules().await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &result,
+            ))])),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Detach or terminate the active debug target. auto terminates launched targets and detaches attached targets."
+    )]
+    #[instrument(skip_all, fields(action = ?req.action))]
+    async fn debug_stop(
+        &self,
+        Parameters(req): Parameters<DebugStopRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_stop");
+        let action = match DebugStopAction::parse(req.action.as_deref()) {
+            Ok(action) => action,
+            Err(message) => return Ok(ToolError::InvalidParams(message).to_tool_result()),
+        };
+        let timeout_seconds = match parse_debug_timeout(req.timeout_secs, 10) {
+            Ok(timeout) => timeout,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        match self.worker.debug_stop(action, timeout_seconds).await {
+            Ok(result) => {
+                self.set_workspace_debug_pin(false);
+                Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                    &result,
+                ))]))
+            }
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
+    #[tool(
+        description = "Open a module returned by debug_modules in a new workspace database. idb_out is always required."
+    )]
+    #[instrument(skip_all)]
+    async fn debug_open_module(
+        &self,
+        Parameters(req): Parameters<DebugOpenModuleRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: debug_open_module");
+        let Some(registry) = self.workspace_registry.as_ref() else {
+            return Ok(ToolError::InvalidParams(
+                "debug_open_module requires ida-mcp --workspace".to_string(),
+            )
+            .to_tool_result());
+        };
+        let Some(source_database_id) = self.workspace_database_id.as_deref() else {
+            return Ok(ToolError::InvalidParams(
+                "debug_open_module requires the source debug database_id".to_string(),
+            )
+            .to_tool_result());
+        };
+        let output = crate::expand_path(req.idb_out.trim());
+        let output_is_supported_database = output
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("i64") || extension.eq_ignore_ascii_case("idb")
+            });
+        if req.idb_out.trim().is_empty() || !output.is_absolute() || !output_is_supported_database {
+            return Ok(ToolError::InvalidParams(
+                "idb_out must be an absolute .i64/.idb output path".to_string(),
+            )
+            .to_tool_result());
+        }
+        let timeout_secs = match parse_optional_unsigned::<u64>(req.timeout_secs, "timeout_secs") {
+            Ok(Some(timeout)) if (1..=600).contains(&timeout) => timeout,
+            Ok(None) => 300,
+            Ok(Some(_)) => {
+                return Ok(ToolError::InvalidParams(
+                    "timeout_secs must be between 1 and 600".to_string(),
+                )
+                .to_tool_result());
+            }
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+
+        let modules = match self.worker.debug_modules().await {
+            Ok(modules) => modules,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let module = match select_runtime_module(&modules, req.module.trim()) {
+            Ok(module) => module,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let Some(module_path) = module.get("path").and_then(Value::as_str) else {
+            return Ok(ToolError::RemoteProtocol(
+                "debug_modules returned a module without a path".to_string(),
+            )
+            .to_tool_result());
+        };
+        let module_path = module_path.to_string();
+        let expanded_module = crate::expand_path(&module_path);
+        if !expanded_module.is_absolute() || !expanded_module.is_file() {
+            return Ok(
+                ToolError::InvalidPath(expanded_module.display().to_string()).to_tool_result(),
+            );
+        }
+        if expanded_module == output {
+            return Ok(ToolError::InvalidParams(
+                "idb_out must not overwrite the runtime module image".to_string(),
+            )
+            .to_tool_result());
+        }
+
+        let lease = registry.allocate_database();
+        let database_id = lease.database_id().to_string();
+        let destination = WorkerBackend::pooled(lease.database());
+        let opened = destination
+            .open_observed(
+                &expanded_module.display().to_string(),
+                false,
+                None,
+                false,
+                false,
+                req.rebuild.unwrap_or(false),
+                None,
+                false,
+                RawBinaryTarget::default(),
+                Vec::new(),
+                Some(output.display().to_string()),
+                Some(timeout_secs),
+                None,
+                None,
+            )
+            .await;
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                drop(lease);
+                let _ = registry.close_database(&database_id).await;
+                return Ok(error.to_tool_result());
+            }
+        };
+        let segments = match destination.segments().await {
+            Ok(segments) => segments,
+            Err(error) => {
+                drop(lease);
+                let _ = registry.close_database(&database_id).await;
+                return Ok(error.to_tool_result());
+            }
+        };
+        let preferred_base = segments
+            .iter()
+            .filter_map(|segment| Self::parse_address(&segment.start).ok())
+            .min();
+        let runtime_base = module.get("base_value").and_then(Value::as_u64);
+        let runtime_slide = runtime_base
+            .zip(preferred_base)
+            .map(|(runtime, preferred)| checked_runtime_slide(runtime, preferred));
+        drop(lease);
+
+        let result = json!({
+            "status": "ready",
+            "source_database_id": source_database_id,
+            "database_id": database_id,
+            "module": module,
+            "database": opened,
+            "preferred_base": preferred_base.map(|base| format!("{base:#x}")),
+            "preferred_base_value": preferred_base,
+            "runtime_slide": runtime_slide,
+            "note": "The new database remains at its on-disk preferred addresses; use runtime_slide to translate runtime addresses."
+        });
+        Ok(CallToolResult::success(vec![Content::text(pretty_json(
+            &result,
+        ))]))
     }
 
     #[tool(description = "Report auto-analysis status (auto_is_ok, auto_state). \
@@ -5670,10 +6068,16 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "dsc_add_region" => Some(schema::<DscAddRegionRequest>()),
         "close_idb" => Some(schema::<CloseIdbRequest>()),
         "load_debug_info" => Some(schema::<LoadDebugInfoRequest>()),
+        "debug_status" | "debug_modules" => Some(schema::<EmptyParams>()),
+        "debug_launch" => Some(schema::<DebugLaunchRequest>()),
+        "debug_attach" => Some(schema::<DebugAttachRequest>()),
+        "debug_stop" => Some(schema::<DebugStopRequest>()),
+        "debug_open_module" => Some(schema::<DebugOpenModuleRequest>()),
         "analysis_status" => Some(schema::<EmptyParams>()),
         "tool_catalog" => Some(schema::<ToolCatalogRequest>()),
         "tool_help" => Some(schema::<ToolHelpRequest>()),
         "recent_operations" => Some(schema::<RecentOperationsRequest>()),
+        "task_status" => Some(schema::<TaskStatusRequest>()),
         "idb_meta" => Some(schema::<EmptyParams>()),
 
         // Functions
@@ -6029,14 +6433,18 @@ fn tool_annotations_for(name: &str) -> ToolAnnotations {
             .read_only(false)
             .destructive(true)
             .open_world(true),
-        "run_script" => ToolAnnotations::new()
+        "run_script" | "debug_launch" | "debug_attach" => ToolAnnotations::new()
             .read_only(false)
             .destructive(true)
             .open_world(true),
+        "debug_stop" => ToolAnnotations::new()
+            .read_only(false)
+            .destructive(true)
+            .open_world(false),
         "patch" | "patch_asm" => ToolAnnotations::new().read_only(false).destructive(true),
         "open_idb" | "open_dsc" | "dsc_add_dylib" | "dsc_add_region" | "close_idb"
         | "load_debug_info" | "declare_type" | "apply_types" | "declare_stack" | "delete_stack"
-        | "rename" | "set_comments" => ToolAnnotations::new()
+        | "rename" | "set_comments" | "debug_open_module" => ToolAnnotations::new()
             .read_only(false)
             .destructive(name == "close_idb")
             .open_world(false),
@@ -6372,21 +6780,23 @@ mod tests {
     use crate::error::ToolError;
     use crate::ida::worker::{CloseTokenGrant, WorkerBackend};
     use crate::server::{
-        apply_close_metadata, apply_task_update, call_tool_result_to_value, close_hint_for,
+        add_workspace_database_id_schema, add_workspace_schema, apply_close_metadata,
+        apply_task_update, call_tool_result_to_value, checked_runtime_slide, close_hint_for,
         dsc_open_plan, is_sessionless_request_meta, materialize_task_response,
         normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
-        run_script_truncate_chars, supported_protocol_versions, task, task_payload_result_value,
-        task_state_to_detailed_task, task_state_to_mcp_task, timeout_with_child_grace,
-        tool_params_schema, DscOpenPlan, IdaMcpServer, OpenIdbBackgroundDecision,
-        RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest, ToolHelpRequest,
-        XrefsRequest,
+        run_script_truncate_chars, select_runtime_module, supported_protocol_versions, task,
+        task_payload_result_value, task_state_to_detailed_task, task_state_to_mcp_task,
+        timeout_with_child_grace, tool_annotations_for, tool_params_schema, DscOpenPlan,
+        IdaMcpServer, OpenIdbBackgroundDecision, RecentOperationsRequest, ServerRuntimeState,
+        ToolCatalogRequest, ToolHelpRequest, XrefsRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::{CallToolResponse, CallToolResult, InputResponses, ProtocolVersion};
     use rmcp::ServerHandler;
     use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
 
@@ -6841,6 +7251,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_module_selection_requires_an_exact_or_unambiguous_match() {
+        let modules = json!({
+            "modules": [
+                {"path": "/usr/lib/libsame.dylib", "base_value": 0x1000},
+                {"path": "/opt/lib/libsame.dylib", "base_value": 0x2000},
+                {"path": "/usr/lib/libunique.dylib", "base_value": 0x3000}
+            ]
+        });
+        assert_eq!(
+            select_runtime_module(&modules, "/opt/lib/libsame.dylib")
+                .expect("exact module")
+                .get("base_value"),
+            Some(&json!(0x2000))
+        );
+        assert_eq!(
+            select_runtime_module(&modules, "libunique.dylib")
+                .expect("unambiguous basename")
+                .get("base_value"),
+            Some(&json!(0x3000))
+        );
+        assert!(select_runtime_module(&modules, "libsame.dylib").is_err());
+        assert!(select_runtime_module(&modules, "missing.dylib").is_err());
+    }
+
+    #[test]
+    fn runtime_slide_preserves_direction_without_signed_overflow() {
+        assert_eq!(checked_runtime_slide(0x3000, 0x1000)["signed"], "+0x2000");
+        assert_eq!(checked_runtime_slide(0x1000, 0x3000)["signed"], "-0x2000");
+        assert_eq!(
+            checked_runtime_slide(u64::MAX, 0)["magnitude_value"],
+            json!(u64::MAX)
+        );
+    }
+
+    #[test]
     fn run_script_failure_message_adds_syntax_hint() {
         let value = json!({
             "success": false,
@@ -7039,6 +7484,129 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn registry_router_and_schema_inventories_are_identical() {
+        use std::collections::BTreeSet;
+
+        let server = test_server();
+        let registry_names: BTreeSet<&str> = crate::tool_registry::all_tools()
+            .map(|tool| tool.name)
+            .collect();
+        let route_names: BTreeSet<&str> = server
+            .tool_mux
+            .call_router
+            .map
+            .keys()
+            .map(|name| name.as_ref())
+            .collect();
+
+        assert_eq!(
+            registry_names, route_names,
+            "registry and dispatch router must expose exactly the same tools"
+        );
+
+        let missing_schemas: Vec<_> = crate::tool_registry::all_tools()
+            .filter(|tool| tool_params_schema(tool.name).is_none())
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            missing_schemas.is_empty(),
+            "every registered tool must have a help/schema entry; missing: {missing_schemas:?}"
+        );
+    }
+
+    #[test]
+    fn debugger_annotations_match_process_and_filesystem_effects() {
+        let stop = tool_annotations_for("debug_stop");
+        assert_eq!(stop.read_only_hint, Some(false));
+        assert_eq!(stop.destructive_hint, Some(true));
+
+        let open_module = tool_annotations_for("debug_open_module");
+        assert_eq!(open_module.read_only_hint, Some(false));
+        assert_eq!(open_module.destructive_hint, Some(false));
+    }
+
+    #[test]
+    fn workspace_schema_requires_database_id_only_for_database_scoped_tools() {
+        let server = test_server();
+        let default_disasm = server
+            .tool_mux
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "disasm")
+            .expect("disasm tool");
+        let default_disasm_schema = Value::Object(default_disasm.input_schema.as_ref().clone());
+        assert!(
+            default_disasm_schema
+                .pointer("/properties/database_id")
+                .is_none(),
+            "default schemas must remain unchanged"
+        );
+
+        let mut workspace_disasm = default_disasm.clone();
+        add_workspace_schema(&mut workspace_disasm);
+        let workspace_disasm_schema = Value::Object(workspace_disasm.input_schema.as_ref().clone());
+        assert_eq!(
+            workspace_disasm_schema.pointer("/properties/database_id/type"),
+            Some(&json!("string"))
+        );
+        assert!(workspace_disasm_schema
+            .pointer("/required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|field| field == "database_id")));
+
+        let mut open_idb = server
+            .tool_mux
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "open_idb")
+            .expect("open_idb tool");
+        add_workspace_schema(&mut open_idb);
+        let open_idb_schema = Value::Object(open_idb.input_schema.as_ref().clone());
+        assert!(open_idb_schema.pointer("/properties/database_id").is_none());
+        assert!(open_idb
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("returns a new database_id")));
+
+        let mut help_schema = tool_params_schema("disasm").expect("disasm help schema");
+        let Value::Object(help_schema) = &mut help_schema else {
+            panic!("disasm help schema must be an object");
+        };
+        add_workspace_database_id_schema("disasm", help_schema);
+        let help_schema = Value::Object(help_schema.clone());
+        assert_eq!(
+            help_schema.pointer("/properties/database_id/format"),
+            Some(&json!("uuid"))
+        );
+        assert!(help_schema
+            .pointer("/required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| required.iter().any(|field| field == "database_id")));
+    }
+
+    #[test]
+    fn default_tool_schema_snapshot() {
+        let schemas = crate::tool_registry::all_tools()
+            .filter(|tool| !tool.requirements.debugger)
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "schema": tool_params_schema(tool.name),
+                })
+            })
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_vec(&schemas).expect("serialize schema snapshot");
+        let digest = Sha256::digest(encoded)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            digest,
+            "18332b7d023a842bed625ccfcd09299750ce38edff2069227b1ddec2e7fbc21e"
+        );
     }
 
     #[test]

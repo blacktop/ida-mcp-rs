@@ -260,6 +260,46 @@ immediately, but the child process may stay alive idle for reuse until
 retry later. Pooled mode requires stateful HTTP sessions; `--max-workers > 1`
 is rejected with `--stateless`.
 
+#### Headless debugger (experimental opt-in)
+
+Debugger tools are absent from the default schema. On supported builds, add
+`--enable-debugger` to expose `debug_status`, `debug_launch`, `debug_attach`,
+`debug_modules`, and `debug_stop`. `debug_open_module` additionally requires
+`--workspace`, because it opens the selected runtime image in a new database
+without replacing the database that owns the live debug session:
+
+```text
+debug_status()
+debug_launch(database_id: "…", path: "/absolute/path/to/program")
+debug_modules(database_id: "…")
+debug_open_module(
+  database_id: "…",
+  module: "/usr/lib/libobjc.A.dylib",
+  idb_out: "~/ida-work/libobjc.i64"
+)
+debug_stop(database_id: "…", action: "auto")
+```
+
+`debug_open_module.idb_out` is always required. Runtime modules often live in
+read-only system directories, and silently writing an IDB next to them is not a
+valid headless workflow. The response includes a checked runtime slide; the new
+database remains at its on-disk preferred addresses.
+
+In workspace mode, a successfully launched or attached debug session pins its
+database against the idle TTL until `debug_stop` succeeds or `close_idb`
+releases the database.
+
+The first enabled platform is macOS on Apple Silicon. ida-mcp connects through
+IDA's signed loopback `mac_server_arm` helper. macOS may require IDA's supported
+“Take Control” authorization once per login; tools report
+`user_action_required` when it is missing. ida-mcp never asks for root, disables
+SIP, edits `authorizationdb`, or re-signs binaries. Linux and Windows remain
+fail-closed rather than being advertised optimistically: IDA's ARM Linux
+backend is remote-only and remote configuration is not exposed, while the SDK
+does not provide a Windows-on-ARM user debugger. Their native ARM64 harnesses
+pass by proving the debugger surface remains unavailable; x86 Linux and Windows
+still require a positive local-backend oracle before advertisement.
+
 MCP `2026-07-28` uses the sessionless `server/discover` lifecycle. It is
 supported over stdio and the default single-worker HTTP mode, including
 multi-round elicitation and the `io.modelcontextprotocol/tasks` extension for
@@ -359,16 +399,24 @@ because it does not modify the database.
 
 ## Context Optimization
 
-`ida-mcp` exposes 73 tools (~11k tokens of `tools/list` payload). Clients with dynamic tool discovery defer that cost; clients that preload schemas include it in every session. Filter the surface to only what you need:
+`ida-mcp` exposes the same 75 baseline tools by default (~12k tokens of
+`tools/list` payload). Six debugger tools exist behind the explicit gates above,
+so installing the new release does not enlarge existing clients' schema.
+Clients with dynamic tool discovery defer that cost; clients that preload
+schemas include it in every session. Filter the surface to only what you need:
 
 | Flag | Env var | Effect |
 |---|---|---|
 | `--toolsets=cat1,cat2` | `IDA_MCP_TOOLSETS` | Replaces "all tools" with the union of selected categories |
 | `--tools=t1,t2`        | `IDA_MCP_TOOLS`         | Adds individual tools (additive to `--toolsets`) |
 | `--exclude-tools=t1,t2`| `IDA_MCP_EXCLUDE_TOOLS` | Subtracts from the include set; always wins |
-| `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `patch*`, `rename`, `set_comments`, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`); keeps lifecycle/discovery |
+| `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `patch*`, `rename`, `set_comments`, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`, and debugger process control); keeps lifecycle/discovery |
 
-No flags = all 73 tools (default). Categories: `core`, `functions`, `disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`, `metadata`, `types`, `editing`, `scripting` (run `tool_catalog` to enumerate). Flags override env vars; unknown names rejected at startup.
+No flags = all 75 baseline tools (default). Categories: `core`, `functions`,
+`disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`,
+`metadata`, `types`, `editing`, `scripting`; `debug` appears only when its
+startup/platform gate is active (run `tool_catalog` to enumerate). Flags
+override env vars; unknown names are rejected at startup.
 
 ### Recommendations by client
 
