@@ -454,6 +454,16 @@ test-modern:
     PORT=$((9400 + RANDOM % 400)) RUST_LOG="{{ rust_log }}" \
         MCP_BIN="{{ server_bin }}" bash ./modern_protocol.sh
 
+# Verify opt-in explicit database-ID routing over one headless stdio server.
+test-workspace: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" \
+        WORKSPACE_FIXTURE="{{ test_i64 }}" bash ./stdio_workspace.sh
+    PORT=$((9600 + RANDOM % 300)) RUST_LOG="{{ rust_log }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" WORKSPACE_FIXTURE="{{ test_i64 }}" \
+        bash ./http_workspace.sh
+
 # Run open_idb rebuild semantics test (Cases C and D from the rebuild=bool patch)
 # Phase 1 seeds a tmpdir .i64 with a renamed function via the raw-input path,
 # Phase 2 re-opens the raw path and asserts the rename survives (reuse),

@@ -2,7 +2,7 @@
 
 use crate::error::ToolError;
 use crate::ida::observability::ProgressSender;
-use crate::ida::pool::PooledSessionState;
+use crate::ida::pool::{LegacySessionBinding, PooledDatabaseBinding, WorkspaceDatabase};
 use crate::ida::request::IdaRequest;
 use crate::ida::types::*;
 use serde_json::Value;
@@ -1349,7 +1349,7 @@ impl IdaWorker {
 #[derive(Clone)]
 pub enum WorkerBackend {
     Local(Arc<IdaWorker>),
-    Pooled(Arc<PooledSessionState>),
+    Pooled(PooledDatabaseBinding),
 }
 
 impl WorkerBackend {
@@ -1357,8 +1357,12 @@ impl WorkerBackend {
         Self::Local(worker)
     }
 
-    pub fn pooled(state: Arc<PooledSessionState>) -> Self {
-        Self::Pooled(state)
+    pub fn pooled(state: Arc<WorkspaceDatabase>) -> Self {
+        Self::Pooled(PooledDatabaseBinding::Workspace(state))
+    }
+
+    pub fn pooled_legacy(binding: Arc<LegacySessionBinding>) -> Self {
+        Self::Pooled(PooledDatabaseBinding::Legacy(binding))
     }
 
     pub(crate) fn uses_close_tokens(&self) -> bool {
@@ -1367,6 +1371,10 @@ impl WorkerBackend {
 
     pub(crate) fn is_pooled(&self) -> bool {
         matches!(self, Self::Pooled(_))
+    }
+
+    pub(crate) fn is_legacy_pooled(&self) -> bool {
+        matches!(self, Self::Pooled(PooledDatabaseBinding::Legacy(_)))
     }
 
     pub(crate) fn issue_close_token_for_session(

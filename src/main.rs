@@ -20,7 +20,7 @@ use ida_mcp::server::{SanitizedIdaServer, ServerRuntimeState};
 use ida_mcp::{
     disasm::generate_disasm_line,
     expand_path, ida,
-    ida::pool::{PooledSessionState, WorkerPool, WorkerPoolConfig},
+    ida::pool::{WorkerPool, WorkerPoolConfig, WorkspaceRegistry},
     ida::worker::WorkerBackend,
     DbInfo, FunctionInfo, IdaMcpServer, IdaWorker, ServerMode,
 };
@@ -50,8 +50,31 @@ struct Cli {
     filter: ToolFilterArgs,
     #[command(flatten)]
     ida_network: IdaNetworkArgs,
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(next_help_heading = "Workspace (opt-in)")]
+struct WorkspaceArgs {
+    /// Enable explicit multi-database routing. open_idb/open_dsc return a
+    /// database_id; database-scoped calls must send it on every call.
+    #[arg(long, global = true)]
+    workspace: bool,
+    /// Maximum child processes used by stdio/HTTP workspace mode.
+    #[arg(long, global = true, default_value_t = 4)]
+    workspace_max_workers: usize,
+    /// Reap an unpinned database after this many idle seconds (0 disables).
+    #[arg(long, global = true, default_value_t = 1800)]
+    workspace_idle_timeout_secs: u64,
+    /// Reap an idle child process after this many seconds (0 disables).
+    #[arg(long, global = true, default_value_t = 300)]
+    workspace_worker_idle_timeout_secs: u64,
+    /// Kill a workspace child that exceeds this operation watchdog.
+    #[arg(long, global = true, default_value_t = 1800)]
+    workspace_worker_op_timeout_secs: u64,
 }
 
 #[derive(Subcommand)]
@@ -258,10 +281,14 @@ fn main() -> anyhow::Result<()> {
     };
     let allow_lumina = cli.ida_network.allow_lumina;
     let worker_args = cli.ida_network.worker_args();
+    let workspace = cli.workspace.clone();
     match cli.command.unwrap_or(Command::Serve) {
+        Command::Serve if workspace.workspace => {
+            run_server_workspace(build_filter()?, worker_args, workspace)
+        }
         Command::Serve => run_server(build_filter()?, allow_lumina),
         Command::ServeHttp(args) => {
-            run_server_http(args, build_filter()?, worker_args, allow_lumina)
+            run_server_http(args, build_filter()?, worker_args, allow_lumina, workspace)
         }
         Command::Worker(_args) => {
             run_server_with_mode(build_filter()?, ServerMode::Worker, allow_lumina)
@@ -345,6 +372,87 @@ fn cancel_background_tasks(registry: &TaskRegistry, message: &str) {
 
 fn run_server(filter: Arc<ToolFilter>, allow_lumina: bool) -> anyhow::Result<()> {
     run_server_with_mode(filter, ServerMode::Stdio, allow_lumina)
+}
+
+fn run_server_workspace(
+    filter: Arc<ToolFilter>,
+    worker_args: Vec<OsString>,
+    workspace: WorkspaceArgs,
+) -> anyhow::Result<()> {
+    if workspace.workspace_max_workers == 0 {
+        return Err(anyhow::anyhow!(
+            "--workspace-max-workers must be at least 1"
+        ));
+    }
+    if workspace.workspace_worker_op_timeout_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "--workspace-worker-op-timeout-secs must be at least 1"
+        ));
+    }
+
+    info!(
+        max_workers = workspace.workspace_max_workers,
+        "Starting explicit workspace router on stdio; parent will not initialize IDA"
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+    runtime.block_on(async move {
+        let exe_path = std::env::current_exe()
+            .map_err(|error| anyhow::anyhow!("failed to resolve current executable: {error}"))?;
+        let pool = WorkerPool::new(WorkerPoolConfig {
+            max_workers: workspace.workspace_max_workers,
+            min_workers: 0,
+            worker_idle_timeout: Duration::from_secs(workspace.workspace_worker_idle_timeout_secs),
+            worker_op_timeout: Duration::from_secs(workspace.workspace_worker_op_timeout_secs),
+            exe_path,
+            worker_args,
+        });
+        let registry = WorkspaceRegistry::new(
+            pool.clone(),
+            Duration::from_secs(workspace.workspace_idle_timeout_secs),
+        );
+        let server = IdaMcpServer::with_workspace_and_state(
+            registry.clone(),
+            ServerMode::Stdio,
+            filter.clone(),
+            ServerRuntimeState::new(),
+        );
+        let task_registry = server.task_registry().clone();
+        let sanitized = SanitizedIdaServer::with_workspace(server, filter);
+        let mut service = sanitized
+            .serve(stdio())
+            .await
+            .map_err(|error| anyhow::anyhow!("stdio MCP negotiation failed: {error}"))?;
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown_signal = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(error) = wait_for_shutdown_signal().await {
+                warn!(%error, "Workspace shutdown signal handler failed");
+            }
+            shutdown_signal.cancel();
+        });
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    cancel_background_tasks(&task_registry, "Cancelled by server shutdown");
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    if service.is_transport_closed() {
+                        cancel_background_tasks(&task_registry, "Cancelled by client disconnect");
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = service.close_with_timeout(Duration::from_secs(2)).await?;
+        registry.shutdown().await;
+        pool.shutdown_all().await;
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 fn run_server_with_mode(
@@ -479,10 +587,14 @@ fn run_server_http(
     filter: Arc<ToolFilter>,
     worker_args: Vec<OsString>,
     allow_lumina: bool,
+    workspace: WorkspaceArgs,
 ) -> anyhow::Result<()> {
     info!("Starting IDA MCP Server (streamable HTTP mode)");
     if args.json_response && !args.stateless {
         info!("--json-response applies to sessionless dispatch (MCP 2026 requests); legacy sessions keep SSE framing for streams");
+    }
+    if workspace.workspace {
+        return run_server_http_workspace(args, filter, worker_args, workspace);
     }
     if args.max_workers == 0 {
         return Err(anyhow::anyhow!("--max-workers must be at least 1"));
@@ -696,6 +808,10 @@ fn run_server_http_pooled(
             pool.warm_min()
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to warm worker pool: {e}"))?;
+            // Legacy sessions and explicit workspace handles share this one
+            // database-to-worker registry. Legacy entries are pinned to their
+            // session binding and therefore ignore the workspace TTL.
+            let workspace_registry = WorkspaceRegistry::new(pool.clone(), Duration::ZERO);
 
             let session_manager = build_pooled_session_manager(
                 session_keep_alive_secs,
@@ -717,16 +833,15 @@ fn run_server_http_pooled(
                 cancel.clone(),
             );
 
-            let pool_for_factory = pool.clone();
+            let registry_for_factory = workspace_registry.clone();
             let filter_for_factory = filter.clone();
             let service = StreamableHttpService::new(
                 move || {
-                    let pooled_state = Arc::new(PooledSessionState::new(
-                        pool_for_factory.clone(),
-                        uuid::Uuid::new_v4().to_string(),
-                    ));
+                    let legacy_binding = Arc::new(
+                        registry_for_factory.bind_legacy(uuid::Uuid::new_v4().to_string()),
+                    );
                     let inner = IdaMcpServer::with_filter(
-                        WorkerBackend::pooled(pooled_state),
+                        WorkerBackend::pooled_legacy(legacy_binding),
                         ServerMode::Http,
                         filter_for_factory.clone(),
                     );
@@ -745,10 +860,12 @@ fn run_server_http_pooled(
 
             let cancel_for_shutdown = cancel.clone();
             let pool_for_shutdown = pool.clone();
+            let registry_for_shutdown = workspace_registry.clone();
             tokio::spawn(async move {
                 if wait_for_shutdown_signal().await.is_ok() {
                     info!("Shutdown signal received");
                     cancel_for_shutdown.cancel();
+                    registry_for_shutdown.shutdown().await;
                     pool_for_shutdown.shutdown_all().await;
                 }
             });
@@ -762,6 +879,7 @@ fn run_server_http_pooled(
                 .await
                 .map_err(|e| anyhow::anyhow!("serve failed: {e}"))?;
 
+            workspace_registry.shutdown().await;
             pool.shutdown_all().await;
             Ok::<_, anyhow::Error>(())
         });
@@ -787,6 +905,140 @@ fn run_server_http_pooled(
 
     info!("Pooled HTTP server stopped");
     Ok(())
+}
+
+fn run_server_http_workspace(
+    args: ServeHttpArgs,
+    filter: Arc<ToolFilter>,
+    worker_args: Vec<OsString>,
+    workspace: WorkspaceArgs,
+) -> anyhow::Result<()> {
+    if workspace.workspace_max_workers == 0 {
+        return Err(anyhow::anyhow!(
+            "--workspace-max-workers must be at least 1"
+        ));
+    }
+    if workspace.workspace_worker_op_timeout_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "--workspace-worker-op-timeout-secs must be at least 1"
+        ));
+    }
+    if args.max_workers != 1 || args.min_workers != 0 {
+        info!(
+            "Workspace mode uses --workspace-max-workers; legacy --max-workers/--min-workers are ignored"
+        );
+    }
+    let bind_addr: SocketAddr = args
+        .bind
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid bind address: {error}"))?;
+    info!(
+        max_workers = workspace.workspace_max_workers,
+        "Starting explicit HTTP workspace router; parent will not initialize IDA"
+    );
+
+    let server_handle = thread::spawn(move || -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind(bind_addr)
+                .await
+                .map_err(|error| anyhow::anyhow!("bind failed: {error}"))?;
+            let listen_addr = listener
+                .local_addr()
+                .map_err(|error| anyhow::anyhow!("failed to read listener address: {error}"))?;
+            let access_policy = HttpAccessPolicy::from_cli(
+                listen_addr,
+                &args.allow_origin,
+                args.allow_host.as_deref(),
+            );
+            let exe_path = std::env::current_exe().map_err(|error| {
+                anyhow::anyhow!("failed to resolve current executable: {error}")
+            })?;
+            let pool = WorkerPool::new(WorkerPoolConfig {
+                max_workers: workspace.workspace_max_workers,
+                min_workers: 0,
+                worker_idle_timeout: Duration::from_secs(
+                    workspace.workspace_worker_idle_timeout_secs,
+                ),
+                worker_op_timeout: Duration::from_secs(workspace.workspace_worker_op_timeout_secs),
+                exe_path,
+                worker_args,
+            });
+            let registry = WorkspaceRegistry::new(
+                pool.clone(),
+                Duration::from_secs(workspace.workspace_idle_timeout_secs),
+            );
+            let runtime_state = if args.stateless {
+                ServerRuntimeState::new_stateless_http()
+            } else {
+                ServerRuntimeState::new()
+            };
+            let session_manager = build_session_manager(args.session_keep_alive_secs);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let config = build_streamable_config(
+                HttpServerOptions {
+                    sse_keep_alive_secs: args.sse_keep_alive_secs,
+                    stateless: args.stateless,
+                    json_response: args.json_response,
+                    max_request_body_mib: args.max_request_body_mib,
+                },
+                cancel.clone(),
+            );
+            let registry_for_factory = registry.clone();
+            let filter_for_factory = filter.clone();
+            let service = StreamableHttpService::new(
+                move || {
+                    let inner = IdaMcpServer::with_workspace_and_state(
+                        registry_for_factory.clone(),
+                        ServerMode::Http,
+                        filter_for_factory.clone(),
+                        runtime_state.clone(),
+                    );
+                    Ok(SanitizedIdaServer::with_workspace(
+                        inner,
+                        filter_for_factory.clone(),
+                    ))
+                },
+                session_manager,
+                config,
+            );
+            let service = HttpAccessService::new(service, access_policy);
+            let router = Router::new().route_service("/", service);
+            info!("MCP workspace HTTP server listening on http://{listen_addr}");
+
+            let cancel_for_shutdown = cancel.clone();
+            let registry_for_shutdown = registry.clone();
+            let pool_for_shutdown = pool.clone();
+            tokio::spawn(async move {
+                if wait_for_shutdown_signal().await.is_ok() {
+                    cancel_for_shutdown.cancel();
+                    registry_for_shutdown.shutdown().await;
+                    pool_for_shutdown.shutdown_all().await;
+                }
+            });
+            let cancel_for_serve = cancel.clone();
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    cancel_for_serve.cancelled().await;
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("serve failed: {error}"))?;
+            registry.shutdown().await;
+            pool.shutdown_all().await;
+            Ok::<_, anyhow::Error>(())
+        })
+    });
+
+    match server_handle.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(anyhow::anyhow!(
+            "workspace HTTP server thread panicked: {error:?}"
+        )),
+    }
 }
 
 fn run_probe(args: ProbeArgs, allow_lumina: bool) -> anyhow::Result<()> {

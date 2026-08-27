@@ -11,7 +11,7 @@ pub use requests::*;
 
 use crate::error::ToolError;
 use crate::ida::observability::{ProgressReceiver, ProgressSender};
-use crate::ida::pool::CHILD_TIMEOUT_GRACE_SECS;
+use crate::ida::pool::{WorkspacePin, WorkspaceRegistry, CHILD_TIMEOUT_GRACE_SECS};
 use crate::ida::types::{
     CallGraphDirection, ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget,
 };
@@ -21,7 +21,7 @@ use crate::ida::worker::{
 use crate::server::operation::{
     next_operation_id, OperationRegistry, OperationSnapshot, RecentOperations,
 };
-use crate::tool_registry::{self, ToolCategory};
+use crate::tool_registry::{self, ToolCategory, ToolScope};
 use rmcp::{
     handler::server::{
         router::tool::ToolRouter,
@@ -120,6 +120,8 @@ impl Drop for SessionLifetime {
 #[derive(Clone)]
 pub struct IdaMcpServer {
     worker: WorkerBackend,
+    workspace_registry: Option<WorkspaceRegistry>,
+    workspace_database_id: Option<String>,
     tool_mux: ToolMux<IdaMcpServer>,
     mode: ServerMode,
     task_registry: task::TaskRegistry,
@@ -200,7 +202,7 @@ fn is_sessionless_request_meta(meta: &rmcp::model::RequestMetaObject) -> bool {
 impl ToolMux<IdaMcpServer> {
     async fn call(
         &self,
-        context: ToolCallContext<'_, IdaMcpServer>,
+        mut context: ToolCallContext<'_, IdaMcpServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
         // rmcp routes any request carrying the complete 2026 inline-metadata
         // key set through the sessionless path even when it declares a legacy
@@ -208,7 +210,7 @@ impl ToolMux<IdaMcpServer> {
         // HTTP session, so a sessionless tool call would mint (and leak) a
         // fresh worker lease per request. Reject it before it reaches the
         // worker pool; the version allowlist alone cannot catch this case.
-        if context.service.worker.is_pooled()
+        if context.service.worker.is_legacy_pooled()
             && is_sessionless_request_meta(&context.request_context().meta)
         {
             return Err(McpError::invalid_params(
@@ -232,6 +234,7 @@ impl ToolMux<IdaMcpServer> {
         // parse a `resultType: "task"` response even if they declared the
         // tasks extension capability.
         let should_materialize_task = context.name() == "open_dsc"
+            && context.service.workspace_registry.is_none()
             && context
                 .request_context()
                 .protocol_version()
@@ -241,9 +244,151 @@ impl ToolMux<IdaMcpServer> {
                 .client_capabilities()
                 .is_some_and(|capabilities| capabilities.supports_tasks());
         let task_registry = context.service.task_registry.clone();
-        let response = self.call_router.call(context).await?;
+        let mut routed_service = context.service.clone();
+        let workspace_registry = context.service.workspace_registry.clone();
+        let tool_name = context.name().to_string();
+        let supplied_database_id = take_workspace_database_id(&mut context.arguments)?;
+        let mut allocated_database_id = None;
+        let mut selected_database_id = supplied_database_id.clone();
+        let mut workspace_lease = None;
+
+        if let Some(registry) = workspace_registry.as_ref() {
+            let tool = tool_registry::get_tool(&tool_name).ok_or_else(|| {
+                McpError::invalid_params(format!("unknown tool: {tool_name}"), None)
+            })?;
+            let opens_database = matches!(tool_name.as_str(), "open_idb" | "open_dsc");
+            if opens_database {
+                if supplied_database_id.is_some() {
+                    return Err(McpError::invalid_params(
+                        "open_idb/open_dsc allocate a new database_id; do not provide one",
+                        None,
+                    ));
+                }
+                let lease = registry.allocate_database();
+                let database_id = lease.database_id().to_string();
+                routed_service.worker = WorkerBackend::pooled(lease.database());
+                selected_database_id = Some(database_id.clone());
+                allocated_database_id = Some(database_id);
+                workspace_lease = Some(lease);
+            } else if tool.scope == ToolScope::Database {
+                let database_id = supplied_database_id.as_deref().ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("{tool_name} requires database_id in workspace mode"),
+                        None,
+                    )
+                })?;
+                let lease = registry.acquire(database_id).ok_or_else(|| {
+                    McpError::invalid_params(
+                        format!("unknown or expired database_id: {database_id}"),
+                        None,
+                    )
+                })?;
+                routed_service.worker = WorkerBackend::pooled(lease.database());
+                workspace_lease = Some(lease);
+            } else if supplied_database_id.is_some() {
+                return Err(McpError::invalid_params(
+                    format!("{tool_name} is runtime-scoped and does not accept database_id"),
+                    None,
+                ));
+            }
+        } else if supplied_database_id.is_some() {
+            return Err(McpError::invalid_params(
+                "database_id is available only when ida-mcp starts with --workspace",
+                None,
+            ));
+        }
+
+        routed_service.workspace_database_id = selected_database_id.clone();
+        let mut params = CallToolRequestParams::new(context.name.clone());
+        params.arguments = context.arguments.take();
+        params.input_responses = context.input_responses.take();
+        params.request_state = context.request_state.take();
+        let routed_context = ToolCallContext::new(&routed_service, params, context.request_context);
+        let response = self.call_router.call(routed_context).await;
+        drop(workspace_lease);
+        let mut response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if let (Some(registry), Some(database_id)) = (
+                    workspace_registry.as_ref(),
+                    allocated_database_id.as_deref(),
+                ) {
+                    let _ = registry.remove(database_id);
+                }
+                return Err(error);
+            }
+        };
+
+        if let (Some(registry), Some(database_id)) = (
+            workspace_registry.as_ref(),
+            allocated_database_id.as_deref(),
+        ) && !attach_workspace_database_id(&mut response, database_id)
+        {
+            let _ = registry.remove(database_id);
+        }
+        // WorkspaceDatabase::close consumes its worker lease before dispatching
+        // child teardown. Even when teardown returns an error and the pool
+        // retires that worker, this handle can no longer route another call.
+        // Remove it unconditionally so a debug pin cannot preserve a dead UUID.
+        if tool_name == "close_idb"
+            && let (Some(registry), Some(database_id)) =
+                (workspace_registry.as_ref(), selected_database_id.as_deref())
+        {
+            let _ = registry.remove(database_id);
+        }
+
         materialize_task_response(&task_registry, should_materialize_task, response)
     }
+}
+
+fn take_workspace_database_id(
+    arguments: &mut Option<JsonObject>,
+) -> Result<Option<String>, McpError> {
+    let Some(value) = arguments
+        .as_mut()
+        .and_then(|arguments| arguments.remove("database_id"))
+    else {
+        return Ok(None);
+    };
+    let Value::String(database_id) = value else {
+        return Err(McpError::invalid_params(
+            "database_id must be a UUID string",
+            None,
+        ));
+    };
+    let parsed = uuid::Uuid::parse_str(database_id.trim())
+        .map_err(|_| McpError::invalid_params("database_id must be a UUID string", None))?;
+    Ok(Some(parsed.to_string()))
+}
+
+fn attach_workspace_database_id(response: &mut CallToolResponse, database_id: &str) -> bool {
+    let CallToolResponse::Complete(result) = response else {
+        return false;
+    };
+    if result.is_error == Some(true) {
+        return false;
+    }
+
+    let replacement = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .and_then(|text| serde_json::from_str::<Value>(&text.text).ok())
+        .and_then(|mut value| {
+            let Value::Object(map) = &mut value else {
+                return None;
+            };
+            map.insert("database_id".to_string(), json!(database_id));
+            serde_json::to_string_pretty(&value).ok()
+        });
+    if let (Some(text), Some(first)) = (replacement, result.content.first_mut()) {
+        *first = Content::text(text);
+    } else {
+        result.content.push(Content::text(
+            json!({ "database_id": database_id }).to_string(),
+        ));
+    }
+    true
 }
 
 /// Parameters for the background DSC loading task.
@@ -487,6 +632,8 @@ impl IdaMcpServer {
         let call_router = Self::tool_router();
         Self {
             worker,
+            workspace_registry: None,
+            workspace_database_id: None,
             tool_mux: ToolMux::new(call_router),
             mode,
             task_registry: state.task_registry,
@@ -499,6 +646,40 @@ impl IdaMcpServer {
             session_task_owner,
             stateless_http: state.stateless_http,
             filter,
+        }
+    }
+
+    pub fn with_workspace_and_state(
+        registry: WorkspaceRegistry,
+        mode: ServerMode,
+        filter: Arc<tool_filter::ToolFilter>,
+        state: ServerRuntimeState,
+    ) -> Self {
+        let runtime_database = registry.runtime_database();
+        let mut server = Self::with_filter_and_state(
+            WorkerBackend::pooled(runtime_database),
+            mode,
+            filter,
+            state,
+        );
+        server.workspace_registry = Some(registry);
+        server
+    }
+
+    pub fn workspace_enabled(&self) -> bool {
+        self.workspace_registry.is_some()
+    }
+
+    fn workspace_pin(&self) -> Option<WorkspacePin> {
+        let registry = self.workspace_registry.as_ref()?;
+        let database_id = self.workspace_database_id.as_deref()?;
+        registry.pin(database_id)
+    }
+
+    fn workspace_task_key(&self, key: &str) -> String {
+        match self.workspace_database_id.as_deref() {
+            Some(database_id) => format!("{database_id}:{key}"),
+            None => key.to_string(),
         }
     }
 
@@ -543,11 +724,14 @@ impl IdaMcpServer {
     }
 
     fn close_hint(&self) -> &'static str {
-        close_hint_for(self.mode, self.worker.is_pooled())
+        close_hint_for(self.mode, self.worker.is_pooled(), self.workspace_enabled())
     }
 
     fn http_close_grant(&self) -> Option<Result<CloseTokenGrant, String>> {
-        if matches!(self.mode, ServerMode::Http) && self.worker.uses_close_tokens() {
+        if !self.workspace_enabled()
+            && matches!(self.mode, ServerMode::Http)
+            && self.worker.uses_close_tokens()
+        {
             self.worker.issue_close_token_for_session(&self.session_id)
         } else {
             None
@@ -1172,10 +1356,22 @@ impl IdaMcpServer {
         let registry = self.task_registry.clone();
         let worker = self.worker.clone();
         let mode = self.mode;
+        let workspace_database_id = self.workspace_database_id.clone();
+        let workspace_pin = self.workspace_pin();
         let tid = task_id.clone();
         let task_cancel_token = cancel_token.clone();
         tokio::spawn(async move {
-            Self::run_dsc_background(tid, registry, worker, mode, ctx, task_cancel_token).await;
+            let _workspace_pin = workspace_pin;
+            Self::run_dsc_background(
+                tid,
+                registry,
+                worker,
+                mode,
+                workspace_database_id,
+                ctx,
+                task_cancel_token,
+            )
+            .await;
         });
         self.task_registry.set_cancel_token(&task_id, cancel_token);
 
@@ -1393,6 +1589,7 @@ impl IdaMcpServer {
         registry: task::TaskRegistry,
         worker: WorkerBackend,
         mode: ServerMode,
+        workspace_database_id: Option<String>,
         ctx: DscBackgroundCtx,
         cancel_token: tokio_util::sync::CancellationToken,
     ) {
@@ -1719,7 +1916,14 @@ impl IdaMcpServer {
                 map.insert("analysis_ready".to_string(), json!(analysis_ready));
                 map.insert("next_steps".to_string(), json!(next_steps));
             }
-            apply_close_metadata(map, close_token, close_hint_for(mode, worker.is_pooled()));
+            if let Some(database_id) = workspace_database_id.as_deref() {
+                map.insert("database_id".to_string(), json!(database_id));
+            }
+            apply_close_metadata(
+                map,
+                close_token,
+                close_hint_for(mode, worker.is_pooled(), workspace_database_id.is_some()),
+            );
         }
 
         match registry.complete_or_defer_cancellation(&task_id, value, &cancel_token) {
@@ -1773,7 +1977,10 @@ macro_rules! try_param {
     };
 }
 
-fn close_hint_for(mode: ServerMode, pooled: bool) -> &'static str {
+fn close_hint_for(mode: ServerMode, pooled: bool, workspace: bool) -> &'static str {
+    if workspace {
+        return "In workspace mode, call close_idb with this database_id to release its IDA worker and database state.";
+    }
     match (mode, pooled) {
         (ServerMode::Http, true) => {
             "In pooled HTTP/SSE mode, close_idb releases this session's child worker lease. Sessions do not share one global close_token."
@@ -2462,7 +2669,10 @@ impl IdaMcpServer {
         Parameters(req): Parameters<CloseIdbRequest>,
     ) -> Result<CallToolResult, McpError> {
         info!("Tool call: close_idb received");
-        if matches!(self.mode, ServerMode::Http) && self.worker.uses_close_tokens() {
+        if !self.workspace_enabled()
+            && matches!(self.mode, ServerMode::Http)
+            && self.worker.uses_close_tokens()
+        {
             match self.worker.authorize_close(
                 &self.session_id,
                 req.token.as_deref(),
@@ -2523,12 +2733,14 @@ impl IdaMcpServer {
         {
             let tools: Vec<_> = tool_registry::tools_by_category(cat)
                 .filter(|t| filter.is_enabled(t.name))
+                .filter(|t| !t.requirements.workspace || self.workspace_enabled())
                 .take(limit)
                 .map(|t| {
                     json!({
                         "name": t.name,
                         "description": t.short_desc,
                         "category": t.category.as_str(),
+                        "scope": t.scope,
                     })
                 })
                 .collect();
@@ -2553,12 +2765,14 @@ impl IdaMcpServer {
             let tools: Vec<_> = results
                 .iter()
                 .filter(|(t, _)| filter.is_enabled(t.name))
+                .filter(|(t, _)| !t.requirements.workspace || self.workspace_enabled())
                 .take(limit)
                 .map(|(t, keywords)| {
                     json!({
                         "name": t.name,
                         "description": t.short_desc,
                         "category": t.category.as_str(),
+                        "scope": t.scope,
                         "matched": keywords,
                     })
                 })
@@ -2584,6 +2798,7 @@ impl IdaMcpServer {
             .map(|c| {
                 let count = tool_registry::tools_by_category(*c)
                     .filter(|t| filter.is_enabled(t.name))
+                    .filter(|t| !t.requirements.workspace || self.workspace_enabled())
                     .count();
                 json!({
                     "category": c.as_str(),
@@ -2625,29 +2840,32 @@ impl IdaMcpServer {
 
         // If the tool exists in the registry but is filter-disabled, do not
         // leak its schema as available — return a clear disabled message.
-        if self.filter.is_active()
-            && tool_registry::get_tool(&req.name).is_some()
-            && !self.filter.is_enabled(&req.name)
-        {
+        if tool_registry::get_tool(&req.name).is_some_and(|tool| {
+            !self.filter.is_enabled(&req.name)
+                || (tool.requirements.workspace && !self.workspace_enabled())
+        }) {
             return Ok(CallToolResult::success(vec![Content::text(pretty_json(
                 &json!({
-                    "error": format!(
-                        "tool '{}' is disabled by current filter \
-                         (--toolsets/--tools/--exclude-tools/--read-only)",
-                        req.name
-                    ),
-                    "filtering_active": true,
+                    "error": disabled_tool_message(&req.name, self.workspace_enabled()),
+                    "filtering_active": self.filter.is_active(),
                     "hint": "call tool_catalog to see enabled tools",
                 }),
             ))]));
         }
 
         if let Some(tool) = tool_registry::get_tool(&req.name) {
-            let params = tool_params_schema(&req.name);
+            let mut params = tool_params_schema(&req.name);
+            if self.workspace_enabled()
+                && let Some(Value::Object(schema)) = params.as_mut()
+            {
+                add_workspace_database_id_schema(&req.name, schema);
+            }
             Ok(CallToolResult::success(vec![Content::text(pretty_json(
                 &json!({
                     "name": tool.name,
                     "category": tool.category.as_str(),
+                    "scope": tool.scope,
+                    "requirements": tool.requirements,
                     "description": tool.full_desc,
                     "parameters": params,
                     "example": tool.example,
@@ -4621,10 +4839,11 @@ impl IdaMcpServer {
         owner: &task::TaskOwner,
         cancel_token: tokio_util::sync::CancellationToken,
     ) -> Result<String, task::TaskCreateError> {
+        let dedup_key = self.workspace_task_key("analyze_funcs");
         let task_id = self.task_registry.create_keyed(
             owner,
             "analyze",
-            "analyze_funcs",
+            &dedup_key,
             "Waiting for IDA auto-analysis to finish",
         )?;
 
@@ -4632,10 +4851,12 @@ impl IdaMcpServer {
 
         let registry = self.task_registry.clone();
         let worker = self.worker.clone();
+        let workspace_pin = self.workspace_pin();
         let tid = task_id.clone();
         let worker_cancel_token = cancel_token.clone();
 
         tokio::spawn(async move {
+            let _workspace_pin = workspace_pin;
             // Bridge worker progress updates → task registry messages.
             // The drain task ends when tx is dropped after analyze_funcs_observed returns.
             let (tx, mut rx): (ProgressSender, ProgressReceiver) =
@@ -4820,7 +5041,7 @@ impl IdaMcpServer {
                 };
                 return self.start_dsc_background(
                     &self.task_owner(&ctx.meta),
-                    dsc_path.display().to_string(),
+                    self.workspace_task_key(&dsc_path.display().to_string()),
                     &format!(
                         "Opening DSC directly with idalib (idb_out={})...",
                         idb_out.display()
@@ -4865,7 +5086,7 @@ impl IdaMcpServer {
             &file_type,
             log_path.as_deref(),
         );
-        let dedup_key = out_i64.display().to_string();
+        let dedup_key = self.workspace_task_key(&out_i64.display().to_string());
 
         let dsc_ctx = DscBackgroundCtx {
             open: DscBackgroundOpen::LegacyIdat {
@@ -5690,7 +5911,7 @@ fn materialize_task_response(
 #[tool_handler(router = self.tool_mux)]
 impl ServerHandler for IdaMcpServer {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        supported_protocol_versions(self.worker.is_pooled())
+        supported_protocol_versions(self.worker.is_legacy_pooled())
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -5758,6 +5979,7 @@ impl ServerHandler for IdaMcpServer {
 pub struct SanitizedIdaServer<S> {
     inner: S,
     filter: Arc<tool_filter::ToolFilter>,
+    workspace: bool,
 }
 
 impl<S> SanitizedIdaServer<S> {
@@ -5767,12 +5989,25 @@ impl<S> SanitizedIdaServer<S> {
         Self {
             inner,
             filter: Arc::new(tool_filter::ToolFilter::unrestricted()),
+            workspace: false,
         }
     }
 
     /// Wrap with an explicit filter (built from CLI/env at startup).
     pub fn with_filter(inner: S, filter: Arc<tool_filter::ToolFilter>) -> Self {
-        Self { inner, filter }
+        Self {
+            inner,
+            filter,
+            workspace: false,
+        }
+    }
+
+    pub fn with_workspace(inner: S, filter: Arc<tool_filter::ToolFilter>) -> Self {
+        Self {
+            inner,
+            filter,
+            workspace: true,
+        }
     }
 }
 
@@ -5820,6 +6055,51 @@ fn set_tool_metadata(tool: &mut Tool) {
 fn apply_tool_metadata(mut tool: Tool) -> Tool {
     set_tool_metadata(&mut tool);
     tool
+}
+
+fn add_workspace_database_id_schema(name: &str, schema: &mut Map<String, Value>) {
+    let Some(info) = tool_registry::get_tool(name) else {
+        return;
+    };
+    if info.scope != ToolScope::Database {
+        return;
+    }
+
+    let properties = schema
+        .entry("properties".to_string())
+        .or_insert_with(|| json!({}));
+    if let Value::Object(properties) = properties {
+        properties.insert(
+            "database_id".to_string(),
+            json!({
+                "type": "string",
+                "format": "uuid",
+                "description": "Opaque database handle returned by open_idb/open_dsc in workspace mode"
+            }),
+        );
+    }
+    let required = schema
+        .entry("required".to_string())
+        .or_insert_with(|| json!([]));
+    if let Value::Array(required) = required
+        && !required.iter().any(|value| value == "database_id")
+    {
+        required.push(json!("database_id"));
+    }
+}
+
+fn add_workspace_schema(tool: &mut Tool) {
+    if matches!(tool.name.as_ref(), "open_idb" | "open_dsc") {
+        let description = tool.description.as_deref().unwrap_or_default();
+        tool.description = Some(Cow::Owned(format!(
+            "{description} Workspace mode allocates and returns a new database_id."
+        )));
+        return;
+    }
+
+    let mut schema = tool.input_schema.as_ref().clone();
+    add_workspace_database_id_schema(&tool.name, &mut schema);
+    tool.input_schema = Arc::new(schema);
 }
 
 fn is_null_schema(value: &Value) -> bool {
@@ -5964,7 +6244,17 @@ fn normalize_tool_schemas(result: &mut ListToolsResult) {
 
 /// Error message for a filter-rejected tool/call. Centralized so the
 /// dispatch and tool_help paths return identical wording.
-fn disabled_tool_message(name: &str) -> String {
+fn disabled_tool_message(name: &str, workspace: bool) -> String {
+    if tool_registry::get_tool(name).is_some_and(|tool| tool.requirements.workspace && !workspace) {
+        return format!(
+            "tool '{name}' requires explicit --workspace startup; call tool_catalog to see enabled tools"
+        );
+    }
+    if tool_registry::get_tool(name).is_some_and(|tool| tool.requirements.debugger) {
+        return format!(
+            "tool '{name}' requires explicit --enable-debugger startup and a platform whose native debugger integration gate has passed; call tool_catalog to see enabled tools"
+        );
+    }
     format!(
         "tool '{name}' is disabled by current filter \
          (--toolsets/--tools/--exclude-tools/--read-only); \
@@ -5996,10 +6286,15 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut result = self.inner.list_tools(params, ctx).await?;
-        if self.filter.is_active() {
-            result
-                .tools
-                .retain(|tool| self.filter.is_enabled(&tool.name));
+        result.tools.retain(|tool| {
+            self.filter.is_enabled(&tool.name)
+                && tool_registry::get_tool(&tool.name)
+                    .is_none_or(|info| !info.requirements.workspace || self.workspace)
+        });
+        if self.workspace {
+            for tool in &mut result.tools {
+                add_workspace_schema(tool);
+            }
         }
         normalize_tool_schemas(&mut result);
         Ok(result)
@@ -6010,9 +6305,17 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         params: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        if self.filter.is_active() && !self.filter.is_enabled(&params.name) {
+        if !self.filter.is_enabled(&params.name) {
             return Err(McpError::invalid_params(
-                disabled_tool_message(&params.name),
+                disabled_tool_message(&params.name, self.workspace),
+                None,
+            ));
+        }
+        if tool_registry::get_tool(&params.name)
+            .is_some_and(|tool| tool.requirements.workspace && !self.workspace)
+        {
+            return Err(McpError::invalid_params(
+                disabled_tool_message(&params.name, self.workspace),
                 None,
             ));
         }
@@ -6024,10 +6327,16 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        if self.filter.is_active() && !self.filter.is_enabled(name) {
+        if !self.filter.is_enabled(name)
+            || tool_registry::get_tool(name)
+                .is_some_and(|tool| tool.requirements.workspace && !self.workspace)
+        {
             return None;
         }
         self.inner.get_tool(name).map(|mut tool| {
+            if self.workspace {
+                add_workspace_schema(&mut tool);
+            }
             normalize_tool_input_schema(&mut tool);
             apply_tool_metadata(tool)
         })
@@ -7277,7 +7586,7 @@ mod tests {
         apply_close_metadata(
             &mut map,
             grant,
-            close_hint_for(crate::ServerMode::Http, false),
+            close_hint_for(crate::ServerMode::Http, false, false),
         );
         map
     }

@@ -824,10 +824,6 @@ pub struct WorkspaceDatabase {
     runtime: Option<Handle>,
 }
 
-// Transitional name retained while the behavior-preserving registry
-// extraction lands ahead of the public workspace router.
-pub type PooledSessionState = WorkspaceDatabase;
-
 #[derive(Clone)]
 pub struct WorkspaceRegistry {
     inner: Arc<WorkspaceRegistryInner>,

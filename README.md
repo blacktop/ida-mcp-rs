@@ -216,6 +216,27 @@ variant; ambiguous bare names such as `arm` or `metapc` are rejected. These
 target fields apply only while creating a raw-input database and never alter an
 existing `.i64`/`.idb`.
 
+#### Multi-database workspace (opt-in)
+
+The default remains one implicit IDA database, so existing agent prompts and
+tool calls do not need a handle. For headless workflows that deliberately keep
+several databases open, start with `--workspace`:
+
+```bash
+ida-mcp --workspace --workspace-max-workers 4
+ida-mcp --workspace serve-http --bind 127.0.0.1:8765 --stateless
+```
+
+In workspace mode, each `open_idb`/`open_dsc` allocates and returns a
+`database_id`. Every database-scoped call must send that ID; runtime tools such
+as `tool_catalog` reject it. `close_idb(database_id: ...)` invalidates only the
+selected handle. Idle handles are reaped after 30 minutes by default; use
+`--workspace-idle-timeout-secs 0` to disable that database TTL.
+
+Workspace routing and legacy pooled HTTP share one internal registry. The
+legacy session behavior below is preserved, but there is no second independent
+session-to-worker lease map.
+
 #### HTTP/SSE worker pool
 
 `serve-http` keeps the existing single in-process IDA worker by default. For

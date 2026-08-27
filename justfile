@@ -206,6 +206,10 @@ test-elicitation: build
 test-modern: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-modern
 
+# Verify explicit multi-database workspace routing over stdio.
+test-workspace: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-workspace
+
 # Run open_idb rebuild semantics test (raw reuse vs rebuild=true overwrite)
 test-rebuild-idb: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-rebuild-idb
