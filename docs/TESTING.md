@@ -8,6 +8,7 @@ just test-http    # HTTP/SSE integration test
 just test-modern  # MCP 2026 discover/stateless lifecycle test
 just test-script  # IDAPython script execution test
 just test-elicitation # open_idb auto-background elicitation test
+just test-raw-target # typed raw blob target configuration test
 just test-session-cancel # legacy-session cancel-on-disconnect test
 just test-http-startup # HTTP bind-failure exit status (no IDA license needed)
 just test-dsc /path/to/dyld_shared_cache_arm64e  # DSC loading test
@@ -64,6 +65,13 @@ All integration tests require IDA Pro with a valid license. Run `just build` fir
   would show as 137), and releases its IDA worker loop
 - Asserts pooled HTTP exits nonzero and never logs a clean stop it didn't achieve
 - Needs no IDA license, database, or fixture
+
+**Raw-target test** (`just test-raw-target`)
+- Creates a minimal headerless x86 blob
+- Forces the Binary loader with an explicit processor variant
+- Verifies application bitness, segment bitness, base address, and entry point
+- Verifies the configured database is persisted only after a successful open
+- Verifies an invalid processor fails without leaving database sidecars
 
 **Session-cancel test** (`just test-session-cancel`)
 - Single-worker HTTP: a legacy session starts a slow foreground `open_idb`

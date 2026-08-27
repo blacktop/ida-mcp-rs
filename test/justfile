@@ -473,6 +473,18 @@ test-rebuild-idb: fixture
     RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" \
         bash ./stdio_rebuild_idb.sh
 
+# Verify typed raw-target processor, bitness, base, and entry-point configuration.
+test-raw-target:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    RUST_LOG="{{ rust_log }}" MCP_STDIO_BIN="{{ server_bin }}" \
+        bash ./stdio_raw_target.sh
+
 # Run callees-indirect regression test (PR #20)
 # Builds a tiny C fixture with both a direct and an indirect call, opens it
 # at a bundle-id-style path, and checks that callees() returns only the direct
