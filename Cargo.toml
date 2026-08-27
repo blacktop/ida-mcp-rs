@@ -12,7 +12,7 @@ categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.4.0" }
+idalib = { git = "https://github.com/niqiuqiux/idalib.git", rev = "5c4bc29af0ea503450e558489d879829fd5d411c" }
 rmcp = { version = "3.1", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "elicitation", "request-state", "schemars"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal", "process", "io-util"] }
 tokio-util = "0.7"
@@ -43,4 +43,4 @@ windows-sys = { version = "0.61", features = [
 
 [build-dependencies]
 cc = "1"
-idalib-build = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.4.0", package = "idalib-build" }
+idalib-build = { git = "https://github.com/niqiuqiux/idalib.git", rev = "5c4bc29af0ea503450e558489d879829fd5d411c", package = "idalib-build" }

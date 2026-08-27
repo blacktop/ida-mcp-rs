@@ -17,6 +17,7 @@ pub enum IdaRequest {
         force: bool,
         rebuild: bool,
         file_type: Option<String>,
+        raw_target: RawTarget,
         auto_analyse: bool,
         extra_args: Vec<String>,
         idb_out: Option<String>,

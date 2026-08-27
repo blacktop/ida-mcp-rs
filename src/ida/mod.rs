@@ -4,6 +4,7 @@
 //! It uses a channel-based worker pattern to ensure IDA operations run on the main thread
 //! (IDA types are not thread-safe).
 
+mod cancellation;
 pub mod handlers;
 pub mod lock;
 mod loop_impl;

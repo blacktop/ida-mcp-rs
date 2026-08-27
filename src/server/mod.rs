@@ -4,6 +4,8 @@ pub mod http_access;
 pub mod http_config;
 mod operation;
 mod requests;
+#[cfg(target_os = "windows")]
+pub mod stdio_transport;
 pub mod task;
 pub mod tool_filter;
 
@@ -12,7 +14,7 @@ pub use requests::*;
 use crate::error::ToolError;
 use crate::ida::observability::{ProgressReceiver, ProgressSender};
 use crate::ida::pool::CHILD_TIMEOUT_GRACE_SECS;
-use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration};
+use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawTarget};
 use crate::ida::worker::{
     CloseAuthorization, CloseTokenGrant, IdaWorker, WorkerBackend, MAX_TIMEOUT_SECS,
 };
@@ -1175,6 +1177,7 @@ impl IdaMcpServer {
                 false,
                 false,
                 file_type.map(str::to_string),
+                RawTarget::default(),
                 false,
                 Vec::new(),
                 None,
@@ -1500,6 +1503,7 @@ impl IdaMcpServer {
                 false,
                 false,
                 None,
+                RawTarget::default(),
                 auto_analyse,
                 Vec::new(),
                 idb_out.as_ref().map(|path| path.display().to_string()),
@@ -1719,6 +1723,39 @@ where
     }
 }
 
+fn validate_raw_processor(processor: &str) -> Result<(), ToolError> {
+    if processor.len() > 128 || processor.chars().any(char::is_control) {
+        return Err(ToolError::InvalidParams(
+            "processor must be at most 128 characters and contain no control characters"
+                .to_string(),
+        ));
+    }
+
+    let hint = match processor.to_ascii_lowercase().as_str() {
+        "arm" => Some(
+            "\"arm\" is ambiguous for a headerless blob; use an explicit variant such as \
+             \"arm:ARMv7-M\" or \"arm:ARMv8-A\"",
+        ),
+        "metapc" | "pc" => Some(
+            "\"metapc\" is ambiguous for a headerless blob; use an explicit variant such as \
+             \"metapc:80386p\"",
+        ),
+        "mips" | "mipsl" | "mipsb" => Some(
+            "the selected MIPS processor is ambiguous for a headerless blob; use an explicit \
+             processor variant (processor:variant)",
+        ),
+        "ppc" | "riscv" => Some(
+            "the selected processor has ambiguous bitness for a headerless blob; use an explicit \
+             processor variant (processor:variant)",
+        ),
+        _ => None,
+    };
+    match hint {
+        Some(hint) => Err(ToolError::InvalidParams(hint.to_string())),
+        None => Ok(()),
+    }
+}
+
 /// Short-circuit on a `Result<_, ToolError>` from within a `#[tool]` async fn,
 /// surfacing the error to the client as an `is_error: true` CallToolResult
 /// (matching the existing `Err(e) => Ok(e.to_tool_result())` pattern used by
@@ -1857,8 +1894,84 @@ impl IdaMcpServer {
             Err(error) => return Ok(error.to_tool_result().into()),
         };
 
+        let input_is_database = Self::is_database_path(&path);
         let debug_info_path = req.normalized_debug_info_path();
-        let file_type = req.normalized_file_type();
+        let processor = req.normalized_processor();
+        if let Some(processor) = processor.as_deref()
+            && let Err(error) = validate_raw_processor(processor)
+        {
+            return Ok(error.to_tool_result().into());
+        }
+        let bitness = match parse_optional_unsigned::<u32>(req.bitness, "bitness") {
+            Ok(bitness) => bitness,
+            Err(error) => return Ok(error.to_tool_result().into()),
+        };
+        if bitness.is_some_and(|value| !matches!(value, 16 | 32 | 64)) {
+            return Ok(
+                ToolError::InvalidParams("bitness must be 16, 32, or 64".to_string())
+                    .to_tool_result()
+                    .into(),
+            );
+        }
+        let base_address = match req
+            .base_address
+            .as_ref()
+            .map(|value| Self::value_to_exactly_one_address(value, "base_address"))
+            .transpose()
+        {
+            Ok(address) => address,
+            Err(error) => return Ok(error.to_tool_result().into()),
+        };
+        if let Some(base_address) = base_address
+            && base_address & 0xf != 0
+        {
+            return Ok(ToolError::InvalidParams(format!(
+                "base_address {base_address:#x} must be 16-byte aligned"
+            ))
+            .to_tool_result()
+            .into());
+        }
+        let entry_point = match req
+            .entry_point
+            .as_ref()
+            .map(|value| Self::value_to_exactly_one_address(value, "entry_point"))
+            .transpose()
+        {
+            Ok(address) => address,
+            Err(error) => return Ok(error.to_tool_result().into()),
+        };
+        let raw_target = RawTarget {
+            processor,
+            bitness,
+            base_address,
+            entry_point,
+        };
+        if input_is_database && raw_target.is_configured() {
+            return Ok(ToolError::InvalidParams(
+                "processor, bitness, base_address, and entry_point apply only when creating a \
+                 database from a raw input"
+                    .to_string(),
+            )
+            .to_tool_result()
+            .into());
+        }
+        let requested_file_type = req.normalized_file_type();
+        if raw_target.is_configured()
+            && requested_file_type
+                .as_deref()
+                .is_some_and(|file_type| !file_type.eq_ignore_ascii_case("Binary"))
+        {
+            return Ok(ToolError::InvalidParams(
+                "file_type cannot select a non-Binary loader when raw-target fields are supplied"
+                    .to_string(),
+            )
+            .to_tool_result()
+            .into());
+        }
+        let file_type = raw_target
+            .is_configured()
+            .then(|| "Binary".to_string())
+            .or(requested_file_type);
         let worker_extra_args = if matches!(self.mode, ServerMode::Worker) {
             req.worker_extra_args.clone()
         } else {
@@ -1874,7 +1987,7 @@ impl IdaMcpServer {
         let user_auto_analyse = req.auto_analyse.unwrap_or(false);
         let large_input_size = if !matches!(self.mode, ServerMode::Worker)
             && user_auto_analyse
-            && !Self::is_database_path(&path)
+            && !input_is_database
         {
             Self::input_size_above_threshold(&path)
         } else {
@@ -1924,6 +2037,7 @@ impl IdaMcpServer {
                         req.force.unwrap_or(false),
                         req.rebuild.unwrap_or(false),
                         file_type.clone(),
+                        raw_target.clone(),
                         effective_auto_analyse,
                         worker_extra_args.clone(),
                         worker_idb_out.clone(),
@@ -5876,9 +5990,9 @@ mod tests {
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
         run_script_truncate_chars, supported_protocol_versions, task, task_payload_result_value,
         task_state_to_detailed_task, task_state_to_mcp_task, timeout_with_child_grace,
-        tool_params_schema, DscOpenPlan, IdaMcpServer, OpenIdbBackgroundDecision,
-        RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest, ToolHelpRequest,
-        XrefsRequest,
+        tool_params_schema, validate_raw_processor, DscOpenPlan, IdaMcpServer,
+        OpenIdbBackgroundDecision, RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest,
+        ToolHelpRequest, XrefsRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::{CallToolResponse, CallToolResult, InputResponses, ProtocolVersion};
@@ -6440,6 +6554,16 @@ mod tests {
         assert!(IdaMcpServer::is_database_path("/tmp/sample.id0"));
         assert!(!IdaMcpServer::is_database_path("/tmp/sample.macho"));
         assert!(!IdaMcpServer::is_database_path("/tmp/sample"));
+    }
+
+    #[test]
+    fn raw_processor_validation_rejects_ambiguous_names() {
+        let error = validate_raw_processor("arm").expect_err("bare ARM is ambiguous");
+        assert!(
+            matches!(error, ToolError::InvalidParams(message) if message.contains("arm:ARMv7-M"))
+        );
+        assert!(validate_raw_processor("arm:ARMv7-M").is_ok());
+        assert!(validate_raw_processor("metapc:80386p").is_ok());
     }
 
     #[test]

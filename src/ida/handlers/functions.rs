@@ -147,7 +147,7 @@ pub fn handle_analyze_funcs(
         Some(SINGLE_PHASE_PROGRESS_TOTAL),
         "Waiting for IDA auto-analysis to finish",
     );
-    let completed = db.auto_wait();
+    let completed = crate::ida::cancellation::cancellable_auto_wait(db, cancel.as_ref())?;
     ensure_not_cancelled(cancel.as_ref())?;
     emit_progress(
         progress_tx.as_ref(),

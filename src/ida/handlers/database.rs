@@ -9,7 +9,7 @@ use crate::ida::lock::{
 use crate::ida::observability::{
     emit_progress, ensure_not_cancelled, ProgressHeartbeat, ProgressSender, OPEN_IDB_PROGRESS_TOTAL,
 };
-use crate::ida::types::{DbInfo, DebugInfoLoad};
+use crate::ida::types::{DbInfo, DebugInfoLoad, RawTarget};
 use idalib::{IDBOpenOptions, IDB};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -27,6 +27,7 @@ fn build_db_info(db: &IDB, path: &str, debug_info: Option<DebugInfoLoad>) -> DbI
         path: path.to_string(),
         file_type: format!("{:?}", meta.filetype()),
         processor: db.processor().long_name(),
+        processor_short: db.processor().short_name(),
         bits: if meta.is_64bit() {
             64
         } else if meta.is_32bit_exactly() {
@@ -34,6 +35,8 @@ fn build_db_info(db: &IDB, path: &str, debug_info: Option<DebugInfoLoad>) -> DbI
         } else {
             16
         },
+        base_address: meta.base_address().map(|address| format!("{address:#x}")),
+        entry_point: meta.start_address().map(|address| format!("{address:#x}")),
         function_count: db.function_count(),
         debug_info,
         analysis_status: build_analysis_status(db),
@@ -129,14 +132,134 @@ fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
 }
 
 fn init_database_args(extra_args: &[String]) -> Vec<String> {
-    let mut args = Vec::new();
+    extra_args
+        .iter()
+        .filter(|arg| arg.as_str() != "-A")
+        .cloned()
+        .collect()
+}
 
-    if !extra_args.iter().any(|arg| arg == "-A") {
-        args.push("-A".to_string());
+fn is_raw_target_loader_arg(arg: &str) -> bool {
+    arg == "-A"
+        || arg == "-c"
+        || ["-T", "-p", "-b", "-i", "-o"]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix))
+}
+
+fn remove_partial_database_outputs(path: &Path) {
+    let mut candidates = vec![path.to_path_buf()];
+    for extension in ["id0", "id1", "id2", "nam", "til"] {
+        candidates.push(path.with_extension(extension));
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    for candidate in candidates {
+        match std::fs::remove_file(&candidate) {
+            Ok(()) => {
+                info!(path = %candidate.display(), "Removed partial raw-target database output")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(path = %candidate.display(), %error, "Failed to remove partial raw-target database output")
+            }
+        }
+    }
+}
+
+struct RawOpenTransaction {
+    output: PathBuf,
+    committed: bool,
+}
+
+impl RawOpenTransaction {
+    fn new(output: PathBuf) -> Self {
+        Self {
+            output,
+            committed: false,
+        }
     }
 
-    args.extend(extra_args.iter().cloned());
-    args
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RawOpenTransaction {
+    fn drop(&mut self) {
+        if !self.committed {
+            remove_partial_database_outputs(&self.output);
+        }
+    }
+}
+
+fn database_bitness(db: &IDB) -> u32 {
+    let meta = db.meta();
+    if meta.is_64bit() {
+        64
+    } else if meta.is_32bit_exactly() {
+        32
+    } else {
+        16
+    }
+}
+
+fn raw_bitness(bitness: u32) -> Result<idalib::segment::Bitness, ToolError> {
+    match bitness {
+        16 => Ok(idalib::segment::Bitness::Bits16),
+        32 => Ok(idalib::segment::Bitness::Bits32),
+        64 => Ok(idalib::segment::Bitness::Bits64),
+        _ => Err(ToolError::InvalidParams(
+            "bitness must be 16, 32, or 64".to_string(),
+        )),
+    }
+}
+
+fn verify_raw_target(db: &IDB, target: &RawTarget) -> Result<(), ToolError> {
+    if let Some(bitness) = target.bitness {
+        let bitness = raw_bitness(bitness)?;
+        let expected_segment_bitness = match bitness {
+            idalib::segment::Bitness::Bits16 => 0,
+            idalib::segment::Bitness::Bits32 => 1,
+            idalib::segment::Bitness::Bits64 => 2,
+        };
+        if database_bitness(db) != bitness.bits() {
+            return Err(ToolError::OpenFailed(format!(
+                "IDA did not apply {}-bit application mode",
+                bitness.bits()
+            )));
+        }
+        if let Some(segment) = db
+            .segments()
+            .map(|(_, segment)| segment)
+            .find(|segment| segment.bitness() as u32 != expected_segment_bitness)
+        {
+            return Err(ToolError::OpenFailed(format!(
+                "IDA did not apply {}-bit addressing to segment at {:#x}",
+                bitness.bits(),
+                segment.start_address()
+            )));
+        }
+    }
+
+    if let Some(entry_point) = target.entry_point
+        && db.meta().start_address() != Some(entry_point)
+    {
+        return Err(ToolError::OpenFailed(format!(
+            "IDA did not apply raw entry point {entry_point:#x}"
+        )));
+    }
+
+    if let Some(base_address) = target.base_address
+        && db.meta().base_address() != Some(base_address)
+    {
+        return Err(ToolError::OpenFailed(format!(
+            "IDA did not apply raw base address {base_address:#x}"
+        )));
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -151,6 +274,7 @@ pub fn handle_open(
     force: bool,
     rebuild: bool,
     file_type: Option<&str>,
+    raw_target: &RawTarget,
     auto_analyse: bool,
     extra_args: &[String],
     idb_out: Option<&str>,
@@ -164,6 +288,12 @@ pub fn handle_open(
 
     // Check if a database is already open
     if let Some(db) = idb.as_ref() {
+        if raw_target.is_configured() {
+            return Err(ToolError::InvalidParams(
+                "raw-target fields cannot be applied to an already open database; close it and use rebuild=true"
+                    .to_string(),
+            ));
+        }
         let current_path = db.path();
         if database_paths_match(current_path, &expanded) {
             // Same database - return its info instead of reopening
@@ -192,6 +322,13 @@ pub fn handle_open(
         .unwrap_or("")
         .to_ascii_lowercase();
     let is_idb = ext == "i64" || ext == "idb" || ext == "id0";
+
+    if is_idb && raw_target.is_configured() {
+        return Err(ToolError::InvalidParams(
+            "processor, bitness, base_address, and entry_point apply only to a new raw input"
+                .to_string(),
+        ));
+    }
 
     let mut raw_out_path = None;
     let mut existing_raw_idb_path = None;
@@ -228,6 +365,13 @@ pub fn handle_open(
         raw_out_path = Some(out_path);
     }
 
+    if raw_target.is_configured() && existing_raw_idb_path.is_some() {
+        return Err(ToolError::InvalidParams(
+            "raw-target fields only affect a newly created database; the generated database already exists. Set rebuild=true to recreate it"
+                .to_string(),
+        ));
+    }
+
     let lock_target_path = raw_out_path.as_ref().unwrap_or(&expanded);
 
     // If force is enabled, try to clean up stale lock files from crashed sessions.
@@ -248,6 +392,8 @@ pub fn handle_open(
 
     // Acquire MCP lock file (to detect other ida-mcp instances)
     let mcp_lock = acquire_mcp_lock(lock_target_path)?;
+    let mut raw_transaction = (!is_idb && existing_raw_idb_path.is_none())
+        .then(|| RawOpenTransaction::new(raw_out_path.clone().expect("raw output initialized")));
 
     // Open database
     let path_display = expanded.display().to_string();
@@ -293,6 +439,9 @@ pub fn handle_open(
         let mut opts = IDBOpenOptions::new();
         opts.auto_analyse(false).save(true);
         for arg in &init_args {
+            if raw_target.is_configured() && is_raw_target_loader_arg(arg) {
+                continue;
+            }
             opts.arg(arg);
         }
         let mut db = opts.open(db_path_to_open);
@@ -311,7 +460,8 @@ pub fn handle_open(
         }
         (db, opened_path)
     } else {
-        // Raw binary - open with auto-analysis and save to .i64
+        // Raw binary. Targeted blobs are opened without analysis or persistence
+        // until their loader metadata has been configured and verified.
         let Some(out_path) = raw_out_path.as_ref() else {
             return Err(ToolError::OpenFailed(
                 "raw binary output path was not initialized".to_string(),
@@ -323,20 +473,40 @@ pub fn handle_open(
         );
         let opened_path = out_path.clone();
         let mut opts = IDBOpenOptions::new();
-        opts.auto_analyse(auto_analyse);
-        if let Some(ft) = file_type {
+        opts.idb(out_path).auto_analyse(false);
+        if let Some(ft) = file_type
+            && !raw_target.is_configured()
+        {
             info!(file_type = ft, "Using file type selector (-T flag)");
             opts.file_type(ft);
         }
+        if raw_target.is_configured() {
+            if let Some(processor) = raw_target.processor.as_deref() {
+                opts.processor(processor);
+            }
+            if let Some(bitness) = raw_target.bitness {
+                opts.bitness(raw_bitness(bitness)?);
+            }
+            if let Some(base_address) = raw_target.base_address {
+                opts.base_address(base_address)
+                    .map_err(|error| ToolError::InvalidParams(error.to_string()))?;
+            }
+            if let Some(entry_point) = raw_target.entry_point {
+                opts.entry_point(entry_point);
+            }
+        }
         for arg in &init_args {
+            if raw_target.is_configured() && is_raw_target_loader_arg(arg) {
+                continue;
+            }
             opts.arg(arg);
         }
-        let db = opts.idb(out_path).save(true).open(&expanded);
+        let db = opts.save(false).open(&expanded);
         (db, opened_path)
     };
     let _ = ticker_stop_tx.send(());
     let _ = ticker.join();
-    let db = match db {
+    let mut db = match db {
         Ok(db) => db,
         Err(e) => {
             release_mcp_lock_file(mcp_lock);
@@ -353,14 +523,20 @@ pub fn handle_open(
         }
     };
     ensure_not_cancelled(cancel.as_ref())?;
-    if !is_idb && auto_analyse {
+    if !is_idb && raw_target.is_configured() {
+        verify_raw_target(&db, raw_target)?;
+        ensure_not_cancelled(cancel.as_ref())?;
+    }
+    if !open_existing_database && auto_analyse {
         emit_progress(
             progress_tx.as_ref(),
             "analyzing",
             2.0,
             Some(OPEN_IDB_PROGRESS_TOTAL),
-            "Raw binary open finished; collecting post-open analysis state",
+            "Waiting for IDA auto-analysis to finish",
         );
+        crate::ida::cancellation::cancellable_auto_wait(&mut db, cancel.as_ref())?;
+        ensure_not_cancelled(cancel.as_ref())?;
     }
 
     let mut debug_info = None;
@@ -445,6 +621,13 @@ pub fn handle_open(
     }
     ensure_not_cancelled(cancel.as_ref())?;
 
+    if raw_transaction.is_some() {
+        db.save_on_close(true);
+        if let Some(transaction) = raw_transaction.as_mut() {
+            transaction.commit();
+        }
+    }
+
     let path_str = opened_path.display().to_string();
     let info = build_db_info(&db, &path_str, debug_info);
     info!(
@@ -502,7 +685,8 @@ mod tests {
     use crate::ida::handlers::database::{
         base_input_path_for_database, database_paths_match, existing_idb_for_raw_binary,
         existing_idb_for_raw_open, has_ida_database_extension, idb_path_for_raw_binary,
-        init_database_args, non_empty_trimmed,
+        init_database_args, is_raw_target_loader_arg, non_empty_trimmed,
+        remove_partial_database_outputs,
     };
 
     #[test]
@@ -515,9 +699,63 @@ mod tests {
 
     #[test]
     fn init_database_args_preserves_user_args() {
-        let args = init_database_args(&["-Sscript.py".to_string(), "-Tpe".to_string()]);
+        let args = init_database_args(&[
+            "-A".to_string(),
+            "-Sscript.py".to_string(),
+            "-Tpe".to_string(),
+        ]);
+        assert!(!args.iter().any(|arg| arg == "-A"));
         assert!(args.iter().any(|arg| arg == "-Sscript.py"));
         assert!(args.iter().any(|arg| arg == "-Tpe"));
+    }
+
+    #[test]
+    fn raw_target_loader_args_are_filtered_from_internal_passthrough() {
+        for arg in [
+            "-A",
+            "-TPE",
+            "-parm",
+            "-b1000",
+            "-i401000",
+            "-c",
+            "-ooutput.i64",
+        ] {
+            assert!(is_raw_target_loader_arg(arg), "{arg}");
+        }
+        for arg in ["-Sscript.py", "-Lida.log"] {
+            assert!(!is_raw_target_loader_arg(arg), "{arg}");
+        }
+    }
+
+    #[test]
+    fn partial_database_cleanup_removes_packed_and_unpacked_outputs() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ida-mcp-partial-{unique}"));
+        fs::create_dir(&dir).expect("create temp dir");
+        let output = dir.join("blob.i64");
+        for path in [
+            output.clone(),
+            output.with_extension("id0"),
+            output.with_extension("id1"),
+            output.with_extension("id2"),
+            output.with_extension("nam"),
+            output.with_extension("til"),
+        ] {
+            fs::write(path, b"partial").expect("write partial output");
+        }
+
+        remove_partial_database_outputs(&output);
+
+        assert!(!output.exists());
+        assert!(!output.with_extension("id0").exists());
+        assert!(!output.with_extension("id1").exists());
+        assert!(!output.with_extension("id2").exists());
+        assert!(!output.with_extension("nam").exists());
+        assert!(!output.with_extension("til").exists());
+        fs::remove_dir_all(dir).expect("remove temp dir");
     }
 
     #[test]
@@ -637,11 +875,11 @@ mod tests {
     }
 
     #[test]
-    fn init_database_args_injects_non_interactive_flag_once() {
+    fn init_database_args_omits_legacy_auto_flag() {
         let args = init_database_args(&[]);
-        assert_eq!(args, vec!["-A".to_string()]);
+        assert!(args.is_empty());
 
         let args = init_database_args(&["-A".to_string(), "-Tpe".to_string()]);
-        assert_eq!(args.iter().filter(|arg| arg.as_str() == "-A").count(), 1);
+        assert_eq!(args, vec!["-Tpe".to_string()]);
     }
 }

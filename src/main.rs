@@ -25,6 +25,7 @@ use ida_mcp::{
     DbInfo, FunctionInfo, IdaMcpServer, IdaWorker, ServerMode,
 };
 use idalib::{idb::IDBOpenOptions, Address, IDB};
+#[cfg(not(target_os = "windows"))]
 use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::ServiceExt;
@@ -380,7 +381,11 @@ fn run_server_with_mode(
             );
             let task_registry = server.task_registry().clone();
             let sanitized = SanitizedIdaServer::with_filter(server, filter_for_server);
-            let mut service = match sanitized.serve(stdio()).await {
+            #[cfg(target_os = "windows")]
+            let transport = ida_mcp::server::stdio_transport::IdaSafeStdioTransport::new();
+            #[cfg(not(target_os = "windows"))]
+            let transport = stdio();
+            let mut service = match sanitized.serve(transport).await {
                 Ok(running) => Some(running),
                 Err(e) => {
                     // rmcp fails the serve future without answering the client
@@ -845,6 +850,7 @@ fn run_probe(args: ProbeArgs, allow_lumina: bool) -> anyhow::Result<()> {
         path: path.display().to_string(),
         file_type: format!("{:?}", meta.filetype()),
         processor: db.processor().long_name(),
+        processor_short: db.processor().short_name(),
         bits: if meta.is_64bit() {
             64
         } else if meta.is_32bit_exactly() {
@@ -852,6 +858,8 @@ fn run_probe(args: ProbeArgs, allow_lumina: bool) -> anyhow::Result<()> {
         } else {
             16
         },
+        base_address: meta.base_address().map(|address| format!("{address:#x}")),
+        entry_point: meta.start_address().map(|address| format!("{address:#x}")),
         function_count: db.function_count(),
         debug_info: None,
         analysis_status: ida::handlers::analysis::build_analysis_status(&db),
@@ -905,14 +913,10 @@ fn open_db_for_probe(path: &PathBuf, args: &ProbeArgs) -> Result<IDB, idalib::ID
         .unwrap_or("")
         .to_ascii_lowercase();
     let is_idb = ext == "i64" || ext == "idb" || ext == "id0";
-    let init_args = probe_init_database_args();
 
     if is_idb {
         let mut opts = IDBOpenOptions::new();
         opts.auto_analyse(args.auto_analyse).save(true);
-        for arg in &init_args {
-            opts.arg(arg);
-        }
         if args.auto_analyse {
             info!("Opening existing IDB with auto-analysis enabled");
         }
@@ -929,9 +933,6 @@ fn open_db_for_probe(path: &PathBuf, args: &ProbeArgs) -> Result<IDB, idalib::ID
             "Opening raw binary with auto-analysis (idb_out={})",
             out_path.display()
         );
-        for arg in &init_args {
-            opts.arg(arg);
-        }
         opts.idb(&out_path).save(true).open(path)
     }
 }
@@ -940,10 +941,6 @@ fn idb_path_for_raw_binary(path: &Path) -> PathBuf {
     let mut raw_idb = OsString::from(path.as_os_str());
     raw_idb.push(".i64");
     PathBuf::from(raw_idb)
-}
-
-fn probe_init_database_args() -> Vec<String> {
-    vec!["-A".to_string()]
 }
 
 fn parse_address(s: &str) -> anyhow::Result<u64> {

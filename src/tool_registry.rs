@@ -153,6 +153,12 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     like Mach-O/ELF/PE. Raw binaries are saved as .i64 alongside the input; \
                     if that generated .i64 already exists, ida-mcp opens it directly instead of rebuilding. \
                     Set rebuild=true only when the raw input changed or stale analysis should be overwritten. \
+                    For a headerless blob, set one or more raw-target fields: processor, bitness, \
+                    base_address, or entry_point. Any such field forces the Binary loader. Use an \
+                    explicit processor variant for multi-mode processors (for example \
+                    arm:ARMv7-M or metapc:80386p); base_address must be 16-byte aligned. \
+                    Raw-target fields only apply while creating a new database, so set rebuild=true \
+                    if a generated database already exists. \
                     Auto-analysis does NOT run by default — open returns quickly with the database \
                     loaded. Check analysis_status in the response: if auto_is_ok is false and you \
                     need xrefs/decompile, call analyze_funcs(background=true) and poll task_status. \
@@ -167,7 +173,7 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
                     In HTTP/SSE mode, keep the close_token returned by open_idb for sessionless MCP 2026 or cross-session close requests; the owning legacy session can close directly. \
                     Supports timeout_secs (default 300s, max 600s). Phase transitions are observable via recent_operations. \
                     Returns metadata about the binary: file type, processor, bitness, function count, analysis_status.",
-        example: r#"{"path": "/path/to/binary", "auto_analyse": false}"#,
+        example: r#"{"path": "/path/to/firmware.bin", "processor": "arm:ARMv7-M", "bitness": 32, "base_address": "0x08000000", "entry_point": "0x08000100", "auto_analyse": false}"#,
         default: true,
         keywords: &[
             "open", "load", "database", "binary", "idb", "i64", "macho", "elf", "pe",

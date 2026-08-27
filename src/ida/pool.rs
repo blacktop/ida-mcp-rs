@@ -1049,6 +1049,7 @@ impl PooledSessionState {
         force: bool,
         rebuild: bool,
         file_type: Option<String>,
+        raw_target: RawTarget,
         auto_analyse: bool,
         extra_args: Vec<String>,
         idb_out: Option<String>,
@@ -1064,6 +1065,7 @@ impl PooledSessionState {
             force,
             rebuild,
             file_type,
+            raw_target,
             auto_analyse,
             extra_args,
             idb_out,
@@ -1085,6 +1087,7 @@ impl PooledSessionState {
         force: bool,
         rebuild: bool,
         file_type: Option<String>,
+        raw_target: RawTarget,
         auto_analyse: bool,
         extra_args: Vec<String>,
         idb_out: Option<String>,
@@ -1105,6 +1108,7 @@ impl PooledSessionState {
                     force,
                     rebuild,
                     file_type,
+                    raw_target,
                     auto_analyse,
                     extra_args,
                     idb_out,
@@ -2115,6 +2119,7 @@ fn open_idb_child_args(
     force: bool,
     rebuild: bool,
     file_type: Option<String>,
+    raw_target: RawTarget,
     auto_analyse: bool,
     extra_args: Vec<String>,
     idb_out: Option<String>,
@@ -2128,6 +2133,10 @@ fn open_idb_child_args(
         "force": force,
         "rebuild": rebuild,
         "file_type": file_type,
+        "processor": raw_target.processor,
+        "bitness": raw_target.bitness.map(|value| value as i64),
+        "base_address": raw_target.base_address.map(|value| format!("{value:#x}")),
+        "entry_point": raw_target.entry_point.map(|value| format!("{value:#x}")),
         "auto_analyse": auto_analyse,
         "_worker_extra_args": extra_args,
         "_worker_idb_out": idb_out,
@@ -2341,7 +2350,7 @@ mod tests {
         open_idb_child_args, release_error_retires_worker, require_lease_generation,
         run_script_child_args, search_child_args, WorkerPool, WorkerPoolConfig,
     };
-    use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration};
+    use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawTarget};
     use serde_json::json;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -2406,6 +2415,7 @@ mod tests {
             false,
             false,
             Some("pe".to_string()),
+            RawTarget::default(),
             true,
             vec!["-A".to_string()],
             Some("/tmp/a.out.i64".to_string()),
@@ -2414,6 +2424,31 @@ mod tests {
         assert_eq!(open_args["timeout_secs"], json!(600));
         assert_eq!(open_args["rebuild"], json!(false));
         assert_eq!(open_args["_worker_idb_out"], json!("/tmp/a.out.i64"));
+
+        let raw_target = RawTarget {
+            processor: Some("metapc:80386p".to_string()),
+            bitness: Some(32),
+            base_address: Some(0x401000),
+            entry_point: Some(0x401000),
+        };
+        let raw_open_args = open_idb_child_args(
+            "/tmp/blob.bin",
+            false,
+            None,
+            false,
+            false,
+            true,
+            Some("Binary".to_string()),
+            raw_target,
+            false,
+            Vec::new(),
+            None,
+            Some(300),
+        );
+        assert_eq!(raw_open_args["processor"], json!("metapc:80386p"));
+        assert_eq!(raw_open_args["bitness"], json!(32));
+        assert_eq!(raw_open_args["base_address"], json!("0x401000"));
+        assert_eq!(raw_open_args["entry_point"], json!("0x401000"));
 
         let analyze_args = analyze_funcs_child_args(Some(600), false);
         assert_eq!(analyze_args["timeout_secs"], json!(600));

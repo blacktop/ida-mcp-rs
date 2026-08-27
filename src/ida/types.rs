@@ -2,13 +2,36 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Validated target settings for creating an IDA database from a headerless blob.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawTarget {
+    pub processor: Option<String>,
+    pub bitness: Option<u32>,
+    pub base_address: Option<u64>,
+    pub entry_point: Option<u64>,
+}
+
+impl RawTarget {
+    pub fn is_configured(&self) -> bool {
+        self.processor.is_some()
+            || self.bitness.is_some()
+            || self.base_address.is_some()
+            || self.entry_point.is_some()
+    }
+}
+
 /// Database info returned after opening
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DbInfo {
     pub path: String,
     pub file_type: String,
     pub processor: String,
+    pub processor_short: String,
     pub bits: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_point: Option<String>,
     pub function_count: usize,
     pub debug_info: Option<DebugInfoLoad>,
     pub analysis_status: AnalysisStatus,

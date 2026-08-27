@@ -21,6 +21,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         idalib_build::configure_linkage()?;
     }
 
+    let (sdk_path, _, _, _) = idalib_build::idalib_sdk_paths();
+    let mut cancel_bridge = cc::Build::new();
+    cancel_bridge
+        .cpp(true)
+        .file("src/ida_cancel.cpp")
+        .include(sdk_path.join("include"))
+        .define("__EA64__", "1")
+        .warnings(false);
+    if cfg!(target_os = "windows") {
+        cancel_bridge.define("__NT__", "1").std("c++17");
+    } else if cfg!(target_os = "macos") {
+        cancel_bridge
+            .define("__MACOS__", "1")
+            .flag_if_supported("-std=c++17");
+    } else {
+        cancel_bridge
+            .define("__LINUX__", "1")
+            .flag_if_supported("-std=c++17");
+    }
+    if cfg!(target_arch = "aarch64") {
+        cancel_bridge.define("__ARM__", "1");
+    }
+    cancel_bridge.compile("ida_mcp_cancel");
+
     // Compile the C crash guard (sigsetjmp-based signal isolation)
     #[cfg(unix)]
     cc::Build::new()
