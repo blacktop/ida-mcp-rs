@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 use crate::error::ToolError;
 use crate::ida::handlers::resolve_address;
 use crate::ida::handlers::{
-    address, analysis, annotations, controlflow, database, disasm, dscu, functions, globals,
-    imports, lumina, memory, script, search, segments, strings, structs, types, xrefs,
+    address, analysis, annotations, controlflow, database, debugger, disasm, dscu, functions,
+    globals, imports, lumina, memory, script, search, segments, strings, structs, types, xrefs,
 };
 use crate::ida::lock::release_mcp_lock;
 use crate::ida::observability::{
@@ -513,6 +513,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
     let mut version_mismatch = init_state.version_mismatch;
     let allow_lumina = init_state.allow_lumina;
     let mut isolated_idausr = init_state.isolated_idausr;
+    let mut debugger_runtime = debugger::DebuggerRuntime::default();
     #[cfg(target_os = "windows")]
     let mut _isolated_registry = init_state.isolated_registry;
 
@@ -561,7 +562,12 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             match req {
                 IdaRequest::Shutdown => {
                     info!("Worker shutting down after SDK version mismatch");
-                    shutdown_cleanup(&mut idb, &mut lock_file, &mut lock_path);
+                    shutdown_cleanup(
+                        &mut debugger_runtime,
+                        &mut idb,
+                        &mut lock_file,
+                        &mut lock_path,
+                    );
                     break;
                 }
                 other => {
@@ -599,6 +605,13 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     continue;
                 }
                 info!(path = %path, force, rebuild, file_type = ?file_type, auto_analyse, "Opening database");
+                if idb.is_some()
+                    && let Err(error) = debugger_runtime.close_session(&idb)
+                {
+                    error!(path = %path, error = %error, "Refusing to replace database while debugger teardown is incomplete");
+                    let _ = resp.send(Err(error));
+                    continue;
+                }
                 let had_open_database = idb.is_some();
                 let result = database::handle_open(
                     &mut idb,
@@ -680,6 +693,11 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::Close { resp } => {
                 info!("Closing database");
+                if let Err(error) = debugger_runtime.close_session(&idb) {
+                    warn!(%error, "Refusing to close database while debugger teardown is incomplete");
+                    let _ = resp.send(Err(error));
+                    continue;
+                }
                 if let Some(ref db) = idb {
                     info!(path = %db.path().display(), "Dropping IDB (will call close_database_with(save))");
                 }
@@ -687,7 +705,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 database_generation = None;
                 info!("IDB dropped, database should be packed");
                 release_mcp_lock(&mut lock_file, &mut lock_path);
-                let _ = resp.send(());
+                let _ = resp.send(Ok(()));
             }
             IdaRequest::CloseIfGeneration { generation, resp } => {
                 if database_generation == Some(generation) {
@@ -695,6 +713,11 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                         database_generation = generation.0,
                         "Closing matching database generation"
                     );
+                    if let Err(error) = debugger_runtime.close_session(&idb) {
+                        warn!(%error, "Refusing conditional close while debugger teardown is incomplete");
+                        let _ = resp.send(Err(error));
+                        continue;
+                    }
                     drop(idb.take());
                     database_generation = None;
                     release_mcp_lock(&mut lock_file, &mut lock_path);
@@ -721,6 +744,66 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     Ok(v) => debug!(result = %v, "Loaded debug info"),
                     Err(e) => warn!(error = %e, "Failed to load debug info"),
                 }
+                let _ = resp.send(result);
+            }
+            IdaRequest::DebugLaunch {
+                path,
+                arguments,
+                start_directory,
+                timeout_seconds,
+                resp,
+            } => {
+                debug!(path = %path, timeout_seconds, "Launching debugger target");
+                let result = crate::crash_guard::crash_guarded("debug_launch", || {
+                    debugger::launch(
+                        &mut debugger_runtime,
+                        &idb,
+                        &path,
+                        arguments.as_deref(),
+                        start_directory.as_deref(),
+                        timeout_seconds,
+                    )
+                });
+                log_result!(result, "Debugger target launched", "Debugger launch failed");
+                let _ = resp.send(result);
+            }
+            IdaRequest::DebugAttach {
+                pid,
+                timeout_seconds,
+                resp,
+            } => {
+                debug!(pid, timeout_seconds, "Attaching debugger target");
+                let result = crate::crash_guard::crash_guarded("debug_attach", || {
+                    debugger::attach(&mut debugger_runtime, &idb, pid, timeout_seconds)
+                });
+                log_result!(result, "Debugger target attached", "Debugger attach failed");
+                let _ = resp.send(result);
+            }
+            IdaRequest::DebugModules { resp } => {
+                debug!("Listing debugger modules");
+                let result = crate::crash_guard::crash_guarded("debug_modules", || {
+                    debugger::modules(&mut debugger_runtime, &idb)
+                });
+                log_result!(
+                    result,
+                    "Debugger modules listed",
+                    "Debugger module list failed"
+                );
+                let _ = resp.send(result);
+            }
+            IdaRequest::DebugStop {
+                action,
+                timeout_seconds,
+                resp,
+            } => {
+                debug!(
+                    action = action.as_str(),
+                    timeout_seconds, "Stopping debugger target"
+                );
+                let result = crate::crash_guard::crash_guarded("debug_stop", || {
+                    debugger::stop(&mut debugger_runtime, &idb, action, timeout_seconds)
+                });
+                log_result!(result, "Debugger target stopped", "Debugger stop failed");
                 let _ = resp.send(result);
             }
             IdaRequest::AnalysisStatus {
@@ -1941,7 +2024,12 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::Shutdown => {
                 info!("Worker shutting down");
-                shutdown_cleanup(&mut idb, &mut lock_file, &mut lock_path);
+                shutdown_cleanup(
+                    &mut debugger_runtime,
+                    &mut idb,
+                    &mut lock_file,
+                    &mut lock_path,
+                );
                 break;
             }
         }
@@ -1949,10 +2037,14 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
 }
 
 fn shutdown_cleanup(
+    debugger_runtime: &mut debugger::DebuggerRuntime,
     idb: &mut Option<IDB>,
     lock_file: &mut Option<File>,
     lock_path: &mut Option<PathBuf>,
 ) {
+    if let Err(error) = debugger_runtime.close_session(idb) {
+        warn!(%error, "debugger teardown did not complete before worker shutdown");
+    }
     // Explicitly close database to ensure IDA packs it before exit.
     if idb.take().is_some() {
         info!("Closing database before shutdown");
@@ -2001,12 +2093,14 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
 
     match req {
         IdaRequest::Shutdown => {} // always honour shutdown
-        IdaRequest::Close { resp } => {
-            let _ = resp.send(());
-        }
+        IdaRequest::Close { resp } => reject!(resp, err),
         IdaRequest::CloseIfGeneration { resp, .. } => reject!(resp, err),
         IdaRequest::Open { resp, .. } => reject!(resp, err),
         IdaRequest::LoadDebugInfo { resp, .. } => reject!(resp, err),
+        IdaRequest::DebugLaunch { resp, .. } => reject!(resp, err),
+        IdaRequest::DebugAttach { resp, .. } => reject!(resp, err),
+        IdaRequest::DebugModules { resp } => reject!(resp, err),
+        IdaRequest::DebugStop { resp, .. } => reject!(resp, err),
         IdaRequest::AnalysisStatus { resp, .. } => reject!(resp, err),
         IdaRequest::DscLoadImage { resp, .. } => reject!(resp, err),
         IdaRequest::DscLoadRegion { resp, .. } => reject!(resp, err),

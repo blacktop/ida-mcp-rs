@@ -5,6 +5,7 @@ pub mod analysis;
 pub mod annotations;
 pub mod controlflow;
 pub mod database;
+pub mod debugger;
 pub mod disasm;
 pub mod dscu;
 pub mod functions;

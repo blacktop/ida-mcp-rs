@@ -26,7 +26,7 @@ pub enum IdaRequest {
         resp: oneshot::Sender<Result<OpenedDatabase, ToolError>>,
     },
     Close {
-        resp: oneshot::Sender<()>,
+        resp: oneshot::Sender<Result<(), ToolError>>,
     },
     CloseIfGeneration {
         generation: DatabaseGeneration,
@@ -35,6 +35,26 @@ pub enum IdaRequest {
     LoadDebugInfo {
         path: Option<String>,
         verbose: bool,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    DebugLaunch {
+        path: String,
+        arguments: Option<String>,
+        start_directory: Option<String>,
+        timeout_seconds: u32,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    DebugAttach {
+        pid: u32,
+        timeout_seconds: u32,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    DebugModules {
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
+    DebugStop {
+        action: DebugStopAction,
+        timeout_seconds: u32,
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
     AnalysisStatus {

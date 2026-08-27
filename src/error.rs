@@ -92,6 +92,9 @@ pub enum ToolError {
     #[error("IDA error: {0}")]
     IdaError(String),
 
+    #[error("Debugger teardown incomplete: {0}")]
+    DebuggerTeardown(String),
+
     #[error("Not supported: {0}")]
     NotSupported(String),
 

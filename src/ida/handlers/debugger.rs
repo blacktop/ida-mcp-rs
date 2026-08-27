@@ -1,0 +1,637 @@
+#[cfg(target_os = "macos")]
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::{Child, Command, Stdio};
+#[cfg(target_os = "macos")]
+use std::thread;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+
+use idalib::debugger::DebuggerProcessState;
+use idalib::meta::FileType;
+use idalib::IDB;
+use serde_json::{json, Value};
+#[cfg(target_os = "macos")]
+use tracing::{debug, warn};
+
+use crate::error::ToolError;
+use crate::ida::types::DebugStopAction;
+
+const DEBUG_EVENT_TIMEOUT_MAX_SECS: u32 = 120;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MACOS_DEBUGGER_HELPER: &str = "mac_server_arm";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const MACOS_DEBUGGER_HELPER: &str = "mac_server";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugSessionKind {
+    Launched,
+    Attached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetArchitecture {
+    Arm,
+    Aarch64,
+    X86,
+    X86_64,
+}
+
+fn target_architecture(database: &IDB) -> Result<TargetArchitecture, ToolError> {
+    let processor = database.processor();
+    let family = processor.family();
+    let is_64bit = database.meta().is_64bit();
+    if family.is_arm() {
+        Ok(if is_64bit {
+            TargetArchitecture::Aarch64
+        } else {
+            TargetArchitecture::Arm
+        })
+    } else if family.is_386() {
+        Ok(if is_64bit {
+            TargetArchitecture::X86_64
+        } else {
+            TargetArchitecture::X86
+        })
+    } else {
+        Err(ToolError::NotSupported(format!(
+            "no debugger backend for target processor {}",
+            processor.short_name()
+        )))
+    }
+}
+
+fn debugger_backend_for_target(
+    file_type: FileType,
+    architecture: TargetArchitecture,
+) -> Result<&'static str, &'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        match (file_type, architecture) {
+            (FileType::MACHO, TargetArchitecture::Aarch64) => Ok("arm_mac"),
+            (FileType::MACHO, TargetArchitecture::X86 | TargetArchitecture::X86_64) => Ok("mac"),
+            (FileType::MACHO, TargetArchitecture::Arm) => {
+                Err("32-bit ARM Mach-O debugging is unsupported")
+            }
+            _ => Err("target is not a supported macOS executable"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match (file_type, architecture) {
+            (FileType::ELF, TargetArchitecture::X86 | TargetArchitecture::X86_64) => Ok("linux"),
+            (FileType::ELF, TargetArchitecture::Arm | TargetArchitecture::Aarch64) => {
+                Err("the ARM Linux debugger is remote-only and remote configuration is not exposed")
+            }
+            _ => Err("target is not a supported Linux executable"),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        match (file_type, architecture) {
+            (FileType::PE, TargetArchitecture::X86 | TargetArchitecture::X86_64) => Ok("win32"),
+            (FileType::PE, TargetArchitecture::Arm | TargetArchitecture::Aarch64) => {
+                Err("the IDA SDK does not provide a Windows-on-ARM user debugger")
+            }
+            _ => Err("target is not a supported Windows executable"),
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (file_type, architecture);
+        Err("debugger support is unavailable on this platform")
+    }
+}
+
+fn debugger_backend(database: &IDB) -> Result<&'static str, ToolError> {
+    let file_type = database.meta().filetype();
+    let architecture = target_architecture(database)?;
+    debugger_backend_for_target(file_type, architecture).map_err(|reason| {
+        ToolError::NotSupported(format!(
+            "no debugger backend for target {file_type:?}/{architecture:?}: {reason}"
+        ))
+    })
+}
+
+#[derive(Default)]
+pub struct DebuggerRuntime {
+    backend_loaded: bool,
+    session: Option<DebugSessionKind>,
+    #[cfg(target_os = "macos")]
+    helper: Option<MacDebuggerHelper>,
+}
+
+#[cfg(target_os = "macos")]
+struct MacDebuggerHelper {
+    child: Child,
+    port: u16,
+}
+
+impl Drop for DebuggerRuntime {
+    fn drop(&mut self) {
+        self.stop_helper();
+    }
+}
+
+impl DebuggerRuntime {
+    fn ensure_backend(&mut self, database: &IDB) -> Result<&'static str, ToolError> {
+        let backend = debugger_backend(database)?;
+        #[cfg(target_os = "macos")]
+        {
+            let port = self.ensure_macos_helper()?;
+            if !self.backend_loaded {
+                database
+                    .debugger_load(backend, true, Some("127.0.0.1"), Some(port))
+                    .map_err(debugger_error)?;
+                self.backend_loaded = true;
+            }
+            Ok(backend)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if !self.backend_loaded {
+                database
+                    .debugger_load(backend, false, None, None)
+                    .map_err(debugger_error)?;
+                self.backend_loaded = true;
+            }
+            Ok(backend)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if !self.backend_loaded {
+                database
+                    .debugger_load(backend, false, None, None)
+                    .map_err(debugger_error)?;
+                self.backend_loaded = true;
+            }
+            Ok(backend)
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            let _ = database;
+            let _ = backend;
+            Err(ToolError::InvalidParams(
+                "debugger support is unavailable on this platform".to_string(),
+            ))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ensure_macos_helper(&mut self) -> Result<u16, ToolError> {
+        if let Some(helper) = self.helper.as_mut() {
+            match helper.child.try_wait() {
+                Ok(None) => return Ok(helper.port),
+                Ok(Some(status)) => {
+                    debug!(%status, "signed macOS debugger helper exited; restarting");
+                    self.helper = None;
+                    self.backend_loaded = false;
+                }
+                Err(error) => {
+                    return Err(ToolError::IdaError(format!(
+                        "failed to inspect signed macOS debugger helper: {error}"
+                    )));
+                }
+            }
+        }
+
+        let path = macos_helper_path()?;
+        let listener =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(|error| {
+                ToolError::IdaError(format!("failed to reserve debugger loopback port: {error}"))
+            })?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| {
+                ToolError::IdaError(format!("failed to read debugger loopback port: {error}"))
+            })?
+            .port();
+        drop(listener);
+        let child = Command::new(&path)
+            .args(["-i", "127.0.0.1", "-p", &port.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                ToolError::IdaError(format!(
+                    "failed to start IDA's signed loopback debugger helper {}: {error}",
+                    path.display()
+                ))
+            })?;
+        self.helper = Some(MacDebuggerHelper { child, port });
+        thread::sleep(Duration::from_millis(250));
+        let Some(helper) = self.helper.as_mut() else {
+            return Err(ToolError::IdaError(
+                "signed macOS debugger helper was not retained".to_string(),
+            ));
+        };
+        if let Some(status) = helper.child.try_wait().map_err(|error| {
+            ToolError::IdaError(format!(
+                "failed to inspect signed macOS debugger helper: {error}"
+            ))
+        })? {
+            self.helper = None;
+            return Err(ToolError::IdaError(format!(
+                "IDA's signed macOS debugger helper exited during startup: {status}"
+            )));
+        }
+        Ok(port)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn stop_helper(&mut self) {}
+
+    #[cfg(target_os = "macos")]
+    fn stop_helper(&mut self) {
+        let Some(mut helper) = self.helper.take() else {
+            return;
+        };
+        if let Err(error) = helper.child.kill()
+            && error.kind() != std::io::ErrorKind::InvalidInput
+        {
+            warn!(%error, "failed to stop signed macOS debugger helper");
+        }
+        let _ = helper.child.wait();
+    }
+
+    pub fn close_session(&mut self, idb: &Option<IDB>) -> Result<(), ToolError> {
+        let Some(database) = idb.as_ref() else {
+            self.session = None;
+            self.backend_loaded = false;
+            self.stop_helper();
+            return Ok(());
+        };
+        match self.session {
+            Some(DebugSessionKind::Launched) => database.debugger_terminate(5),
+            Some(DebugSessionKind::Attached) => database.debugger_detach(5),
+            None => Ok(0),
+        }
+        .map_err(|error| ToolError::DebuggerTeardown(error.to_string()))?;
+        self.session = None;
+        self.backend_loaded = false;
+        self.stop_helper();
+        Ok(())
+    }
+}
+
+pub fn runtime_status() -> Value {
+    #[cfg(target_os = "macos")]
+    {
+        match macos_helper_path() {
+            Ok(path) => json!({
+                "status": "user_action_required",
+                "platform": "macos",
+                "backends": ["arm_mac", "mac"],
+                "backend_selection": "opened_database_target",
+                "transport": "signed_loopback_helper",
+                "helper_path": path,
+                "authorization": "IDA's Take Control authorization may be required once per login before macOS permits task control",
+                "message": "Debugger tools are opt-in. ida-mcp uses IDA's signed loopback helper and never requests root, disables SIP, changes authorizationdb, or re-signs binaries."
+            }),
+            Err(error) => json!({
+                "status": "unavailable",
+                "platform": "macos",
+                "backends": ["arm_mac", "mac"],
+                "backend_selection": "opened_database_target",
+                "transport": "signed_loopback_helper",
+                "message": error.to_string(),
+            }),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        json!({
+            "status": "unavailable",
+            "platform": "linux",
+            "backends": ["linux"],
+            "backend_selection": "opened_database_target",
+            "message": "Linux debugger advertisement is gated until the native integration oracle passes; ptrace_scope may also require user action for attach."
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        json!({
+            "status": "unavailable",
+            "platform": "windows",
+            "backends": ["win32"],
+            "backend_selection": "opened_database_target",
+            "message": "Windows debugger advertisement is gated until the native PowerShell integration oracle passes."
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    json!({
+        "status": "unavailable",
+        "platform": std::env::consts::OS,
+        "message": "IDA debugger support is unavailable on this platform."
+    })
+}
+
+pub fn launch(
+    runtime: &mut DebuggerRuntime,
+    idb: &Option<IDB>,
+    path: &str,
+    arguments: Option<&str>,
+    start_directory: Option<&str>,
+    timeout_seconds: u32,
+) -> Result<Value, ToolError> {
+    validate_timeout(timeout_seconds)?;
+    let database = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let backend = runtime.ensure_backend(database)?;
+    match database.debugger_launch(path, arguments, start_directory, timeout_seconds) {
+        Ok(event_code) => {
+            runtime.session = Some(DebugSessionKind::Launched);
+            Ok(session_result(database, backend, "ready", event_code, None))
+        }
+        Err(error)
+            if cfg!(target_os = "macos") && macos_authorization_failure(&error.to_string()) =>
+        {
+            Ok(json!({
+            "status": "user_action_required",
+            "platform": "macos",
+            "backend": backend,
+            "process_state": process_state_name(database.debugger_process_state()),
+            "message": "macOS denied or cancelled task control. Complete IDA's Take Control authorization for this login, then retry. ida-mcp will not request root, disable SIP, change authorizationdb, or re-sign binaries.",
+            "error": error.to_string(),
+            }))
+        }
+        Err(error) => Err(debugger_error(error)),
+    }
+}
+
+pub fn attach(
+    runtime: &mut DebuggerRuntime,
+    idb: &Option<IDB>,
+    pid: u32,
+    timeout_seconds: u32,
+) -> Result<Value, ToolError> {
+    validate_timeout(timeout_seconds)?;
+    let database = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let backend = runtime.ensure_backend(database)?;
+    match database.debugger_attach(pid, timeout_seconds) {
+        Ok(event_code) => {
+            runtime.session = Some(DebugSessionKind::Attached);
+            Ok(session_result(database, backend, "ready", event_code, None))
+        }
+        Err(error)
+            if cfg!(target_os = "macos") && macos_authorization_failure(&error.to_string()) =>
+        {
+            Ok(json!({
+                "status": "user_action_required",
+                "platform": "macos",
+                "backend": backend,
+                "process_state": process_state_name(database.debugger_process_state()),
+                "message": "macOS denied task attachment. Complete IDA's Take Control authorization for this login, then retry.",
+                "error": error.to_string(),
+            }))
+        }
+        Err(error) => Err(debugger_error(error)),
+    }
+}
+
+pub fn modules(runtime: &mut DebuggerRuntime, idb: &Option<IDB>) -> Result<Value, ToolError> {
+    let database = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let backend = runtime.ensure_backend(database)?;
+    let modules = database.debugger_modules().map_err(debugger_error)?;
+    let modules = modules
+        .into_iter()
+        .map(|module| {
+            json!({
+                "path": module.path,
+                "base": format!("{:#x}", module.base),
+                "base_value": module.base,
+                "size": module.size,
+                "end": format!("{:#x}", module.base.saturating_add(module.size)),
+                "end_value": module.base.saturating_add(module.size),
+                "rebase_to": format!("{:#x}", module.rebase_to),
+                "rebase_to_value": module.rebase_to,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "status": "ready",
+        "backend": backend,
+        "process_state": process_state_name(database.debugger_process_state()),
+        "module_count": modules.len(),
+        "modules": modules,
+    }))
+}
+
+pub fn stop(
+    runtime: &mut DebuggerRuntime,
+    idb: &Option<IDB>,
+    action: DebugStopAction,
+    timeout_seconds: u32,
+) -> Result<Value, ToolError> {
+    validate_timeout(timeout_seconds)?;
+    let database = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    let backend = runtime.ensure_backend(database)?;
+    let resolved = match action {
+        DebugStopAction::Auto => match runtime.session {
+            Some(DebugSessionKind::Launched) => DebugStopAction::Terminate,
+            Some(DebugSessionKind::Attached) | None => DebugStopAction::Detach,
+        },
+        explicit => explicit,
+    };
+    let event_code = match resolved {
+        DebugStopAction::Detach => database.debugger_detach(timeout_seconds),
+        DebugStopAction::Terminate => database.debugger_terminate(timeout_seconds),
+        DebugStopAction::Auto => {
+            return Err(ToolError::IdaError(
+                "internal debugger stop policy was not resolved".to_string(),
+            ));
+        }
+    }
+    .map_err(debugger_error)?;
+    runtime.session = None;
+    Ok(session_result(
+        database,
+        backend,
+        "ready",
+        event_code,
+        Some(resolved.as_str()),
+    ))
+}
+
+fn validate_timeout(timeout_seconds: u32) -> Result<(), ToolError> {
+    if timeout_seconds == 0 || timeout_seconds > DEBUG_EVENT_TIMEOUT_MAX_SECS {
+        return Err(ToolError::InvalidParams(format!(
+            "debugger timeout must be between 1 and {DEBUG_EVENT_TIMEOUT_MAX_SECS} seconds"
+        )));
+    }
+    Ok(())
+}
+
+fn session_result(
+    database: &IDB,
+    backend: &str,
+    status: &str,
+    event_code: i32,
+    action: Option<&str>,
+) -> Value {
+    let mut result = json!({
+        "status": status,
+        "backend": backend,
+        "event_code": event_code,
+        "process_state": process_state_name(database.debugger_process_state()),
+    });
+    if let Some(action) = action {
+        result["action"] = json!(action);
+    }
+    result
+}
+
+fn process_state_name(state: DebuggerProcessState) -> String {
+    match state {
+        DebuggerProcessState::Suspended => "suspended".to_string(),
+        DebuggerProcessState::NoProcess => "no_process".to_string(),
+        DebuggerProcessState::Running => "running".to_string(),
+        DebuggerProcessState::Unknown(value) => format!("unknown_{value}"),
+    }
+}
+
+fn debugger_error(error: idalib::IDAError) -> ToolError {
+    ToolError::IdaError(format!("IDA debugger operation failed: {error}"))
+}
+
+fn macos_authorization_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "authorization",
+        "cancelled",
+        "canceled",
+        "task_for_pid",
+        "take control",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_helper_path() -> Result<PathBuf, ToolError> {
+    let configured_dir = std::env::var_os("IDADIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    let default_dirs = [
+        Path::new("/Applications/IDA Professional 9.4.app/Contents/MacOS"),
+        Path::new("/Applications/IDA Pro 9.4.app/Contents/MacOS"),
+    ];
+
+    find_macos_helper(
+        configured_dir
+            .as_deref()
+            .into_iter()
+            .chain(default_dirs),
+    )
+    .ok_or_else(|| {
+        ToolError::InvalidParams(format!(
+            "cannot find signed macOS debugger helper {MACOS_DEBUGGER_HELPER}; set IDADIR to the IDA 9.4 installation directory"
+        ))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn find_macos_helper<'a>(ida_dirs: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf> {
+    ida_dirs
+        .into_iter()
+        .map(|ida_dir| ida_dir.join("dbgsrv").join(MACOS_DEBUGGER_HELPER))
+        .find(|helper| helper.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use idalib::meta::FileType;
+
+    use crate::ida::handlers::debugger::{
+        debugger_backend_for_target, macos_authorization_failure, TargetArchitecture,
+    };
+    use crate::ida::types::DebugStopAction;
+
+    #[cfg(target_os = "macos")]
+    use crate::ida::handlers::debugger::{find_macos_helper, MACOS_DEBUGGER_HELPER};
+
+    #[test]
+    fn stop_action_is_explicit_and_bounded() {
+        assert_eq!(DebugStopAction::parse(None), Ok(DebugStopAction::Auto));
+        assert_eq!(
+            DebugStopAction::parse(Some("detach")),
+            Ok(DebugStopAction::Detach)
+        );
+        assert!(DebugStopAction::parse(Some("continue")).is_err());
+    }
+
+    #[test]
+    fn macos_authorization_classification_does_not_hide_target_errors() {
+        assert!(macos_authorization_failure(
+            "user cancelled Take Control authorization"
+        ));
+        assert!(macos_authorization_failure(
+            "task_for_pid authorization failed"
+        ));
+        assert!(!macos_authorization_failure(
+            "permission denied while opening executable"
+        ));
+        assert!(!macos_authorization_failure(
+            "process 999999999 does not exist"
+        ));
+        assert!(!macos_authorization_failure(
+            "remote debugger protocol mismatch"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn loaded_x86_64_macho_selects_mac_backend() {
+        assert_eq!(
+            debugger_backend_for_target(FileType::MACHO, TargetArchitecture::X86_64),
+            Ok("mac")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn loaded_aarch64_macho_selects_arm_mac_backend() {
+        assert_eq!(
+            debugger_backend_for_target(FileType::MACHO, TargetArchitecture::Aarch64),
+            Ok("arm_mac")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn arm_linux_target_rejects_unconfigured_remote_backend() {
+        assert!(debugger_backend_for_target(FileType::ELF, TargetArchitecture::Aarch64).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_arm_target_rejects_missing_user_backend() {
+        assert!(debugger_backend_for_target(FileType::PE, TargetArchitecture::Aarch64).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_helper_discovery_does_not_require_idat() {
+        let ida_dir =
+            std::env::temp_dir().join(format!("ida-mcp-debugger-helper-{}", uuid::Uuid::new_v4()));
+        let helper = ida_dir.join("dbgsrv").join(MACOS_DEBUGGER_HELPER);
+        std::fs::create_dir_all(helper.parent().expect("helper has a parent"))
+            .expect("create debugger helper directory");
+        std::fs::write(&helper, b"").expect("create debugger helper");
+
+        let discovered = find_macos_helper([ida_dir.as_path()]);
+        let _ = std::fs::remove_dir_all(&ida_dir);
+
+        assert_eq!(discovered, Some(helper));
+    }
+}

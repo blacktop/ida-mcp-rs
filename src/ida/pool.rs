@@ -1468,6 +1468,56 @@ impl WorkspaceDatabase {
         .await
     }
 
+    pub async fn debug_launch(
+        &self,
+        path: &str,
+        arguments: Option<String>,
+        start_directory: Option<String>,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        self.call_value(
+            "debug_launch",
+            json!({
+                "path": path,
+                "arguments": arguments,
+                "start_directory": start_directory,
+                "timeout_secs": timeout_seconds,
+            }),
+            Some(u64::from(timeout_seconds).saturating_add(5)),
+            None,
+        )
+        .await
+    }
+
+    pub async fn debug_attach(&self, pid: u32, timeout_seconds: u32) -> Result<Value, ToolError> {
+        self.call_value(
+            "debug_attach",
+            json!({ "pid": pid, "timeout_secs": timeout_seconds }),
+            Some(u64::from(timeout_seconds).saturating_add(5)),
+            None,
+        )
+        .await
+    }
+
+    pub async fn debug_modules(&self) -> Result<Value, ToolError> {
+        self.call_value("debug_modules", json!({}), None, None)
+            .await
+    }
+
+    pub async fn debug_stop(
+        &self,
+        action: DebugStopAction,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        self.call_value(
+            "debug_stop",
+            json!({ "action": action.as_str(), "timeout_secs": timeout_seconds }),
+            Some(u64::from(timeout_seconds).saturating_add(5)),
+            None,
+        )
+        .await
+    }
+
     pub async fn analysis_status(&self) -> Result<AnalysisStatus, ToolError> {
         self.analysis_status_for_generation(None).await
     }
@@ -2592,6 +2642,7 @@ fn release_error_retires_worker(err: &ToolError) -> bool {
         ToolError::Timeout(_)
             | ToolError::TimeoutDetailed(_)
             | ToolError::Cancelled(_)
+            | ToolError::DebuggerTeardown(_)
             | ToolError::WorkerCrashed { .. }
             | ToolError::RemoteProtocol(_)
             | ToolError::WorkerClosed
@@ -2929,6 +2980,9 @@ mod tests {
         )));
         assert!(release_error_retires_worker(&ToolError::Timeout(5)));
         assert!(release_error_retires_worker(&ToolError::WorkerClosed));
+        assert!(release_error_retires_worker(&ToolError::DebuggerTeardown(
+            "terminal event missing".to_string()
+        )));
     }
 
     #[test]

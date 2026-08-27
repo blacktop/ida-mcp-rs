@@ -312,14 +312,14 @@ impl IdaWorker {
             Some(Duration::from_secs(CLOSE_SEND_TIMEOUT_SECS)),
         )
         .await?;
-        rx.await.map_err(|_| ToolError::WorkerClosed)
+        rx.await.map_err(|_| ToolError::WorkerClosed)?
     }
 
     pub async fn close_for_shutdown(&self) -> Result<(), ToolError> {
         let (tx, rx) = oneshot::channel();
         self.send_with_retry(IdaRequest::Close { resp: tx }, None)
             .await?;
-        rx.await.map_err(|_| ToolError::WorkerClosed)
+        rx.await.map_err(|_| ToolError::WorkerClosed)?
     }
 
     /// Load external debug info (e.g., dSYM/DWARF) into the current database.
@@ -335,6 +335,54 @@ impl IdaWorker {
             resp: tx,
         })?;
         rx.await?
+    }
+
+    pub async fn debug_launch(
+        &self,
+        path: &str,
+        arguments: Option<String>,
+        start_directory: Option<String>,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DebugLaunch {
+            path: path.to_string(),
+            arguments,
+            start_directory,
+            timeout_seconds,
+            resp: tx,
+        })?;
+        Self::recv_with_timeout(rx, Some(u64::from(timeout_seconds).saturating_add(5))).await
+    }
+
+    pub async fn debug_attach(&self, pid: u32, timeout_seconds: u32) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DebugAttach {
+            pid,
+            timeout_seconds,
+            resp: tx,
+        })?;
+        Self::recv_with_timeout(rx, Some(u64::from(timeout_seconds).saturating_add(5))).await
+    }
+
+    pub async fn debug_modules(&self) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DebugModules { resp: tx })?;
+        Self::recv(rx).await
+    }
+
+    pub async fn debug_stop(
+        &self,
+        action: DebugStopAction,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::DebugStop {
+            action,
+            timeout_seconds,
+            resp: tx,
+        })?;
+        Self::recv_with_timeout(rx, Some(u64::from(timeout_seconds).saturating_add(5))).await
     }
 
     /// Report current auto-analysis status.
@@ -1559,6 +1607,52 @@ impl WorkerBackend {
         match self {
             Self::Local(worker) => worker.load_debug_info(path, verbose).await,
             Self::Pooled(state) => state.load_debug_info(path, verbose).await,
+        }
+    }
+
+    pub async fn debug_launch(
+        &self,
+        path: &str,
+        arguments: Option<String>,
+        start_directory: Option<String>,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => {
+                worker
+                    .debug_launch(path, arguments, start_directory, timeout_seconds)
+                    .await
+            }
+            Self::Pooled(state) => {
+                state
+                    .debug_launch(path, arguments, start_directory, timeout_seconds)
+                    .await
+            }
+        }
+    }
+
+    pub async fn debug_attach(&self, pid: u32, timeout_seconds: u32) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.debug_attach(pid, timeout_seconds).await,
+            Self::Pooled(state) => state.debug_attach(pid, timeout_seconds).await,
+        }
+    }
+
+    pub async fn debug_modules(&self) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.debug_modules().await,
+            Self::Pooled(state) => state.debug_modules().await,
+        }
+    }
+
+    pub async fn debug_stop(
+        &self,
+        action: DebugStopAction,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.debug_stop(action, timeout_seconds).await,
+            Self::Pooled(state) => state.debug_stop(action, timeout_seconds).await,
         }
     }
 

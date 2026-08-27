@@ -3,6 +3,34 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugStopAction {
+    Auto,
+    Detach,
+    Terminate,
+}
+
+impl DebugStopAction {
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "detach" => Ok(Self::Detach),
+            "terminate" | "kill" => Ok(Self::Terminate),
+            value => Err(format!(
+                "action must be auto, detach, or terminate (got {value:?})"
+            )),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Detach => "detach",
+            Self::Terminate => "terminate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallGraphDirection {
     Callees,
     Callers,
