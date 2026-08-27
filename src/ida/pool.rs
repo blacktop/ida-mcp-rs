@@ -1346,6 +1346,7 @@ impl WorkspaceDatabase {
         rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
+        raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
         idb_out: Option<String>,
         timeout_secs: Option<u64>,
@@ -1361,6 +1362,7 @@ impl WorkspaceDatabase {
             rebuild,
             file_type,
             auto_analyse,
+            raw_target,
             extra_args,
             idb_out,
             timeout_secs,
@@ -1382,6 +1384,7 @@ impl WorkspaceDatabase {
         rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
+        raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
         idb_out: Option<String>,
         timeout_secs: Option<u64>,
@@ -1402,6 +1405,7 @@ impl WorkspaceDatabase {
                     rebuild,
                     file_type,
                     auto_analyse,
+                    raw_target,
                     extra_args,
                     idb_out,
                     timeout_secs,
@@ -2412,6 +2416,7 @@ fn open_idb_child_args(
     rebuild: bool,
     file_type: Option<String>,
     auto_analyse: bool,
+    raw_target: RawBinaryTarget,
     extra_args: Vec<String>,
     idb_out: Option<String>,
     timeout_secs: Option<u64>,
@@ -2425,6 +2430,10 @@ fn open_idb_child_args(
         "rebuild": rebuild,
         "file_type": file_type,
         "auto_analyse": auto_analyse,
+        "processor": raw_target.processor,
+        "bitness": raw_target.bitness.map(idalib::segment::Bitness::bits),
+        "base_address": raw_target.base_address.map(remote::hex_addr),
+        "entry_point": raw_target.entry_point.map(remote::hex_addr),
         "_worker_extra_args": extra_args,
         "_worker_idb_out": idb_out,
         "timeout_secs": timeout_secs,
@@ -2637,7 +2646,7 @@ mod tests {
         open_idb_child_args, release_error_retires_worker, require_lease_generation,
         run_script_child_args, search_child_args, WorkerPool, WorkerPoolConfig, WorkspaceRegistry,
     };
-    use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration};
+    use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget};
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
@@ -2786,7 +2795,13 @@ mod tests {
     }
 
     #[test]
-    fn pooled_observed_child_args_forward_timeouts() {
+    fn pooled_observed_child_args_forward_timeouts_and_raw_target() {
+        let raw_target = RawBinaryTarget {
+            processor: Some("arm:ARMv7-M".to_string()),
+            bitness: Some(idalib::segment::Bitness::Bits32),
+            base_address: Some(0x0800_0000),
+            entry_point: Some(0x0800_0100),
+        };
         let open_args = open_idb_child_args(
             "/tmp/a",
             true,
@@ -2796,12 +2811,17 @@ mod tests {
             false,
             Some("pe".to_string()),
             true,
+            raw_target,
             vec!["-A".to_string()],
             Some("/tmp/a.out.i64".to_string()),
             Some(600),
         );
         assert_eq!(open_args["timeout_secs"], json!(600));
         assert_eq!(open_args["rebuild"], json!(false));
+        assert_eq!(open_args["processor"], json!("arm:ARMv7-M"));
+        assert_eq!(open_args["bitness"], json!(32));
+        assert_eq!(open_args["base_address"], json!("0x8000000"));
+        assert_eq!(open_args["entry_point"], json!("0x8000100"));
         assert_eq!(open_args["_worker_idb_out"], json!("/tmp/a.out.i64"));
 
         let analyze_args = analyze_funcs_child_args(Some(600), false);

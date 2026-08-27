@@ -12,7 +12,7 @@ pub use requests::*;
 use crate::error::ToolError;
 use crate::ida::observability::{ProgressReceiver, ProgressSender};
 use crate::ida::pool::CHILD_TIMEOUT_GRACE_SECS;
-use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration};
+use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget};
 use crate::ida::worker::{
     CloseAuthorization, CloseTokenGrant, IdaWorker, WorkerBackend, MAX_TIMEOUT_SECS,
 };
@@ -329,6 +329,43 @@ fn direct_dsc_cache_i64_path(dsc_path: &std::path::Path) -> std::path::PathBuf {
     absolute.hash(&mut hasher);
     let hash = hasher.finish();
     std::env::temp_dir().join(format!("ida-mcp-dsc-{name}-{hash:016x}.i64"))
+}
+
+fn validate_raw_processor(processor: &str) -> Result<(), ToolError> {
+    if processor.len() > 128 || processor.chars().any(char::is_control) {
+        return Err(ToolError::InvalidParams(
+            "processor must be at most 128 characters and contain no control characters"
+                .to_string(),
+        ));
+    }
+
+    let normalized = processor.to_ascii_lowercase();
+    let hint = match normalized.as_str() {
+        "arm" => Some(
+            "\"arm\" is ambiguous for a raw blob in headless mode; use an explicit variant such as \"arm:ARMv7-M\" or \"arm:ARMv8-A\"",
+        ),
+        "metapc" | "pc" => Some(
+            "\"metapc\" is ambiguous for a raw blob in headless mode; use an explicit variant such as \"metapc:80386p\"",
+        ),
+        "mips" | "mipsl" | "mipsb" | "ppc" | "riscv" => Some(
+            "the selected processor has ambiguous modes for a raw blob in headless mode; use an explicit processor:variant",
+        ),
+        _ => None,
+    };
+    if let Some(hint) = hint {
+        return Err(ToolError::InvalidParams(hint.to_string()));
+    }
+    Ok(())
+}
+
+fn raw_blob_idb_path(input: &str, idb_out: Option<&str>) -> std::path::PathBuf {
+    if let Some(idb_out) = idb_out {
+        return crate::expand_path(idb_out);
+    }
+    let input = crate::expand_path(input);
+    let mut output = std::ffi::OsString::from(input.as_os_str());
+    output.push(".i64");
+    std::path::PathBuf::from(output)
 }
 
 impl TemporaryFileCleanup {
@@ -1176,6 +1213,7 @@ impl IdaMcpServer {
                 false,
                 file_type.map(str::to_string),
                 false,
+                RawBinaryTarget::default(),
                 Vec::new(),
                 None,
                 None,
@@ -1501,6 +1539,7 @@ impl IdaMcpServer {
                 false,
                 None,
                 auto_analyse,
+                RawBinaryTarget::default(),
                 Vec::new(),
                 idb_out.as_ref().map(|path| path.display().to_string()),
                 None,
@@ -1829,8 +1868,9 @@ fn apply_close_metadata(
 impl IdaMcpServer {
     #[tool(
         description = "Open an IDA database (.i64/.idb) or raw binary (Mach-O/ELF/PE). \
-        Raw binaries are saved as .i64 alongside the input and later raw-path opens reuse \
-        that database unless rebuild=true is set. \
+        Raw binaries default to a .i64 alongside the input; idb_out selects another output path. \
+        Later raw-path opens reuse only a database whose recorded input SHA-256 matches. \
+        rebuild=true may replace only a provenance-matched database. \
         For raw binaries, auto-analysis is OFF by default — check analysis_status; \
         call analyze_funcs(background=true) for full xrefs/decompile. \
         Returns close_token in HTTP/SSE mode (provide to close_idb). \
@@ -1857,24 +1897,99 @@ impl IdaMcpServer {
             Err(error) => return Ok(error.to_tool_result().into()),
         };
 
+        let input_is_database = Self::is_database_path(&path);
         let debug_info_path = req.normalized_debug_info_path();
         let file_type = req.normalized_file_type();
+        let processor = req.normalized_processor();
+        if let Some(processor) = processor.as_deref()
+            && let Err(error) = validate_raw_processor(processor)
+        {
+            return Ok(error.to_tool_result().into());
+        }
+        let bitness_value = match parse_optional_unsigned::<u32>(req.bitness, "bitness") {
+            Ok(value) => value,
+            Err(error) => return Ok(error.to_tool_result().into()),
+        };
+        let bitness = match bitness_value {
+            None => None,
+            Some(16) => Some(idalib::segment::Bitness::Bits16),
+            Some(32) => Some(idalib::segment::Bitness::Bits32),
+            Some(64) => Some(idalib::segment::Bitness::Bits64),
+            Some(_) => {
+                return Ok(
+                    ToolError::InvalidParams("bitness must be 16, 32, or 64".to_string())
+                        .to_tool_result()
+                        .into(),
+                );
+            }
+        };
+        let base_address = match req
+            .base_address
+            .as_ref()
+            .map(|value| Self::value_to_exactly_one_address(value, "base_address"))
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(error.to_tool_result().into()),
+        };
+        if base_address.is_some_and(|address| address & 0xf != 0) {
+            return Ok(ToolError::InvalidParams(
+                "base_address must be 16-byte aligned".to_string(),
+            )
+            .to_tool_result()
+            .into());
+        }
+        let entry_point = match req
+            .entry_point
+            .as_ref()
+            .map(|value| Self::value_to_exactly_one_address(value, "entry_point"))
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => return Ok(error.to_tool_result().into()),
+        };
+        let public_idb_out = req.normalized_idb_out();
+        let raw_target = RawBinaryTarget {
+            processor,
+            bitness,
+            base_address,
+            entry_point,
+        };
+        if input_is_database && (public_idb_out.is_some() || !raw_target.is_empty()) {
+            return Ok(ToolError::InvalidParams(
+                "processor, bitness, base_address, entry_point, and idb_out are only valid when opening a raw input"
+                    .to_string(),
+            )
+            .to_tool_result()
+            .into());
+        }
+        if !raw_target.is_empty()
+            && !req.rebuild.unwrap_or(false)
+            && raw_blob_idb_path(&path, public_idb_out.as_deref()).exists()
+        {
+            return Ok(ToolError::InvalidParams(
+                "raw target options only affect a newly-created database; the output already exists. Set rebuild=true to recreate it, or omit processor/bitness/base_address/entry_point to reuse the verified database."
+                    .to_string(),
+            )
+            .to_tool_result()
+            .into());
+        }
         let worker_extra_args = if matches!(self.mode, ServerMode::Worker) {
             req.worker_extra_args.clone()
         } else {
             Vec::new()
         };
-        let worker_idb_out = if matches!(self.mode, ServerMode::Worker) {
-            req.worker_idb_out.clone()
+        let idb_out = if matches!(self.mode, ServerMode::Worker) {
+            req.worker_idb_out.clone().or(public_idb_out)
         } else {
-            None
+            public_idb_out
         };
         let open_timeout_secs = timeout_secs.unwrap_or(300).min(MAX_TIMEOUT_SECS);
         let foreground_timeout_secs = self.foreground_timeout_secs(timeout_secs, 300);
         let user_auto_analyse = req.auto_analyse.unwrap_or(false);
         let large_input_size = if !matches!(self.mode, ServerMode::Worker)
             && user_auto_analyse
-            && !Self::is_database_path(&path)
+            && !input_is_database
         {
             Self::input_size_above_threshold(&path)
         } else {
@@ -1925,8 +2040,9 @@ impl IdaMcpServer {
                         req.rebuild.unwrap_or(false),
                         file_type.clone(),
                         effective_auto_analyse,
+                        raw_target.clone(),
                         worker_extra_args.clone(),
-                        worker_idb_out.clone(),
+                        idb_out.clone(),
                         Some(open_timeout_secs),
                         Some(progress_tx),
                         Some(cancel),

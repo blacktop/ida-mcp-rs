@@ -4,16 +4,18 @@ use crate::error::ToolError;
 use crate::expand_path;
 use crate::ida::handlers::analysis::build_analysis_status;
 use crate::ida::lock::{
-    acquire_mcp_lock, clean_stale_mcp_lock, detect_db_lock, release_mcp_lock_file,
+    acquire_mcp_lock, clean_stale_mcp_lock, detect_db_lock, release_mcp_lock_file, McpLock,
 };
 use crate::ida::observability::{
     emit_progress, ensure_not_cancelled, ProgressHeartbeat, ProgressSender, OPEN_IDB_PROGRESS_TOTAL,
 };
-use crate::ida::types::{DbInfo, DebugInfoLoad};
+use crate::ida::types::{DbInfo, DebugInfoLoad, RawBinaryTarget};
 use idalib::{IDBOpenOptions, IDB};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -21,19 +23,24 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Build `DbInfo` from an open IDB.
+fn database_bitness(db: &IDB) -> u32 {
+    let meta = db.meta();
+    if meta.is_64bit() {
+        64
+    } else if meta.is_32bit_exactly() {
+        32
+    } else {
+        16
+    }
+}
+
 fn build_db_info(db: &IDB, path: &str, debug_info: Option<DebugInfoLoad>) -> DbInfo {
     let meta = db.meta();
     DbInfo {
         path: path.to_string(),
         file_type: format!("{:?}", meta.filetype()),
         processor: db.processor().long_name(),
-        bits: if meta.is_64bit() {
-            64
-        } else if meta.is_32bit_exactly() {
-            32
-        } else {
-            16
-        },
+        bits: database_bitness(db),
         function_count: db.function_count(),
         debug_info,
         analysis_status: build_analysis_status(db),
@@ -77,17 +84,32 @@ fn idb_path_for_raw_binary(path: &Path) -> PathBuf {
 
 fn existing_idb_for_raw_binary(path: &Path) -> Option<PathBuf> {
     let idb_path = idb_path_for_raw_binary(path);
-    idb_path.exists().then_some(idb_path)
+    ida_database_output_exists(&idb_path).then_some(idb_path)
 }
 
 fn existing_idb_for_raw_open(path: &Path, explicit_idb_out: Option<&Path>) -> Option<PathBuf> {
     if let Some(explicit_idb_out) = explicit_idb_out {
-        explicit_idb_out
-            .exists()
-            .then_some(explicit_idb_out.to_path_buf())
+        ida_database_output_exists(explicit_idb_out).then_some(explicit_idb_out.to_path_buf())
     } else {
         existing_idb_for_raw_binary(path)
     }
+}
+
+fn database_artifact_paths(output: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![output.to_path_buf()];
+    for extension in ["id0", "id1", "id2", "nam", "til"] {
+        let mut candidate = output.to_path_buf();
+        candidate.set_extension(extension);
+        candidates.push(candidate);
+    }
+    candidates
+}
+
+fn ida_database_output_exists(output: &Path) -> bool {
+    output.exists()
+        || unpacked_id0_path(output)
+            .as_deref()
+            .is_some_and(Path::exists)
 }
 
 fn has_ida_database_extension(path: &Path) -> bool {
@@ -139,6 +161,238 @@ fn init_database_args(extra_args: &[String]) -> Vec<String> {
     args
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingRawIdbAction {
+    Reuse,
+    Rebuild,
+}
+
+fn existing_raw_idb_action(
+    rebuild: bool,
+    recorded_hash: &[u8; 32],
+    input_hash: &[u8; 32],
+    recorded_path_matches: bool,
+) -> Option<ExistingRawIdbAction> {
+    let recorded_hash_available = recorded_hash.iter().any(|byte| *byte != 0);
+    let hash_matches = recorded_hash_available && recorded_hash == input_hash;
+
+    if !rebuild && hash_matches {
+        Some(ExistingRawIdbAction::Reuse)
+    } else if rebuild && (hash_matches || recorded_path_matches) {
+        Some(ExistingRawIdbAction::Rebuild)
+    } else {
+        None
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<[u8; 32], ToolError> {
+    let mut file = File::open(path).map_err(|error| {
+        ToolError::OpenFailed(format!(
+            "failed to read input for SHA-256 verification ({}): {error}",
+            path.display()
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| {
+            ToolError::OpenFailed(format!(
+                "failed while hashing input ({}): {error}",
+                path.display()
+            ))
+        })?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+
+    let digest = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&digest);
+    Ok(hash)
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn recorded_input_path_matches(input: &Path, recorded: &str) -> bool {
+    // IDA's get_input_file_path/getinf_buf length may include the trailing C
+    // terminator. Treat it as transport padding, never as part of the path.
+    let recorded =
+        recorded.trim_matches(|character: char| character == '\0' || character.is_whitespace());
+    !recorded.is_empty() && paths_refer_to_same_file(input, &expand_path(recorded))
+}
+
+fn validate_raw_idb_output(input: &Path, output: &Path) -> Result<(), ToolError> {
+    let valid_extension = output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("i64") || extension.eq_ignore_ascii_case("idb")
+        });
+    if !valid_extension {
+        return Err(ToolError::InvalidParams(format!(
+            "idb_out must end in .i64 or .idb: {}",
+            output.display()
+        )));
+    }
+    if paths_refer_to_same_file(input, output) {
+        return Err(ToolError::InvalidParams(
+            "idb_out must not refer to the raw input file".to_string(),
+        ));
+    }
+    if output.exists() && !output.is_file() {
+        return Err(ToolError::InvalidPath(format!(
+            "idb_out is not a file: {}",
+            output.display()
+        )));
+    }
+    if let Some(id0) = unpacked_id0_path(output)
+        && id0.exists()
+        && !id0.is_file()
+    {
+        return Err(ToolError::InvalidPath(format!(
+            "unpacked idb_out artifact is not a file: {}",
+            id0.display()
+        )));
+    }
+    if !ida_database_output_exists(output)
+        && let Some(orphan) = database_artifact_paths(output)
+            .into_iter()
+            .skip(1)
+            .find(|candidate| candidate.exists())
+    {
+        return Err(ToolError::InvalidParams(format!(
+            "idb_out has an orphaned pre-existing database artifact ({}); choose another output path or remove the artifact after verifying it",
+            orphan.display()
+        )));
+    }
+
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let metadata = fs::metadata(parent).map_err(|error| {
+        ToolError::InvalidPath(format!(
+            "idb_out parent is unavailable ({}): {error}",
+            parent.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(ToolError::InvalidPath(format!(
+            "idb_out parent is not a directory: {}",
+            parent.display()
+        )));
+    }
+    if metadata.permissions().readonly() {
+        return Err(ToolError::InvalidPath(format!(
+            "idb_out parent is read-only: {}",
+            parent.display()
+        )));
+    }
+    Ok(())
+}
+
+fn open_existing_idb(
+    path: &Path,
+    init_args: &[String],
+    save: bool,
+) -> Result<(IDB, PathBuf), idalib::IDAError> {
+    let mut opened_path = path.to_path_buf();
+    let mut opts = IDBOpenOptions::new();
+    opts.auto_analyse(false).save(save);
+    for arg in init_args {
+        opts.arg(arg);
+    }
+    let mut database = opts.open(path);
+    if database.is_err()
+        && let Some(id0_path) = unpacked_id0_path(path)
+        && id0_path.exists()
+    {
+        info!(path = %id0_path.display(), "Falling back to unpacked ID0 database");
+        opened_path = id0_path.clone();
+        let mut opts = IDBOpenOptions::new();
+        opts.auto_analyse(false).save(save);
+        for arg in init_args {
+            opts.arg(arg);
+        }
+        database = opts.open(&id0_path);
+    }
+    database.map(|database| (database, opened_path))
+}
+
+fn remove_new_database_artifacts(output: &Path) {
+    for candidate in database_artifact_paths(output) {
+        match fs::remove_file(&candidate) {
+            Ok(()) => info!(path = %candidate.display(), "Removed partial IDA database artifact"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                path = %candidate.display(),
+                error = %error,
+                "Failed to remove partial IDA database artifact"
+            ),
+        }
+    }
+}
+
+fn cleanup_failed_open(db: IDB, mcp_lock: McpLock, output: &Path, remove_artifacts: bool) {
+    drop(db);
+    release_mcp_lock_file(mcp_lock);
+    if remove_artifacts {
+        remove_new_database_artifacts(output);
+    }
+}
+
+fn configure_raw_bitness(db: &mut IDB, bitness: idalib::segment::Bitness) -> Result<(), ToolError> {
+    db.meta_mut().set_app_bitness(bitness);
+    for (_, mut segment) in db.segments() {
+        if !segment.set_bitness(bitness) {
+            return Err(ToolError::OpenFailed(format!(
+                "failed to set {}-bit addressing for segment at {:#x}",
+                bitness.bits(),
+                segment.start_address()
+            )));
+        }
+    }
+
+    let actual = database_bitness(db);
+    if actual != bitness.bits() {
+        return Err(ToolError::OpenFailed(format!(
+            "IDA reported {actual}-bit after requesting {}-bit raw input mode",
+            bitness.bits()
+        )));
+    }
+    Ok(())
+}
+
+fn configure_raw_entry_point(db: &mut IDB, entry_point: u64) -> Result<(), ToolError> {
+    if db.segment_at(entry_point).is_none() {
+        return Err(ToolError::OpenFailed(format!(
+            "raw entry point {entry_point:#x} is outside every loaded segment"
+        )));
+    }
+
+    if db.meta().start_address() != Some(entry_point)
+        && !db.meta_mut().set_start_address(entry_point)
+    {
+        return Err(ToolError::OpenFailed(format!(
+            "IDA refused raw entry point {entry_point:#x}"
+        )));
+    }
+    if db.meta().start_address() != Some(entry_point) {
+        return Err(ToolError::OpenFailed(format!(
+            "IDA did not retain requested raw entry point {entry_point:#x}"
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn handle_open(
     idb: &mut Option<IDB>,
@@ -152,6 +406,7 @@ pub fn handle_open(
     rebuild: bool,
     file_type: Option<&str>,
     auto_analyse: bool,
+    raw_target: &RawBinaryTarget,
     extra_args: &[String],
     idb_out: Option<&str>,
     progress_tx: Option<ProgressSender>,
@@ -192,9 +447,22 @@ pub fn handle_open(
         .unwrap_or("")
         .to_ascii_lowercase();
     let is_idb = ext == "i64" || ext == "idb" || ext == "id0";
+    if is_idb && !raw_target.is_empty() {
+        return Err(ToolError::InvalidParams(
+            "processor, bitness, base_address, and entry_point apply only to a newly-created raw-input database"
+                .to_string(),
+        ));
+    }
+    if let Some(base_address) = raw_target.base_address
+        && base_address % 16 != 0
+    {
+        return Err(ToolError::InvalidParams(format!(
+            "raw base address {base_address:#x} must be 16-byte aligned"
+        )));
+    }
 
     let mut raw_out_path = None;
-    let mut existing_raw_idb_path = None;
+    let mut existing_raw_idb_candidate = None;
     let mut dsym_path = None;
     let mut should_load_dsym = false;
     if !is_idb {
@@ -202,28 +470,19 @@ pub fn handle_open(
         let out_path = explicit_idb_out
             .clone()
             .unwrap_or_else(|| idb_path_for_raw_binary(&expanded));
+        validate_raw_idb_output(&expanded, &out_path)?;
         let generated_idb_path = existing_idb_for_raw_open(&expanded, explicit_idb_out.as_deref());
         let generated_exists = generated_idb_path.is_some();
-        if let Some(generated_idb_path) = generated_idb_path.filter(|_| !rebuild) {
-            info!(
-                input = %expanded.display(),
-                idb = %generated_idb_path.display(),
-                auto_analyse,
-                "Reusing existing IDA database for raw input; set rebuild=true to reanalyze raw input"
-            );
-            existing_raw_idb_path = Some(generated_idb_path);
-        } else {
-            if generated_exists {
-                warn!(
-                    input = %expanded.display(),
-                    idb = %out_path.display(),
-                    "Rebuilding raw input and overwriting existing generated IDA database"
-                );
-            }
-            should_load_dsym = !generated_exists;
-            if should_load_dsym {
-                dsym_path = dsym_path_for_binary(&expanded);
-            }
+        if generated_exists && !rebuild && !raw_target.is_empty() {
+            return Err(ToolError::InvalidParams(
+                "raw target options cannot change an existing database; set rebuild=true to recreate it"
+                    .to_string(),
+            ));
+        }
+        existing_raw_idb_candidate = generated_idb_path;
+        should_load_dsym = !generated_exists;
+        if should_load_dsym {
+            dsym_path = dsym_path_for_binary(&expanded);
         }
         raw_out_path = Some(out_path);
     }
@@ -249,6 +508,90 @@ pub fn handle_open(
     // Acquire MCP lock file (to detect other ida-mcp instances)
     let mcp_lock = acquire_mcp_lock(lock_target_path)?;
 
+    let init_args = init_database_args(extra_args);
+    let mut existing_raw_idb_path = None;
+    if let Some(candidate_path) = existing_raw_idb_candidate.as_ref() {
+        let (candidate, _) = match open_existing_idb(candidate_path, &init_args, false) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                release_mcp_lock_file(mcp_lock);
+                return Err(ToolError::OpenFailed(format!(
+                    "refusing to reuse or overwrite {} because its input provenance could not be read: {error}",
+                    candidate_path.display()
+                )));
+            }
+        };
+        let recorded_hash = candidate.meta().input_file_sha256();
+        let recorded_path = candidate.meta().input_file_path();
+        drop(candidate);
+        if let Err(error) = ensure_not_cancelled(cancel.as_ref()) {
+            release_mcp_lock_file(mcp_lock);
+            return Err(error);
+        }
+        let input_hash = match sha256_file(&expanded) {
+            Ok(hash) => hash,
+            Err(error) => {
+                release_mcp_lock_file(mcp_lock);
+                return Err(error);
+            }
+        };
+        let path_matches = recorded_input_path_matches(&expanded, &recorded_path);
+
+        match existing_raw_idb_action(rebuild, &recorded_hash, &input_hash, path_matches) {
+            Some(ExistingRawIdbAction::Reuse) => {
+                info!(
+                    input = %expanded.display(),
+                    idb = %candidate_path.display(),
+                    auto_analyse,
+                    "Reusing SHA-256-verified IDA database for raw input"
+                );
+                existing_raw_idb_path = Some(candidate_path.clone());
+            }
+            Some(ExistingRawIdbAction::Rebuild) => {
+                warn!(
+                    input = %expanded.display(),
+                    idb = %candidate_path.display(),
+                    hash_matches = recorded_hash.iter().any(|byte| *byte != 0)
+                        && recorded_hash == input_hash,
+                    recorded_path_matches = path_matches,
+                    "Rebuilding raw input and overwriting provenance-matched IDA database"
+                );
+            }
+            None => {
+                release_mcp_lock_file(mcp_lock);
+                let recorded_hash_available = recorded_hash.iter().any(|byte| *byte != 0);
+                let message = if !rebuild && path_matches {
+                    if recorded_hash_available {
+                        format!(
+                            "{} was created from this input path, but its recorded SHA-256 does not match the current file; retry with rebuild=true to replace stale analysis",
+                            candidate_path.display()
+                        )
+                    } else {
+                        format!(
+                            "{} has no recorded input SHA-256 and cannot be reused automatically; retry with rebuild=true to replace it because its recorded input path matches",
+                            candidate_path.display()
+                        )
+                    }
+                } else {
+                    format!(
+                        "refusing to {} {} because it is not provenance-matched to {}; choose a different idb_out or remove the candidate after verifying it",
+                        if rebuild { "overwrite" } else { "reuse" },
+                        candidate_path.display(),
+                        expanded.display()
+                    )
+                };
+                return Err(ToolError::InvalidParams(message));
+            }
+        }
+    }
+
+    // A newly-created raw database owns its output artifacts, including a
+    // rebuild that replaces an existing provenance-matched database. If that
+    // operation fails, leaving its partially-written output behind would make
+    // a later call treat an incomplete database as reusable. Reopening a
+    // verified existing database does not take ownership of its artifacts.
+    let created_raw_database = !is_idb && existing_raw_idb_path.is_none();
+
     // Open database
     let path_display = expanded.display().to_string();
     let (ticker_stop_tx, ticker_stop_rx) = mpsc::channel();
@@ -269,7 +612,6 @@ pub fn handle_open(
     });
 
     let open_start = Instant::now();
-    let init_args = init_database_args(extra_args);
     let open_existing_database = is_idb || existing_raw_idb_path.is_some();
     let open_message = if open_existing_database {
         "Opening existing IDA database"
@@ -289,27 +631,10 @@ pub fn handle_open(
     let db_path_to_open = existing_raw_idb_path.as_ref().unwrap_or(&expanded);
     let (db, opened_path) = if open_existing_database {
         // Open existing IDA database (no auto-analysis needed, but save=true to pack on close)
-        let mut opened_path = db_path_to_open.clone();
-        let mut opts = IDBOpenOptions::new();
-        opts.auto_analyse(false).save(true);
-        for arg in &init_args {
-            opts.arg(arg);
+        match open_existing_idb(db_path_to_open, &init_args, true) {
+            Ok((database, opened_path)) => (Ok(database), opened_path),
+            Err(error) => (Err(error), db_path_to_open.clone()),
         }
-        let mut db = opts.open(db_path_to_open);
-        if db.is_err()
-            && let Some(id0_path) = unpacked_id0_path(db_path_to_open)
-            && id0_path.exists()
-        {
-            info!(path = %id0_path.display(), "Falling back to unpacked ID0 database");
-            opened_path = id0_path.clone();
-            let mut opts = IDBOpenOptions::new();
-            opts.auto_analyse(false).save(true);
-            for arg in &init_args {
-                opts.arg(arg);
-            }
-            db = opts.open(&id0_path);
-        }
-        (db, opened_path)
     } else {
         // Raw binary - open with auto-analysis and save to .i64
         let Some(out_path) = raw_out_path.as_ref() else {
@@ -323,10 +648,26 @@ pub fn handle_open(
         );
         let opened_path = out_path.clone();
         let mut opts = IDBOpenOptions::new();
-        opts.auto_analyse(auto_analyse);
+        // Defer analysis until typed metadata that the raw loader may ignore
+        // has been applied and verified on the newly-created database.
+        opts.auto_analyse(
+            auto_analyse && raw_target.bitness.is_none() && raw_target.entry_point.is_none(),
+        );
         if let Some(ft) = file_type {
             info!(file_type = ft, "Using file type selector (-T flag)");
             opts.file_type(ft);
+        }
+        if let Some(processor) = raw_target.processor.as_deref() {
+            opts.processor(processor);
+        }
+        if let Some(base_address) = raw_target.base_address
+            && let Err(error) = opts.base_address(base_address)
+        {
+            release_mcp_lock_file(mcp_lock);
+            return Err(ToolError::InvalidParams(error.to_string()));
+        }
+        if let Some(entry_point) = raw_target.entry_point {
+            opts.entry_point(entry_point);
         }
         for arg in &init_args {
             opts.arg(arg);
@@ -336,10 +677,13 @@ pub fn handle_open(
     };
     let _ = ticker_stop_tx.send(());
     let _ = ticker.join();
-    let db = match db {
+    let mut db = match db {
         Ok(db) => db,
         Err(e) => {
             release_mcp_lock_file(mcp_lock);
+            if created_raw_database {
+                remove_new_database_artifacts(&opened_path);
+            }
             if let Some(lock_msg) =
                 detect_db_lock(&opened_path, &e).or_else(|| detect_db_lock(&expanded, &e))
             {
@@ -352,7 +696,31 @@ pub fn handle_open(
             )));
         }
     };
-    ensure_not_cancelled(cancel.as_ref())?;
+    if let Some(bitness) = raw_target.bitness
+        && let Err(error) = configure_raw_bitness(&mut db, bitness)
+    {
+        cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+        return Err(error);
+    }
+    if let Some(entry_point) = raw_target.entry_point
+        && let Err(error) = configure_raw_entry_point(&mut db, entry_point)
+    {
+        cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+        return Err(error);
+    }
+    if auto_analyse
+        && (raw_target.bitness.is_some() || raw_target.entry_point.is_some())
+        && !db.auto_wait()
+    {
+        cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+        return Err(ToolError::OpenFailed(
+            "IDA auto-analysis did not complete after raw target configuration".to_string(),
+        ));
+    }
+    if let Err(error) = ensure_not_cancelled(cancel.as_ref()) {
+        cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+        return Err(error);
+    }
     if !is_idb && auto_analyse {
         emit_progress(
             progress_tx.as_ref(),
@@ -372,7 +740,10 @@ pub fn handle_open(
             Some(OPEN_IDB_PROGRESS_TOTAL),
             "Loading requested debug information",
         );
-        ensure_not_cancelled(cancel.as_ref())?;
+        if let Err(error) = ensure_not_cancelled(cancel.as_ref()) {
+            cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+            return Err(error);
+        }
         let mut resolved = None;
         if let Some(path) = debug_info_path {
             resolved = Some(PathBuf::from(path));
@@ -435,7 +806,10 @@ pub fn handle_open(
             Some(OPEN_IDB_PROGRESS_TOTAL),
             "Loading sibling dSYM debug information",
         );
-        ensure_not_cancelled(cancel.as_ref())?;
+        if let Err(error) = ensure_not_cancelled(cancel.as_ref()) {
+            cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+            return Err(error);
+        }
         info!(path = %path.display(), "Loading dSYM debug info");
         match db.load_debug_info(path, false) {
             Ok(true) => info!(path = %path.display(), "dSYM debug info loaded"),
@@ -443,7 +817,10 @@ pub fn handle_open(
             Err(e) => warn!(path = %path.display(), error = %e, "dSYM debug info load error"),
         }
     }
-    ensure_not_cancelled(cancel.as_ref())?;
+    if let Err(error) = ensure_not_cancelled(cancel.as_ref()) {
+        cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+        return Err(error);
+    }
 
     let path_str = opened_path.display().to_string();
     let info = build_db_info(&db, &path_str, debug_info);
@@ -495,15 +872,24 @@ pub fn handle_load_debug_info(
 mod tests {
     use std::{
         fs,
-        path::Path,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use crate::ida::handlers::database::{
         base_input_path_for_database, database_paths_match, existing_idb_for_raw_binary,
-        existing_idb_for_raw_open, has_ida_database_extension, idb_path_for_raw_binary,
-        init_database_args, non_empty_trimmed,
+        existing_idb_for_raw_open, existing_raw_idb_action, has_ida_database_extension,
+        idb_path_for_raw_binary, init_database_args, non_empty_trimmed,
+        recorded_input_path_matches, sha256_file, validate_raw_idb_output, ExistingRawIdbAction,
     };
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ida-mcp-{label}-{unique}"))
+    }
 
     #[test]
     fn empty_optional_open_strings_are_ignored() {
@@ -617,6 +1003,24 @@ mod tests {
     }
 
     #[test]
+    fn explicit_idb_out_detects_an_unpacked_database() {
+        let dir = temp_dir("unpacked-explicit-idb-out");
+        fs::create_dir(&dir).expect("create temp dir");
+        let raw = dir.join("sample.bin");
+        let explicit = dir.join("explicit.i64");
+        let unpacked = dir.join("explicit.id0");
+        fs::write(&raw, b"raw").expect("write raw");
+        fs::write(&unpacked, b"unpacked database").expect("write unpacked database");
+
+        assert_eq!(
+            existing_idb_for_raw_open(&raw, Some(&explicit)),
+            Some(explicit)
+        );
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
     fn base_input_path_for_database_strips_supported_database_extensions() {
         assert_eq!(
             base_input_path_for_database(Path::new("/tmp/sample.i64")),
@@ -643,5 +1047,114 @@ mod tests {
 
         let args = init_database_args(&["-A".to_string(), "-Tpe".to_string()]);
         assert_eq!(args.iter().filter(|arg| arg.as_str() == "-A").count(), 1);
+    }
+
+    #[test]
+    fn existing_raw_idb_requires_hash_match_for_reuse() {
+        let input_hash = [0x11; 32];
+        let other_hash = [0x22; 32];
+        let missing_hash = [0; 32];
+
+        assert_eq!(
+            existing_raw_idb_action(false, &input_hash, &input_hash, false),
+            Some(ExistingRawIdbAction::Reuse)
+        );
+        assert_eq!(
+            existing_raw_idb_action(false, &other_hash, &input_hash, true),
+            None,
+            "recorded path alone must not authorize automatic reuse"
+        );
+        assert_eq!(
+            existing_raw_idb_action(false, &missing_hash, &input_hash, true),
+            None,
+            "missing IDA hashes must never authorize automatic reuse"
+        );
+    }
+
+    #[test]
+    fn rebuild_only_overwrites_provenance_matched_database() {
+        let input_hash = [0x11; 32];
+        let other_hash = [0x22; 32];
+        let missing_hash = [0; 32];
+
+        assert_eq!(
+            existing_raw_idb_action(true, &input_hash, &input_hash, false),
+            Some(ExistingRawIdbAction::Rebuild)
+        );
+        assert_eq!(
+            existing_raw_idb_action(true, &other_hash, &input_hash, true),
+            Some(ExistingRawIdbAction::Rebuild),
+            "a recorded input-path match authorizes rebuilding changed input"
+        );
+        assert_eq!(
+            existing_raw_idb_action(true, &missing_hash, &input_hash, true),
+            Some(ExistingRawIdbAction::Rebuild)
+        );
+        assert_eq!(
+            existing_raw_idb_action(true, &other_hash, &input_hash, false),
+            None
+        );
+    }
+
+    #[test]
+    fn recorded_input_path_ignores_a_trailing_c_terminator() {
+        let dir = temp_dir("recorded-input-path-c-terminator");
+        fs::create_dir(&dir).expect("create temp dir");
+        let input = dir.join("sample.bin");
+        fs::write(&input, b"sample").expect("write input");
+        let recorded = format!("{}\0", input.display());
+        assert!(recorded_input_path_matches(&input, &recorded));
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn raw_idb_output_requires_safe_database_path() {
+        let dir = temp_dir("validate-idb-out");
+        fs::create_dir(&dir).expect("create temp dir");
+        let raw = dir.join("sample.bin");
+        fs::write(&raw, b"raw").expect("write raw");
+
+        assert!(validate_raw_idb_output(&raw, &dir.join("sample.i64")).is_ok());
+        assert!(validate_raw_idb_output(&raw, &dir.join("sample.IDB")).is_ok());
+        assert!(validate_raw_idb_output(&raw, &raw).is_err());
+        assert!(validate_raw_idb_output(&raw, &dir.join("sample.txt")).is_err());
+        assert!(validate_raw_idb_output(&raw, &dir.join("missing").join("sample.i64")).is_err());
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn raw_idb_output_rejects_orphaned_sidecars() {
+        let dir = temp_dir("orphaned-idb-out");
+        fs::create_dir(&dir).expect("create temp dir");
+        let raw = dir.join("sample.bin");
+        let output = dir.join("sample.i64");
+        fs::write(&raw, b"raw").expect("write raw");
+        fs::write(dir.join("sample.nam"), b"pre-existing").expect("write orphaned sidecar");
+
+        let error = validate_raw_idb_output(&raw, &output)
+            .expect_err("orphaned IDA sidecar must reject a new output");
+        assert!(error.to_string().contains("orphaned pre-existing"));
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn input_hash_is_streamed_as_sha256() {
+        let dir = temp_dir("sha256-input");
+        fs::create_dir(&dir).expect("create temp dir");
+        let input = dir.join("sample.bin");
+        fs::write(&input, b"abc").expect("write input");
+
+        assert_eq!(
+            sha256_file(&input).expect("hash input"),
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
+            ]
+        );
+
+        fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 }

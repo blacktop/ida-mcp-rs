@@ -50,11 +50,16 @@ cleanup() {
   rm -f "$large_fixture" \
     "$large_fixture.i64" "$large_fixture.idb" "$large_fixture.imcp" \
     "$large_fixture.i64.imcp" "$large_fixture.idb.imcp" \
+    "$large_fixture.id0" "$large_fixture.id1" "$large_fixture.id2" \
     "$large_fixture.til" "$large_fixture.nam"
 }
 trap cleanup EXIT INT TERM
 
-rm -f "$large_fixture" "$large_fixture.i64" "$large_fixture.idb"
+rm -f "$large_fixture" \
+  "$large_fixture.i64" "$large_fixture.idb" "$large_fixture.imcp" \
+  "$large_fixture.i64.imcp" "$large_fixture.idb.imcp" \
+  "$large_fixture.id0" "$large_fixture.id1" "$large_fixture.id2" \
+  "$large_fixture.til" "$large_fixture.nam"
 cp fixtures/mini "$large_fixture"
 dd if=/dev/zero of="$large_fixture" bs=1 count=1 seek="$THRESHOLD_BYTES" conv=notrunc >/dev/null 2>&1
 

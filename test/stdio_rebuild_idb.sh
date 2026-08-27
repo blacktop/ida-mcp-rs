@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Verify open_idb behavior for raw inputs when a generated .i64 already exists.
 #
-# Three phases, one tmpdir-isolated fixture per run:
+# Nine phases, with all fixtures isolated in one temporary directory. The
+# first three establish the core rebuild contract:
 #   1. Open raw, rename interesting_function -> $CANARY, close -> creates .i64
 #      with the rename packed into it.
 #   2. Re-open the SAME raw path with no rebuild flag. The handler must reuse
-#      the existing .i64 (proven by the "Reusing existing IDA database for raw
+#      the existing .i64 (proven by the "Reusing SHA-256-verified IDA database for raw
 #      input" log line) and the renamed function must still resolve.
 #   3. Re-open raw with rebuild=true. The handler must overwrite the .i64
-#      (proven by the "Rebuilding raw input and overwriting" log line),
+#      (proven by the "Rebuilding raw input and overwriting provenance-matched" log line),
 #      the canary must be gone, and the original symbol name must reappear.
 set -euo pipefail
 
@@ -48,6 +49,7 @@ cleanup() {
     wait "$server_pid" 2>/dev/null || true
     server_pid=""
   fi
+  chmod -R u+w "$tmpdir" 2>/dev/null || true
   rm -rf "$tmpdir"
 }
 trap cleanup EXIT INT TERM
@@ -164,8 +166,8 @@ init
 send "$(jq -cn --arg p "$raw" \
   '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,auto_analyse:true,timeout_secs:120}}}')"
 assert_ok "Phase 1 open_idb" "$(wait_response 2 180)"
-assert_log_absent "Reusing existing IDA database for raw input"
-assert_log_absent "Rebuilding raw input and overwriting"
+assert_log_absent "Reusing SHA-256-verified IDA database for raw input"
+assert_log_absent "Rebuilding raw input and overwriting provenance-matched IDA database"
 
 send "$(jq -cn --arg name "$CANARY" \
   '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"rename",arguments:{current_name:"interesting_function",name:$name,flags:0}}}')"
@@ -187,8 +189,8 @@ init
 send "$(jq -cn --arg p "$raw" \
   '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p}}}')"
 assert_ok "Phase 2 open_idb" "$(wait_response 2 30)"
-assert_log_contains "Reusing existing IDA database for raw input"
-assert_log_absent "Rebuilding raw input and overwriting"
+assert_log_contains "Reusing SHA-256-verified IDA database for raw input"
+assert_log_absent "Rebuilding raw input and overwriting provenance-matched IDA database"
 echo "   ✓ reuse path taken (log line present)"
 
 send "$(jq -cn --arg name "$CANARY" \
@@ -213,8 +215,8 @@ init
 send "$(jq -cn --arg p "$raw" \
   '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,rebuild:true,auto_analyse:true,timeout_secs:120}}}')"
 assert_ok "Phase 3 open_idb" "$(wait_response 2 180)"
-assert_log_contains "Rebuilding raw input and overwriting"
-assert_log_absent "Reusing existing IDA database for raw input"
+assert_log_contains "Rebuilding raw input and overwriting provenance-matched IDA database"
+assert_log_absent "Reusing SHA-256-verified IDA database for raw input"
 echo "   ✓ rebuild path taken (log line present)"
 
 send "$(jq -cn --arg name "$CANARY" \
@@ -231,4 +233,152 @@ send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb
 wait_response 99 30 >/dev/null
 stop_server
 
-echo "✅ rebuild-idb test passed"
+echo "── Phase 4: explicit idb_out works beside a read-only input directory ──"
+readonly_dir="$tmpdir/readonly-input"
+database_dir="$tmpdir/databases"
+explicit_raw="$readonly_dir/mini"
+explicit_idb="$database_dir/explicit.i64"
+mkdir -p "$readonly_dir" "$database_dir"
+cp fixtures/mini "$explicit_raw"
+chmod 0555 "$readonly_dir"
+
+start_server
+init
+send "$(jq -cn --arg p "$explicit_raw" --arg out "$explicit_idb" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
+assert_ok "Phase 4 explicit idb_out open" "$(wait_response 2 120)"
+send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+wait_response 99 30 >/dev/null
+stop_server
+[[ -f "$explicit_idb" ]] || { echo "❌ explicit idb_out was not created" >&2; exit 1; }
+[[ ! -f "$explicit_raw.i64" ]] || { echo "❌ IDB leaked beside read-only input" >&2; exit 1; }
+echo "   ✓ explicit output created without a sibling IDB"
+
+echo "── Phase 5: explicit idb_out reuse requires the recorded input hash ──"
+start_server
+init
+send "$(jq -cn --arg p "$explicit_raw" --arg out "$explicit_idb" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
+assert_ok "Phase 5 hash-verified explicit reuse" "$(wait_response 2 30)"
+assert_log_contains "Reusing SHA-256-verified IDA database for raw input"
+send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+wait_response 99 30 >/dev/null
+stop_server
+echo "   ✓ matching input reused explicit output"
+
+echo "── Phase 6: changed input cannot blindly adopt explicit idb_out ──"
+printf '\0' >>"$explicit_raw"
+start_server
+init
+send "$(jq -cn --arg p "$explicit_raw" --arg out "$explicit_idb" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
+assert_err "Phase 6 mismatched explicit reuse" "$(wait_response 2 30)"
+stop_server
+echo "   ✓ mismatched hash was rejected"
+
+echo "── Phase 7: rebuild may replace an output recorded for the same input path ──"
+start_server
+init
+send "$(jq -cn --arg p "$explicit_raw" --arg out "$explicit_idb" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out,rebuild:true}}}')"
+assert_ok "Phase 7 provenance-matched rebuild" "$(wait_response 2 120)"
+assert_log_contains "Rebuilding raw input and overwriting provenance-matched IDA database"
+send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+wait_response 99 30 >/dev/null
+stop_server
+echo "   ✓ recorded input path allowed explicit rebuild"
+
+echo "── Phase 8: typed raw target survives close and verified reuse ──"
+typed_raw="$tmpdir/aarch64.bin"
+typed_idb="$tmpdir/aarch64.i64"
+# AArch64 NOP; RET. This is deliberately headerless so IDA cannot infer the
+# processor, application bitness, load address, or entry point from a format.
+printf '\x1f\x20\x03\xd5\xc0\x03\x5f\xd6' >"$typed_raw"
+
+start_server
+init
+send "$(jq -cn --arg p "$typed_raw" --arg out "$typed_idb" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out,processor:"arm:ARMv8-A",bitness:64,base_address:"0x1000",entry_point:"0x1000",auto_analyse:true,timeout_secs:120}}}')"
+typed_open_resp="$(wait_response 2 180)"
+assert_ok "Phase 8 typed raw open" "$typed_open_resp"
+if ! echo "$typed_open_resp" | jq -e \
+  '.result.content[0].text | fromjson | .bits == 64 and (.processor | test("arm"; "i"))' >/dev/null; then
+  echo "❌ typed raw open did not report a 64-bit ARM database" >&2
+  echo "$typed_open_resp" | jq . >&2
+  exit 1
+fi
+
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"segments","arguments":{}}}'
+segments_resp="$(wait_response 3 30)"
+assert_ok "Phase 8 segments" "$segments_resp"
+if ! echo "$segments_resp" | jq -e \
+  '.result.content[0].text | fromjson | any(.[]; .start == "0x1000" and .bitness == 2)' >/dev/null; then
+  echo "❌ typed raw segment did not retain base 0x1000 and IDA 64-bit segment mode 2" >&2
+  echo "$segments_resp" | jq . >&2
+  exit 1
+fi
+
+send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"entrypoints","arguments":{}}}'
+entrypoints_resp="$(wait_response 4 30)"
+assert_ok "Phase 8 entrypoints" "$entrypoints_resp"
+if ! echo "$entrypoints_resp" | jq -e \
+  '.result.content[0].text | fromjson | index("0x1000") != null' >/dev/null; then
+  echo "❌ typed raw entry point 0x1000 was not recorded" >&2
+  echo "$entrypoints_resp" | jq . >&2
+  exit 1
+fi
+
+send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+wait_response 99 30 >/dev/null
+stop_server
+[[ -f "$typed_idb" ]] || { echo "❌ typed raw IDB was not created" >&2; exit 1; }
+
+start_server
+init
+send "$(jq -cn --arg p "$typed_raw" --arg out "$typed_idb" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
+typed_reuse_resp="$(wait_response 2 30)"
+assert_ok "Phase 8 typed raw reuse" "$typed_reuse_resp"
+assert_log_contains "Reusing SHA-256-verified IDA database for raw input"
+if ! echo "$typed_reuse_resp" | jq -e \
+  '.result.content[0].text | fromjson | .bits == 64 and (.processor | test("arm"; "i"))' >/dev/null; then
+  echo "❌ verified reuse lost typed raw processor or bitness" >&2
+  echo "$typed_reuse_resp" | jq . >&2
+  exit 1
+fi
+send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+wait_response 99 30 >/dev/null
+stop_server
+echo "   ✓ processor, bitness, base, and entry point survived verified reuse"
+
+echo "── Phase 9: failed rebuild removes partial output and permits recovery ──"
+start_server
+init
+send "$(jq -cn --arg p "$typed_raw" --arg out "$typed_idb" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out,rebuild:true,processor:"arm:ARMv8-A",bitness:64,base_address:"0x1000",entry_point:"0x2000",auto_analyse:true,timeout_secs:120}}}')"
+assert_err "Phase 9 invalid typed rebuild" "$(wait_response 2 180)"
+stop_server
+
+typed_base="${typed_idb%.*}"
+for artifact in "$typed_idb" "$typed_base.id0" "$typed_base.id1" \
+  "$typed_base.id2" "$typed_base.nam" "$typed_base.til"; do
+  if [[ -e "$artifact" ]]; then
+    echo "❌ failed rebuild left reusable database artifact: $artifact" >&2
+    exit 1
+  fi
+done
+echo "   ✓ invalid entry point failed closed without reusable artifacts"
+
+start_server
+init
+send "$(jq -cn --arg p "$typed_raw" --arg out "$typed_idb" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out,processor:"arm:ARMv8-A",bitness:64,base_address:"0x1000",entry_point:"0x1000",auto_analyse:true,timeout_secs:120}}}')"
+assert_ok "Phase 9 recovery open" "$(wait_response 2 180)"
+send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+wait_response 99 30 >/dev/null
+stop_server
+[[ -f "$typed_idb" ]] || { echo "❌ recovery did not recreate typed raw IDB" >&2; exit 1; }
+echo "   ✓ a valid retry recreated and packed the database"
+
+chmod 0755 "$readonly_dir"
+echo "✅ rebuild/idb_out provenance test passed"

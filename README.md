@@ -171,6 +171,9 @@ Once configured, you can analyze binaries through your AI agent:
 # Open a binary (returns quickly — analysis runs separately)
 open_idb(path: "~/samples/malware")
 
+# Keep the generated database away from a read-only input directory
+open_idb(path: "/System/example", idb_out: "~/ida-work/example.i64")
+
 # These work immediately, no analysis needed
 list_functions(limit: 20)
 disasm_by_name(name: "main", count: 20)
@@ -186,6 +189,32 @@ decompile(address: "0x100000f00")
 # Discover more tools
 tool_catalog(query: "find callers")
 ```
+
+### Raw blobs
+
+Raw inputs still use IDA's normal loader by default and save to `<input>.i64`.
+`idb_out` selects another database location, which is useful for read-only input
+directories. An existing output is reused only when IDA's recorded input
+SHA-256 matches the current file; `rebuild: true` can overwrite only a database
+whose hash or recorded input path proves that it belongs to the input.
+
+For headerless blobs, the same `open_idb` tool accepts typed loader hints:
+
+```text
+open_idb(
+  path: "~/firmware/boot.bin",
+  idb_out: "~/ida-work/boot.i64",
+  processor: "arm:ARMv7-M",
+  bitness: 32,
+  base_address: "0x08000000",
+  entry_point: "0x08000101"
+)
+```
+
+Processor families with multiple modes require an explicit IDA processor
+variant; ambiguous bare names such as `arm` or `metapc` are rejected. These
+target fields apply only while creating a raw-input database and never alter an
+existing `.i64`/`.idb`.
 
 #### HTTP/SSE worker pool
 

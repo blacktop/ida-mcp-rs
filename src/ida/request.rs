@@ -18,6 +18,7 @@ pub enum IdaRequest {
         rebuild: bool,
         file_type: Option<String>,
         auto_analyse: bool,
+        raw_target: RawBinaryTarget,
         extra_args: Vec<String>,
         idb_out: Option<String>,
         progress_tx: Option<ProgressSender>,

@@ -2,6 +2,24 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Typed loader configuration for a newly-created raw-binary database.
+#[derive(Debug, Clone, Default)]
+pub struct RawBinaryTarget {
+    pub processor: Option<String>,
+    pub bitness: Option<idalib::segment::Bitness>,
+    pub base_address: Option<u64>,
+    pub entry_point: Option<u64>,
+}
+
+impl RawBinaryTarget {
+    pub fn is_empty(&self) -> bool {
+        self.processor.is_none()
+            && self.bitness.is_none()
+            && self.base_address.is_none()
+            && self.entry_point.is_none()
+    }
+}
+
 /// Database info returned after opening
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DbInfo {
