@@ -14,12 +14,12 @@ use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::ServiceExt;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::runtime::Handle;
@@ -816,12 +816,57 @@ impl PooledWorkerHandle {
     }
 }
 
-pub struct PooledSessionState {
+pub struct WorkspaceDatabase {
     pool: WorkerPool,
     session_id: String,
     handle: Arc<Mutex<Option<PooledDatabaseLease>>>,
     next_database_generation: AtomicU64,
     runtime: Option<Handle>,
+}
+
+// Transitional name retained while the behavior-preserving registry
+// extraction lands ahead of the public workspace router.
+pub type PooledSessionState = WorkspaceDatabase;
+
+#[derive(Clone)]
+pub struct WorkspaceRegistry {
+    inner: Arc<WorkspaceRegistryInner>,
+}
+
+struct WorkspaceRegistryInner {
+    pool: WorkerPool,
+    entries: StdMutex<HashMap<String, Arc<WorkspaceRegistryEntry>>>,
+    idle_timeout: Duration,
+}
+
+struct WorkspaceRegistryEntry {
+    database: Arc<WorkspaceDatabase>,
+    last_used: StdMutex<Instant>,
+    active_calls: AtomicUsize,
+    pins: AtomicUsize,
+    debug_pinned: AtomicBool,
+    legacy: bool,
+}
+
+pub struct WorkspaceLease {
+    database_id: String,
+    entry: Arc<WorkspaceRegistryEntry>,
+}
+
+pub struct WorkspacePin {
+    entry: Arc<WorkspaceRegistryEntry>,
+}
+
+pub struct LegacySessionBinding {
+    registry: WorkspaceRegistry,
+    database_id: String,
+    database: Arc<WorkspaceDatabase>,
+}
+
+#[derive(Clone)]
+pub enum PooledDatabaseBinding {
+    Legacy(Arc<LegacySessionBinding>),
+    Workspace(Arc<WorkspaceDatabase>),
 }
 
 #[derive(Clone)]
@@ -830,7 +875,258 @@ struct PooledDatabaseLease {
     generation: DatabaseGeneration,
 }
 
-impl PooledSessionState {
+impl WorkspaceRegistry {
+    pub fn new(pool: WorkerPool, idle_timeout: Duration) -> Self {
+        let registry = Self {
+            inner: Arc::new(WorkspaceRegistryInner {
+                pool,
+                entries: StdMutex::new(HashMap::new()),
+                idle_timeout,
+            }),
+        };
+        registry.spawn_reaper();
+        registry
+    }
+
+    fn entries(&self) -> StdMutexGuard<'_, HashMap<String, Arc<WorkspaceRegistryEntry>>> {
+        match self.inner.entries.lock() {
+            Ok(entries) => entries,
+            Err(poisoned) => {
+                warn!("workspace registry mutex was poisoned; recovering its entries");
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn new_entry(&self, owner_id: String, legacy: bool) -> Arc<WorkspaceRegistryEntry> {
+        Arc::new(WorkspaceRegistryEntry {
+            database: Arc::new(WorkspaceDatabase::new(self.inner.pool.clone(), owner_id)),
+            last_used: StdMutex::new(Instant::now()),
+            active_calls: AtomicUsize::new(0),
+            pins: AtomicUsize::new(0),
+            debug_pinned: AtomicBool::new(false),
+            legacy,
+        })
+    }
+
+    pub fn allocate_database(&self) -> WorkspaceLease {
+        let database_id = uuid::Uuid::new_v4().to_string();
+        let entry = self.new_entry(format!("workspace:{database_id}"), false);
+        entry.active_calls.store(1, Ordering::Relaxed);
+        self.entries().insert(database_id.clone(), entry.clone());
+        WorkspaceLease { database_id, entry }
+    }
+
+    pub fn runtime_database(&self) -> Arc<WorkspaceDatabase> {
+        Arc::new(WorkspaceDatabase::new(
+            self.inner.pool.clone(),
+            "workspace-runtime".to_string(),
+        ))
+    }
+
+    pub fn acquire(&self, database_id: &str) -> Option<WorkspaceLease> {
+        let entry = {
+            let entries = self.entries();
+            let entry = entries.get(database_id).cloned()?;
+            // Protect the entry before releasing the registry lock so the
+            // idle reaper cannot remove it between lookup and acquisition.
+            entry.active_calls.fetch_add(1, Ordering::Relaxed);
+            entry
+        };
+        entry.touch();
+        Some(WorkspaceLease {
+            database_id: database_id.to_string(),
+            entry,
+        })
+    }
+
+    pub fn bind_legacy(&self, session_id: String) -> LegacySessionBinding {
+        let database_id = format!("legacy:{}", uuid::Uuid::new_v4());
+        let entry = self.new_entry(session_id, true);
+        let database = entry.database.clone();
+        self.entries().insert(database_id.clone(), entry);
+        LegacySessionBinding {
+            registry: self.clone(),
+            database_id,
+            database,
+        }
+    }
+
+    pub fn remove(&self, database_id: &str) -> Option<Arc<WorkspaceDatabase>> {
+        self.entries()
+            .remove(database_id)
+            .map(|entry| entry.database.clone())
+    }
+
+    pub fn pin(&self, database_id: &str) -> Option<WorkspacePin> {
+        let entry = {
+            let entries = self.entries();
+            let entry = entries.get(database_id).cloned()?;
+            // See `acquire`: pinning and lookup are one reaper-visible state
+            // transition, not two independently scheduled operations.
+            entry.pins.fetch_add(1, Ordering::Relaxed);
+            entry
+        };
+        entry.touch();
+        Some(WorkspacePin { entry })
+    }
+
+    pub fn set_debug_pin(&self, database_id: &str, pinned: bool) -> bool {
+        let entries = self.entries();
+        let Some(entry) = entries.get(database_id) else {
+            return false;
+        };
+        // Touch before clearing the pin while the registry remains locked, so
+        // the reaper cannot observe an unpinned entry with stale idle time.
+        entry.touch();
+        entry.debug_pinned.store(pinned, Ordering::Relaxed);
+        true
+    }
+
+    pub async fn close_database(&self, database_id: &str) -> Result<(), ToolError> {
+        let database = self.remove(database_id).ok_or_else(|| {
+            ToolError::InvalidParams(format!("unknown database_id: {database_id}"))
+        })?;
+        database.close().await
+    }
+
+    pub async fn shutdown(&self) {
+        let databases = {
+            let mut entries = self.entries();
+            entries
+                .drain()
+                .map(|(_, entry)| entry.database.clone())
+                .collect::<Vec<_>>()
+        };
+        for database in databases {
+            let _ = database.close().await;
+        }
+    }
+
+    fn spawn_reaper(&self) {
+        if self.inner.idle_timeout.is_zero() {
+            return;
+        }
+        let Ok(runtime) = Handle::try_current() else {
+            return;
+        };
+        let weak = Arc::downgrade(&self.inner);
+        let interval = match self.inner.idle_timeout.checked_div(2) {
+            Some(interval) => interval,
+            None => Duration::from_secs(1),
+        }
+        .clamp(Duration::from_secs(1), Duration::from_secs(30));
+        runtime.spawn(async move {
+            workspace_reaper(weak, interval).await;
+        });
+    }
+}
+
+async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duration) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let Some(inner) = Weak::upgrade(&inner) else {
+            break;
+        };
+        let expired = {
+            let mut entries = match inner.entries.lock() {
+                Ok(entries) => entries,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let ids = entries
+                .iter()
+                .filter(|(_, entry)| {
+                    !entry.legacy
+                        && entry.active_calls.load(Ordering::Relaxed) == 0
+                        && entry.pins.load(Ordering::Relaxed) == 0
+                        && !entry.debug_pinned.load(Ordering::Relaxed)
+                        && entry.idle_for() >= inner.idle_timeout
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| {
+                    entries
+                        .remove(&id)
+                        .map(|entry| (id, entry.database.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (database_id, database) in expired {
+            info!(database_id, "reaping idle workspace database");
+            let _ = database.close().await;
+        }
+    }
+}
+
+impl WorkspaceRegistryEntry {
+    fn touch(&self) {
+        let mut last_used = match self.last_used.lock() {
+            Ok(last_used) => last_used,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *last_used = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        let last_used = match self.last_used.lock() {
+            Ok(last_used) => last_used,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        last_used.elapsed()
+    }
+}
+
+impl WorkspaceLease {
+    pub fn database_id(&self) -> &str {
+        &self.database_id
+    }
+
+    pub fn database(&self) -> Arc<WorkspaceDatabase> {
+        self.entry.database.clone()
+    }
+}
+
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        self.entry.active_calls.fetch_sub(1, Ordering::Relaxed);
+        self.entry.touch();
+    }
+}
+
+impl Drop for WorkspacePin {
+    fn drop(&mut self) {
+        self.entry.pins.fetch_sub(1, Ordering::Relaxed);
+        self.entry.touch();
+    }
+}
+
+impl std::ops::Deref for LegacySessionBinding {
+    type Target = WorkspaceDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        &self.database
+    }
+}
+
+impl std::ops::Deref for PooledDatabaseBinding {
+    type Target = WorkspaceDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Legacy(binding) => binding,
+            Self::Workspace(database) => database,
+        }
+    }
+}
+
+impl Drop for LegacySessionBinding {
+    fn drop(&mut self) {
+        let _ = self.registry.remove(&self.database_id);
+    }
+}
+
+impl WorkspaceDatabase {
     pub fn new(pool: WorkerPool, session_id: String) -> Self {
         Self {
             pool,
@@ -2085,7 +2381,7 @@ impl PooledSessionState {
     }
 }
 
-impl Drop for PooledSessionState {
+impl Drop for WorkspaceDatabase {
     fn drop(&mut self) {
         let pool = self.pool.clone();
         let handle_slot = self.handle.clone();
@@ -2339,11 +2635,12 @@ mod tests {
         analyze_funcs_child_args, child_tool_error_retires_worker, extract_first_matches,
         find_bytes_child_args, lumina_apply_child_args, open_error_releases_lease,
         open_idb_child_args, release_error_retires_worker, require_lease_generation,
-        run_script_child_args, search_child_args, WorkerPool, WorkerPoolConfig,
+        run_script_child_args, search_child_args, WorkerPool, WorkerPoolConfig, WorkspaceRegistry,
     };
     use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration};
     use serde_json::json;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     fn test_pool(max_workers: usize) -> WorkerPool {
@@ -2355,6 +2652,98 @@ mod tests {
             exe_path: PathBuf::from("/does/not/spawn/in/this/test"),
             worker_args: Vec::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn workspace_and_legacy_bindings_share_one_registry_map() {
+        let registry = WorkspaceRegistry::new(test_pool(4), Duration::ZERO);
+        let first = registry.allocate_database();
+        let second = registry.allocate_database();
+        assert_ne!(first.database_id(), second.database_id());
+        assert_eq!(registry.entries().len(), 2);
+
+        let first_id = first.database_id().to_string();
+        drop(first);
+        let first_entry = registry
+            .entries()
+            .get(&first_id)
+            .cloned()
+            .expect("allocated database remains registered");
+        assert_eq!(first_entry.active_calls.load(Ordering::Relaxed), 0);
+        let acquired = registry
+            .acquire(&first_id)
+            .expect("database remains routed");
+        assert_eq!(acquired.database_id(), first_id);
+        assert_eq!(first_entry.active_calls.load(Ordering::Relaxed), 1);
+        let pin = registry.pin(&first_id).expect("database can be pinned");
+        assert_eq!(first_entry.pins.load(Ordering::Relaxed), 1);
+        drop(pin);
+        assert_eq!(first_entry.pins.load(Ordering::Relaxed), 0);
+        assert!(registry.set_debug_pin(&first_id, true));
+        assert!(first_entry.debug_pinned.load(Ordering::Relaxed));
+        assert!(registry.set_debug_pin(&first_id, false));
+        assert!(!first_entry.debug_pinned.load(Ordering::Relaxed));
+        drop(acquired);
+        assert_eq!(first_entry.active_calls.load(Ordering::Relaxed), 0);
+
+        let legacy = registry.bind_legacy("legacy-test".to_string());
+        assert_eq!(registry.entries().len(), 3);
+        drop(legacy);
+        assert_eq!(registry.entries().len(), 2);
+
+        assert!(registry.remove(&first_id).is_some());
+        let second_id = second.database_id().to_string();
+        drop(second);
+        assert!(registry.remove(&second_id).is_some());
+        assert!(registry.entries().is_empty());
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn workspace_idle_reaper_respects_every_lifetime_guard() {
+        let registry = WorkspaceRegistry::new(test_pool(4), Duration::from_millis(10));
+
+        let idle = registry.allocate_database();
+        let idle_id = idle.database_id().to_string();
+        drop(idle);
+
+        let active = registry.allocate_database();
+        let active_id = active.database_id().to_string();
+
+        let pinned = registry.allocate_database();
+        let pinned_id = pinned.database_id().to_string();
+        let pin = registry
+            .pin(&pinned_id)
+            .expect("allocated database can be pinned");
+        drop(pinned);
+
+        let debug_pinned = registry.allocate_database();
+        let debug_pinned_id = debug_pinned.database_id().to_string();
+        assert!(registry.set_debug_pin(&debug_pinned_id, true));
+        drop(debug_pinned);
+
+        let legacy = registry.bind_legacy("legacy-reaper-test".to_string());
+        let legacy_id = legacy.database_id.clone();
+
+        // The production reaper interval is clamped to one second. Waiting
+        // past its first pass exercises the actual spawned lifecycle rather
+        // than only restating its selection predicate in a helper test.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        {
+            let entries = registry.entries();
+            assert!(!entries.contains_key(&idle_id));
+            assert!(entries.contains_key(&active_id));
+            assert!(entries.contains_key(&pinned_id));
+            assert!(entries.contains_key(&debug_pinned_id));
+            assert!(entries.contains_key(&legacy_id));
+        }
+
+        drop(active);
+        drop(pin);
+        assert!(registry.set_debug_pin(&debug_pinned_id, false));
+        drop(legacy);
+        registry.shutdown().await;
     }
 
     #[test]
@@ -2519,7 +2908,7 @@ mod tests {
     #[tokio::test]
     async fn conditional_close_without_matching_pooled_generation_is_a_noop() {
         let state =
-            crate::ida::pool::PooledSessionState::new(test_pool(1), "generation-test".to_string());
+            crate::ida::pool::WorkspaceDatabase::new(test_pool(1), "generation-test".to_string());
 
         assert_eq!(
             state
@@ -2564,7 +2953,7 @@ mod tests {
     #[tokio::test]
     async fn bound_call_reports_no_database_rather_than_a_redirect() {
         let state =
-            crate::ida::pool::PooledSessionState::new(test_pool(1), "redirect-test".to_string());
+            crate::ida::pool::WorkspaceDatabase::new(test_pool(1), "redirect-test".to_string());
 
         assert!(matches!(
             state
