@@ -846,6 +846,23 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 }
                 let _ = resp.send(result);
             }
+            IdaRequest::RenderRange {
+                start,
+                end,
+                max_lines,
+                resp,
+            } => {
+                debug!(
+                    start = format!("{:#x}", start),
+                    end = format!("{:#x}", end),
+                    max_lines,
+                    "Rendering address range"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_render_range", || {
+                    disasm::handle_render_range(&idb, start, end, max_lines)
+                });
+                let _ = resp.send(result);
+            }
             IdaRequest::Decompile { addr, resp } => {
                 debug!(address = format!("{:#x}", addr), "Decompiling");
                 let result = crate::crash_guard::crash_guarded("handle_decompile", || {
@@ -1429,6 +1446,25 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 }
                 let _ = resp.send(result);
             }
+            IdaRequest::ListPatches {
+                start,
+                end,
+                offset,
+                limit,
+                resp,
+            } => {
+                debug!(
+                    start = start.map(|address| format!("{address:#x}")),
+                    end = end.map(|address| format!("{address:#x}")),
+                    offset,
+                    limit,
+                    "Listing patched bytes"
+                );
+                let result = crate::crash_guard::crash_guarded("handle_list_patches", || {
+                    disasm::handle_list_patches(&idb, start, end, offset, limit)
+                });
+                let _ = resp.send(result);
+            }
             IdaRequest::PatchAsm {
                 addr,
                 name,
@@ -1757,16 +1793,20 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             }
             IdaRequest::CallGraph {
                 addr,
+                direction,
                 max_depth,
                 max_nodes,
                 resp,
             } => {
                 debug!(
                     address = format!("{:#x}", addr),
-                    max_depth, max_nodes, "Building call graph"
+                    direction = direction.as_str(),
+                    max_depth,
+                    max_nodes,
+                    "Building call graph"
                 );
                 let result = crate::crash_guard::crash_guarded("handle_callgraph", || {
-                    controlflow::handle_callgraph(&idb, addr, max_depth, max_nodes)
+                    controlflow::handle_callgraph(&idb, addr, direction, max_depth, max_nodes)
                 });
                 let _ = resp.send(result);
             }
@@ -1974,6 +2014,7 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
         IdaRequest::ResolveFunction { resp, .. } => reject!(resp, err),
         IdaRequest::DisasmByName { resp, .. } => reject!(resp, err),
         IdaRequest::Disasm { resp, .. } => reject!(resp, err),
+        IdaRequest::RenderRange { resp, .. } => reject!(resp, err),
         IdaRequest::Decompile { resp, .. } => reject!(resp, err),
         IdaRequest::Segments { resp, .. } => reject!(resp, err),
         IdaRequest::Strings { resp, .. } => reject!(resp, err),
@@ -1999,6 +2040,7 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
         IdaRequest::LuminaLookup { resp, .. } => reject!(resp, err),
         IdaRequest::LuminaApply { resp, .. } => reject!(resp, err),
         IdaRequest::GetBytes { resp, .. } => reject!(resp, err),
+        IdaRequest::ListPatches { resp, .. } => reject!(resp, err),
         IdaRequest::SetComments { resp, .. } => reject!(resp, err),
         IdaRequest::Rename { resp, .. } => reject!(resp, err),
         IdaRequest::PatchBytes { resp, .. } => reject!(resp, err),

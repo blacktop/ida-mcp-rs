@@ -2,6 +2,39 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallGraphDirection {
+    Callees,
+    Callers,
+    Both,
+}
+
+impl CallGraphDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Callees => "callees",
+            Self::Callers => "callers",
+            Self::Both => "both",
+        }
+    }
+
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value
+            .unwrap_or("callees")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "callees" | "callee" | "outgoing" => Ok(Self::Callees),
+            "callers" | "caller" | "incoming" => Ok(Self::Callers),
+            "both" => Ok(Self::Both),
+            value => Err(format!(
+                "direction must be callees, callers, or both (got {value:?})"
+            )),
+        }
+    }
+}
+
 /// Typed loader configuration for a newly-created raw-binary database.
 #[derive(Debug, Clone, Default)]
 pub struct RawBinaryTarget {

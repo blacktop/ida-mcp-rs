@@ -76,6 +76,12 @@ pub enum IdaRequest {
         count: usize,
         resp: oneshot::Sender<Result<String, ToolError>>,
     },
+    RenderRange {
+        start: u64,
+        end: u64,
+        max_lines: usize,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
     Decompile {
         addr: u64,
         resp: oneshot::Sender<Result<String, ToolError>>,
@@ -230,6 +236,13 @@ pub enum IdaRequest {
         size: usize,
         resp: oneshot::Sender<Result<BytesResult, ToolError>>,
     },
+    ListPatches {
+        start: Option<u64>,
+        end: Option<u64>,
+        offset: usize,
+        limit: usize,
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
     SetComments {
         addr: Option<u64>,
         name: Option<String>,
@@ -362,6 +375,7 @@ pub enum IdaRequest {
     },
     CallGraph {
         addr: u64,
+        direction: CallGraphDirection,
         max_depth: usize,
         max_nodes: usize,
         resp: oneshot::Sender<Result<Value, ToolError>>,

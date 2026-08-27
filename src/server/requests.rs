@@ -282,6 +282,19 @@ pub struct DisasmRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct RenderRangeRequest {
+    #[schemars(description = "Inclusive start address (string/number)")]
+    pub start: Value,
+    #[schemars(
+        description = "Exclusive end address (string/number); ranges are limited to 65536 bytes"
+    )]
+    pub end: Value,
+    #[schemars(description = "Maximum rendered lines (1-4096, default: 512)")]
+    #[schemars(range(min = 1, max = 4096))]
+    pub max_lines: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DisasmByNameRequest {
     #[schemars(description = "Function name to disassemble (exact or partial match)")]
     pub name: String,
@@ -593,6 +606,21 @@ pub struct GetBytesRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListPatchesRequest {
+    #[schemars(description = "Optional inclusive start address (string/number)")]
+    pub start: Option<Value>,
+    #[schemars(description = "Optional exclusive end address (string/number)")]
+    pub end: Option<Value>,
+    #[schemars(description = "Coalesced patch-range offset (default: 0)")]
+    #[schemars(range(min = 0))]
+    pub offset: Option<i64>,
+    #[schemars(description = "Maximum coalesced ranges (1-10000, default: 100)")]
+    #[serde(alias = "count")]
+    #[schemars(range(min = 1, max = 10000))]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SetCommentsRequest {
     #[schemars(description = "Address to comment (string/number)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
@@ -822,6 +850,8 @@ pub struct CallGraphRequest {
         alias = "addrs"
     )]
     pub roots: Value,
+    #[schemars(description = "Traversal direction: callees (default), callers, or both")]
+    pub direction: Option<String>,
     #[schemars(description = "Maximum depth (default: 2)")]
     #[schemars(range(min = 1, max = 256))]
     pub max_depth: Option<i64>,

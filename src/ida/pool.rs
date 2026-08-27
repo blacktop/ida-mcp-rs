@@ -1570,6 +1570,21 @@ impl WorkspaceDatabase {
         .await
     }
 
+    pub async fn render_range(
+        &self,
+        start: u64,
+        end: u64,
+        max_lines: usize,
+    ) -> Result<Value, ToolError> {
+        self.call_value(
+            "render_range",
+            json!({ "start": remote::hex_addr(start), "end": remote::hex_addr(end), "max_lines": max_lines }),
+            None,
+            None,
+        )
+        .await
+    }
+
     pub async fn decompile(&self, addr: u64) -> Result<String, ToolError> {
         self.call_text(
             "decompile",
@@ -1953,6 +1968,27 @@ impl WorkspaceDatabase {
         .await
     }
 
+    pub async fn list_patches(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, ToolError> {
+        self.call_value(
+            "list_patches",
+            json!({
+                "start": remote::opt_hex_addr(start),
+                "end": remote::opt_hex_addr(end),
+                "offset": offset,
+                "limit": limit,
+            }),
+            None,
+            None,
+        )
+        .await
+    }
+
     pub async fn set_comments(
         &self,
         addr: Option<u64>,
@@ -2308,12 +2344,13 @@ impl WorkspaceDatabase {
     pub async fn callgraph(
         &self,
         addr: u64,
+        direction: CallGraphDirection,
         max_depth: usize,
         max_nodes: usize,
     ) -> Result<Value, ToolError> {
         self.call_value(
             "callgraph",
-            json!({ "roots": remote::hex_addr(addr), "max_depth": max_depth, "max_nodes": max_nodes }),
+            json!({ "roots": remote::hex_addr(addr), "direction": direction.as_str(), "max_depth": max_depth, "max_nodes": max_nodes }),
             None,
             None,
         )

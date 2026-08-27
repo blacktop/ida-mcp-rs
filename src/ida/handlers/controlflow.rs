@@ -2,12 +2,12 @@
 
 use crate::error::ToolError;
 use crate::ida::handlers::parse_address_str;
-use crate::ida::types::{BasicBlockInfo, FunctionInfo};
+use crate::ida::types::{BasicBlockInfo, CallGraphDirection, FunctionInfo};
 use idalib::insn::OperandType;
 use idalib::xref::{CodeRef, XRefQuery, XRefType};
 use idalib::{Address, IDB};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 pub fn handle_basic_blocks(idb: &Option<IDB>, addr: u64) -> Result<Vec<BasicBlockInfo>, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
@@ -313,6 +313,7 @@ pub fn handle_find_paths(
 pub fn handle_callgraph(
     idb: &Option<IDB>,
     addr: u64,
+    direction: CallGraphDirection,
     max_depth: usize,
     max_nodes: usize,
 ) -> Result<Value, ToolError> {
@@ -321,8 +322,8 @@ pub fn handle_callgraph(
         .function_at(addr)
         .ok_or(ToolError::FunctionNotFound(addr))?;
 
-    let mut nodes: HashMap<u64, FunctionInfo> = HashMap::new();
-    let mut edges: Vec<(u64, u64)> = Vec::new();
+    let mut nodes: BTreeMap<u64, FunctionInfo> = BTreeMap::new();
+    let mut edges: BTreeSet<(u64, u64)> = BTreeSet::new();
     let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
     let max_depth = max_depth.max(1);
     let max_nodes = max_nodes.max(1);
@@ -348,15 +349,38 @@ pub fn handle_callgraph(
             break;
         }
 
-        let callees = handle_callees(idb, cur_addr).unwrap_or_default();
-        for callee in callees {
-            if let Ok(target_addr) = parse_address_str(&callee.address) {
-                edges.push((cur_addr, target_addr));
-                if !nodes.contains_key(&target_addr) && nodes.len() < max_nodes {
-                    nodes.insert(target_addr, callee.clone());
-                    queue.push_back((target_addr, depth + 1));
+        let mut relations = Vec::new();
+        if matches!(
+            direction,
+            CallGraphDirection::Callees | CallGraphDirection::Both
+        ) {
+            for callee in handle_callees(idb, cur_addr)? {
+                if let Ok(target_addr) = parse_address_str(&callee.address) {
+                    relations.push((cur_addr, target_addr, target_addr, callee));
                 }
             }
+        }
+        if matches!(
+            direction,
+            CallGraphDirection::Callers | CallGraphDirection::Both
+        ) {
+            for caller in handle_callers(idb, cur_addr)? {
+                if let Ok(caller_addr) = parse_address_str(&caller.address) {
+                    relations.push((caller_addr, cur_addr, caller_addr, caller));
+                }
+            }
+        }
+
+        relations.sort_by_key(|(from, to, _, _)| (*from, *to));
+        for (from, to, discovered_addr, discovered) in relations {
+            if !nodes.contains_key(&discovered_addr) {
+                if nodes.len() >= max_nodes {
+                    continue;
+                }
+                nodes.insert(discovered_addr, discovered);
+                queue.push_back((discovered_addr, depth + 1));
+            }
+            edges.insert((from, to));
         }
     }
 
@@ -369,12 +393,17 @@ pub fn handle_callgraph(
         .map(|(from, to)| json!({ "from": format!("{:#x}", from), "to": format!("{:#x}", to) }))
         .collect();
 
-    Ok(json!({ "nodes": nodes_vec, "edges": edges_vec }))
+    Ok(json!({
+        "direction": direction.as_str(),
+        "nodes": nodes_vec,
+        "edges": edges_vec,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::ida::handlers::controlflow::is_direct_branch_operand;
+    use crate::ida::types::CallGraphDirection;
     use idalib::insn::OperandType;
 
     #[test]
@@ -398,5 +427,18 @@ mod tests {
     fn non_address_operands_are_rejected() {
         assert!(!is_direct_branch_operand(OperandType::Reg));
         assert!(!is_direct_branch_operand(OperandType::Imm));
+    }
+
+    #[test]
+    fn callgraph_direction_defaults_to_callees() {
+        assert_eq!(
+            CallGraphDirection::parse(None),
+            Ok(CallGraphDirection::Callees)
+        );
+        assert_eq!(
+            CallGraphDirection::parse(Some("both")),
+            Ok(CallGraphDirection::Both)
+        );
+        assert!(CallGraphDirection::parse(Some("sideways")).is_err());
     }
 }

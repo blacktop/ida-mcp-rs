@@ -96,6 +96,9 @@ fn classify_child_error(message: String) -> ToolError {
     if lowered.contains("cancelled") || lowered.contains("canceled") {
         return ToolError::Cancelled(message);
     }
+    if lowered.contains("debugger teardown incomplete") {
+        return ToolError::DebuggerTeardown(message);
+    }
     ToolError::IdaError(message)
 }
 
@@ -196,6 +199,19 @@ mod tests {
         let err = parse_value(result, "run_script").expect_err("cancellation must fail");
 
         assert!(matches!(err, ToolError::Cancelled(message) if message.contains("cancelled")));
+    }
+
+    #[test]
+    fn parse_value_preserves_debugger_teardown_errors() {
+        let result = CallToolResult::error(vec![Content::text(
+            "Debugger teardown incomplete: timed out waiting for debugger teardown",
+        )]);
+
+        let err = parse_value(result, "close_idb").expect_err("teardown failure must fail");
+
+        assert!(
+            matches!(err, ToolError::DebuggerTeardown(message) if message.contains("timed out"))
+        );
     }
 
     #[test]

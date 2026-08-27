@@ -76,8 +76,6 @@ pub fn handle_exports(
 pub fn handle_entrypoints(idb: &Option<IDB>) -> Result<Vec<String>, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
-    // idalib's EntryPointIter has a bug: index is not incremented on success,
-    // causing infinite iteration. Break as soon as a duplicate address is seen.
     let mut seen = HashSet::new();
     let mut entrypoints = Vec::new();
     for addr in db.entries() {
@@ -85,6 +83,15 @@ pub fn handle_entrypoints(idb: &Option<IDB>) -> Result<Vec<String>, ToolError> {
             break;
         }
         entrypoints.push(format!("{:#x}", addr));
+    }
+
+    // IDA's raw-binary `-i` option records the primary start address in the
+    // database metadata but does not add an ida_entry row. Include that
+    // primary entry when the loader's entry table does not already contain it.
+    if let Some(start) = db.meta().start_address()
+        && seen.insert(start)
+    {
+        entrypoints.push(format!("{start:#x}"));
     }
 
     Ok(entrypoints)

@@ -12,7 +12,9 @@ pub use requests::*;
 use crate::error::ToolError;
 use crate::ida::observability::{ProgressReceiver, ProgressSender};
 use crate::ida::pool::CHILD_TIMEOUT_GRACE_SECS;
-use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget};
+use crate::ida::types::{
+    CallGraphDirection, ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget,
+};
 use crate::ida::worker::{
     CloseAuthorization, CloseTokenGrant, IdaWorker, WorkerBackend, MAX_TIMEOUT_SECS,
 };
@@ -2835,6 +2837,33 @@ impl IdaMcpServer {
         }
     }
 
+    #[tool(description = "Render a bounded half-open address range using IDA's database text")]
+    #[instrument(skip_all, fields(max_lines = req.max_lines))]
+    async fn render_range(
+        &self,
+        Parameters(req): Parameters<RenderRangeRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: render_range");
+        let start = match Self::value_to_single_address(&req.start) {
+            Ok(address) => address,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let end = match Self::value_to_single_address(&req.end) {
+            Ok(address) => address,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        let max_lines = try_param!(parse_optional_unsigned::<usize>(req.max_lines, "max_lines"))
+            .unwrap_or(512)
+            .min(4096);
+
+        match self.worker.render_range(start, end, max_lines).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
+            )])),
+            Err(error) => Ok(error.to_tool_result()),
+        }
+    }
+
     #[tool(description = "Get disassembly for a function by name")]
     #[instrument(skip_all, fields(name = %req.name, count = req.count))]
     async fn disasm_by_name(
@@ -3227,6 +3256,41 @@ impl IdaMcpServer {
             }
         } else {
             Ok(ToolError::InvalidParams("address or name required".to_string()).to_tool_result())
+        }
+    }
+
+    #[tool(description = "List IDA patch records, coalesced and paginated")]
+    #[instrument(skip_all, fields(offset = req.offset, limit = req.limit))]
+    async fn list_patches(
+        &self,
+        Parameters(req): Parameters<ListPatchesRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: list_patches");
+        let start = match req.start.as_ref() {
+            Some(value) => match Self::value_to_single_address(value) {
+                Ok(address) => Some(address),
+                Err(error) => return Ok(error.to_tool_result()),
+            },
+            None => None,
+        };
+        let end = match req.end.as_ref() {
+            Some(value) => match Self::value_to_single_address(value) {
+                Ok(address) => Some(address),
+                Err(error) => return Ok(error.to_tool_result()),
+            },
+            None => None,
+        };
+        let offset =
+            try_param!(parse_optional_unsigned::<usize>(req.offset, "offset")).unwrap_or(0);
+        let limit = try_param!(parse_optional_unsigned::<usize>(req.limit, "limit"))
+            .unwrap_or(100)
+            .min(10000);
+
+        match self.worker.list_patches(start, end, offset, limit).await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{result:?}")),
+            )])),
+            Err(error) => Ok(error.to_tool_result()),
         }
     }
 
@@ -3793,9 +3857,17 @@ impl IdaMcpServer {
         let max_nodes = try_param!(parse_optional_unsigned::<usize>(req.max_nodes, "max_nodes"))
             .unwrap_or(256)
             .min(10000);
+        let direction = match CallGraphDirection::parse(req.direction.as_deref()) {
+            Ok(direction) => direction,
+            Err(message) => return Ok(ToolError::InvalidParams(message).to_tool_result()),
+        };
 
         if roots.len() == 1 {
-            match self.worker.callgraph(roots[0], max_depth, max_nodes).await {
+            match self
+                .worker
+                .callgraph(roots[0], direction, max_depth, max_nodes)
+                .await
+            {
                 Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&result)
                         .unwrap_or_else(|_| format!("{:?}", result)),
@@ -3805,7 +3877,11 @@ impl IdaMcpServer {
         } else {
             let mut results = Vec::new();
             for root in roots {
-                match self.worker.callgraph(root, max_depth, max_nodes).await {
+                match self
+                    .worker
+                    .callgraph(root, direction, max_depth, max_nodes)
+                    .await
+                {
                     Ok(result) => results.push(json!({
                         "root": format!("{:#x}", root),
                         "callgraph": result
@@ -5389,6 +5465,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
 
         // Disassembly / Decompile
         "disasm" => Some(schema::<DisasmRequest>()),
+        "render_range" => Some(schema::<RenderRangeRequest>()),
         "disasm_by_name" => Some(schema::<DisasmByNameRequest>()),
         "disasm_function_at" => Some(schema::<DisasmFunctionAtRequest>()),
         "decompile" => Some(schema::<DecompileRequest>()),
@@ -5403,6 +5480,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
 
         // Memory / Search / Metadata
         "get_bytes" => Some(schema::<GetBytesRequest>()),
+        "list_patches" => Some(schema::<ListPatchesRequest>()),
         "get_string" => Some(schema::<GetStringRequest>()),
         "get_u8" | "get_u16" | "get_u32" | "get_u64" => Some(schema::<AddressRequest>()),
         "get_global_value" => Some(schema::<GetGlobalValueRequest>()),

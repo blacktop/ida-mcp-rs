@@ -449,6 +449,22 @@ impl IdaWorker {
         rx.await?
     }
 
+    pub async fn render_range(
+        &self,
+        start: u64,
+        end: u64,
+        max_lines: usize,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::RenderRange {
+            start,
+            end,
+            max_lines,
+            resp: tx,
+        })?;
+        rx.await?
+    }
+
     /// Decompile a function using Hex-Rays.
     pub async fn decompile(&self, addr: u64) -> Result<String, ToolError> {
         let (tx, rx) = oneshot::channel();
@@ -862,6 +878,24 @@ impl IdaWorker {
         rx.await?
     }
 
+    pub async fn list_patches(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, ToolError> {
+        let (tx, rx) = oneshot::channel();
+        self.try_send(IdaRequest::ListPatches {
+            start,
+            end,
+            offset,
+            limit,
+            resp: tx,
+        })?;
+        rx.await?
+    }
+
     /// Set a comment at an address.
     pub async fn set_comments(
         &self,
@@ -1220,12 +1254,14 @@ impl IdaWorker {
     pub async fn callgraph(
         &self,
         addr: u64,
+        direction: CallGraphDirection,
         max_depth: usize,
         max_nodes: usize,
     ) -> Result<Value, ToolError> {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::CallGraph {
             addr,
+            direction,
             max_depth,
             max_nodes,
             resp: tx,
@@ -1340,6 +1376,18 @@ impl WorkerBackend {
         match self {
             Self::Local(worker) => Some(worker.issue_close_token_for_session(session_id)),
             Self::Pooled(_) => None,
+        }
+    }
+
+    pub async fn render_range(
+        &self,
+        start: u64,
+        end: u64,
+        max_lines: usize,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.render_range(start, end, max_lines).await,
+            Self::Pooled(state) => state.render_range(start, end, max_lines).await,
         }
     }
 
@@ -1960,6 +2008,19 @@ impl WorkerBackend {
         }
     }
 
+    pub async fn list_patches(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Value, ToolError> {
+        match self {
+            Self::Local(worker) => worker.list_patches(start, end, offset, limit).await,
+            Self::Pooled(state) => state.list_patches(start, end, offset, limit).await,
+        }
+    }
+
     pub async fn set_comments(
         &self,
         addr: Option<u64>,
@@ -2311,12 +2372,17 @@ impl WorkerBackend {
     pub async fn callgraph(
         &self,
         addr: u64,
+        direction: CallGraphDirection,
         max_depth: usize,
         max_nodes: usize,
     ) -> Result<Value, ToolError> {
         match self {
-            Self::Local(worker) => worker.callgraph(addr, max_depth, max_nodes).await,
-            Self::Pooled(state) => state.callgraph(addr, max_depth, max_nodes).await,
+            Self::Local(worker) => {
+                worker
+                    .callgraph(addr, direction, max_depth, max_nodes)
+                    .await
+            }
+            Self::Pooled(state) => state.callgraph(addr, direction, max_depth, max_nodes).await,
         }
     }
 

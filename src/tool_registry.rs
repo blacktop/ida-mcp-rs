@@ -6,6 +6,43 @@
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+/// State boundary a tool operates against.
+///
+/// Runtime tools can execute without an open database. Database tools are
+/// routed to the worker that owns the selected IDB (the implicit worker in the
+/// default UX, or an explicit workspace database in workspace mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolScope {
+    Runtime,
+    Database,
+}
+
+/// Opt-in capabilities required before a tool may be advertised or called.
+///
+/// The fields are independent so future tools can require combinations such as
+/// workspace + debugger. Existing tools use [`Self::BASELINE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRequirements {
+    pub workspace: bool,
+    pub debugger: bool,
+    pub experimental: bool,
+}
+
+impl ToolRequirements {
+    pub const BASELINE: Self = Self {
+        workspace: false,
+        debugger: false,
+        experimental: false,
+    };
+
+    pub const DEBUGGER: Self = Self {
+        workspace: false,
+        debugger: true,
+        experimental: false,
+    };
+}
+
 /// Tool category for grouping related tools
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,7 +110,7 @@ impl ToolCategory {
             Self::Metadata => "Database info, segments, imports, exports",
             Self::Types => "Types, structs, and stack variable info",
             Self::Editing => "Patching, renaming, and comment editing",
-            Self::Debug => "Debugger operations (headless unsupported)",
+            Self::Debug => "Opt-in headless debugger lifecycle and runtime modules",
             Self::Ui => "UI/cursor helpers (headless unsupported)",
             Self::Scripting => "Execute Python scripts via IDAPython",
         }
@@ -129,6 +166,10 @@ impl FromStr for ToolCategory {
 pub struct ToolInfo {
     pub name: &'static str,
     pub category: ToolCategory,
+    /// Worker/state boundary used for routing and availability checks.
+    pub scope: ToolScope,
+    /// Opt-in server capabilities required to expose this tool.
+    pub requirements: ToolRequirements,
     /// Short description (1 line, <100 chars) - used in tool_catalog results
     pub short_desc: &'static str,
     /// Full description with usage details - used in tool_help
@@ -147,12 +188,17 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "open_idb",
         category: ToolCategory::Core,
+        scope: ToolScope::Runtime,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Open an IDA database or raw binary",
         full_desc: "Open an IDA Pro database file or a raw binary for analysis. \
                     Supports .i64 (64-bit) and .idb (32-bit) databases, as well as raw binaries \
-                    like Mach-O/ELF/PE. Raw binaries are saved as .i64 alongside the input; \
-                    if that generated .i64 already exists, ida-mcp opens it directly instead of rebuilding. \
-                    Set rebuild=true only when the raw input changed or stale analysis should be overwritten. \
+                    like Mach-O/ELF/PE. Raw binaries default to a .i64 alongside the input; set \
+                    idb_out to save in another existing, writable directory. Existing output databases \
+                    are reused only when IDA's recorded input SHA-256 matches the current raw input. \
+                    Set rebuild=true when the input changed or stale analysis should be overwritten; \
+                    overwrite is allowed only when the existing database's hash or recorded input path \
+                    proves that it belongs to this input. \
                     Auto-analysis does NOT run by default — open returns quickly with the database \
                     loaded. Check analysis_status in the response: if auto_is_ok is false and you \
                     need xrefs/decompile, call analyze_funcs(background=true) and poll task_status. \
@@ -176,6 +222,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "open_dsc",
         category: ToolCategory::Core,
+        scope: ToolScope::Runtime,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Open a dyld_shared_cache and load one module; use dsc_add_dylib/dsc_add_region for more",
         full_desc: "Open an Apple dyld_shared_cache file and extract a single dylib for analysis. \
                     A previously generated .i64 for the same DSC is reopened directly, preserving prior analysis. \
@@ -195,6 +243,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "dsc_add_dylib",
         category: ToolCategory::Core,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Load an additional dylib into an open DSC database",
         full_desc: "Incrementally load a single dylib into a database previously opened via open_dsc. \
                     Uses IDA's native dscu service to add the module. \
@@ -218,6 +268,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "dsc_add_region",
         category: ToolCategory::Core,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Load a DSC memory region by address (data/GOT/stubs)",
         full_desc: "Incrementally load a specific region from the currently open DSC database by address. \
                     Accepts exactly one address per call. \
@@ -234,6 +286,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "load_debug_info",
         category: ToolCategory::Core,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Load external debug info (e.g., dSYM/DWARF)",
         full_desc: "Load external debug info (e.g., DWARF from a dSYM) into the current database. \
                     If path is omitted, attempts to locate a sibling .dSYM for the currently-open database. \
@@ -245,6 +299,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "analysis_status",
         category: ToolCategory::Core,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Report auto-analysis status",
         full_desc: "Report auto-analysis status (auto_is_ok, auto_state) so clients can \
                     determine whether analysis-dependent tools like xrefs or decompile are fully ready.",
@@ -255,6 +311,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "close_idb",
         category: ToolCategory::Core,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Close the current database (release locks)",
         full_desc: "Close the currently open IDA database, releasing resources. \
                     Call this when done with analysis or before opening a different database. \
@@ -267,6 +325,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "tool_catalog",
         category: ToolCategory::Core,
+        scope: ToolScope::Runtime,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Discover available tools by query or category",
         full_desc: "Search for relevant tools based on what you're trying to accomplish. \
                     Returns tool names with short descriptions and relevance reasons. \
@@ -278,6 +338,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "tool_help",
         category: ToolCategory::Core,
+        scope: ToolScope::Runtime,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Get full documentation for a tool",
         full_desc: "Returns complete documentation for a specific tool including: \
                     full description, parameter schema, and example invocation. \
@@ -289,6 +351,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "recent_operations",
         category: ToolCategory::Core,
+        scope: ToolScope::Runtime,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Inspect recent foreground operation history",
         full_desc: "Return the currently active foreground operation (if any) and a capped trail of recent \
                     phase transitions recorded for open_idb, run_script, and analyze_funcs. \
@@ -308,6 +372,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "task_status",
         category: ToolCategory::Core,
+        scope: ToolScope::Runtime,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Check status of a background task (e.g. DSC loading)",
         full_desc: "Check the status of a background task started by open_dsc. \
                     Returns 'running' (with progress message), 'completed' (with db_info — \
@@ -320,6 +386,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "idb_meta",
         category: ToolCategory::Core,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Get database metadata and summary",
         full_desc: "Returns metadata about the currently open database: \
                     file type, processor architecture, bitness, entry points, \
@@ -332,6 +400,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "list_functions",
         category: ToolCategory::Functions,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "List functions with pagination and filtering",
         full_desc: "List all functions in the database with optional name filtering. \
                     Supports pagination via offset/limit. Returns function address, name, and size. \
@@ -350,6 +420,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "list_funcs",
         category: ToolCategory::Functions,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Alias of list_functions",
         full_desc: "Alias of list_functions. Lists all functions in the database with pagination \
                     and optional name filtering.",
@@ -360,6 +432,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "resolve_function",
         category: ToolCategory::Functions,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Find function address by name",
         full_desc: "Resolve a function name to its address. Supports exact names and demangled names. \
                     Returns the function's address, full name, and size if found.",
@@ -370,6 +444,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "function_at",
         category: ToolCategory::Functions,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Find the function containing an address",
         full_desc: "Return the function that contains the given address, including start/end and size. \
                     Useful for mapping PC/LR to a function.",
@@ -380,6 +456,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "lookup_funcs",
         category: ToolCategory::Functions,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Batch lookup multiple functions by name",
         full_desc: "Look up multiple function names at once. Returns address and size for each found function. \
                     More efficient than multiple resolve_function calls.",
@@ -390,6 +468,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "analyze_funcs",
         category: ToolCategory::Functions,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Run auto-analysis (foreground or background task)",
         full_desc: "Run IDA auto-analysis. Set background=true for large binaries (kernelcache, \
                     DSC modules) — returns a task_id immediately, poll task_status for progress. \
@@ -412,6 +492,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "disasm",
         category: ToolCategory::Disassembly,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Disassemble instructions at an address",
         full_desc: "Disassemble machine code starting at the given address. \
                     Returns assembly instructions with addresses and opcodes. \
@@ -421,8 +503,24 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["disassemble", "disasm", "assembly", "instructions", "code"],
     },
     ToolInfo {
+        name: "render_range",
+        category: ToolCategory::Disassembly,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "Render an IDA-style address range",
+        full_desc: "Render IDA's disassembly text for a bounded half-open address range, \
+                    including code and database-defined data directives. Returns stable \
+                    continuation metadata when max_lines truncates the result. This is separate \
+                    from disasm so existing instruction-oriented output stays unchanged.",
+        example: r#"{"start": "0x1000", "end": "0x1100", "max_lines": 256}"#,
+        default: false,
+        keywords: &["render", "range", "ida", "view", "mixed", "data"],
+    },
+    ToolInfo {
         name: "disasm_by_name",
         category: ToolCategory::Disassembly,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Disassemble a function by name",
         full_desc: "Disassemble a function given its name. Resolves the name to an address \
                     and disassembles the specified number of instructions.",
@@ -433,6 +531,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "disasm_function_at",
         category: ToolCategory::Disassembly,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Disassemble the function containing an address",
         full_desc: "Disassemble the function that contains the provided address. \
                     Useful when you only have a PC/LR.",
@@ -444,6 +544,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "decompile",
         category: ToolCategory::Decompile,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Decompile function to C pseudocode",
         full_desc: "Decompile a function using Hex-Rays decompiler (if available). \
                     Returns C-like pseudocode. Accepts address or function name.",
@@ -454,6 +556,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "pseudocode_at",
         category: ToolCategory::Decompile,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Get pseudocode for specific address/range",
         full_desc: "Get decompiled pseudocode for a specific address or address range (e.g., a basic block). \
                     Unlike decompile which returns the full function, this returns only statements \
@@ -466,6 +570,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "xrefs_to",
         category: ToolCategory::Xrefs,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Find all references TO an address",
         full_desc: "Find all cross-references pointing to the given address. \
                     Shows what code/data references this location. \
@@ -477,6 +583,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "xrefs_from",
         category: ToolCategory::Xrefs,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Find all references FROM an address",
         full_desc: "Find all cross-references originating from the given address. \
                     Shows what this instruction/data references. \
@@ -488,6 +596,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "xrefs_to_string",
         category: ToolCategory::Xrefs,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Find xrefs to strings matching a query",
         full_desc: "Find strings that match a query and return xrefs to each match. \
                     Useful for 'xref to cstring' workflows.",
@@ -498,6 +608,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "xref_matrix",
         category: ToolCategory::Xrefs,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Build xref matrix between addresses",
         full_desc: "Build a cross-reference matrix showing relationships between multiple addresses. \
                     Returns a boolean matrix indicating which addresses reference which others.",
@@ -509,6 +621,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "basic_blocks",
         category: ToolCategory::ControlFlow,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Get basic blocks of a function",
         full_desc: "Get the control flow graph basic blocks for a function. \
                     Returns block addresses, sizes, and successor relationships.",
@@ -519,6 +633,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "callers",
         category: ToolCategory::ControlFlow,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Find all callers of a function",
         full_desc: "Find all functions that call the specified function. \
                     Returns caller addresses and names.",
@@ -529,6 +645,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "callees",
         category: ToolCategory::ControlFlow,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Find all functions called by a function",
         full_desc: "Find all functions that are called by the specified function. \
                     Returns callee addresses and names.",
@@ -539,16 +657,21 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "callgraph",
         category: ToolCategory::ControlFlow,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Build call graph from a function",
-        full_desc: "Build a call graph starting from a function, exploring callers/callees \
-                    up to the specified depth. Returns nodes and edges.",
-        example: r#"{"roots": "0x1000", "max_depth": 2, "max_nodes": 256}"#,
+        full_desc: "Build a call graph starting from a function. Direction is callees by default \
+                    for compatibility, or callers/both when explicitly requested. Returns nodes \
+                    and normalized caller-to-callee edges.",
+        example: r#"{"roots": "0x1000", "direction": "both", "max_depth": 2, "max_nodes": 256}"#,
         default: false,
         keywords: &["callgraph", "call", "graph", "depth", "tree"],
     },
     ToolInfo {
         name: "find_paths",
         category: ToolCategory::ControlFlow,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Find control-flow paths between two addresses",
         full_desc: "Find control-flow paths between two addresses within the same function. \
                     Returns all paths up to max_depth. Both addresses must be in the same function.",
@@ -560,6 +683,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "get_bytes",
         category: ToolCategory::Memory,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Read raw bytes from an address",
         full_desc: "Read raw bytes from the database at the specified address. \
                     Returns bytes as hex string. Useful for examining data. \
@@ -571,6 +696,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "get_string",
         category: ToolCategory::Memory,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Read string at an address",
         full_desc: "Read a null-terminated string at the specified address. \
                     Supports C strings and other string types recognized by IDA.",
@@ -581,6 +708,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "get_u8",
         category: ToolCategory::Memory,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Read 8-bit value",
         full_desc: "Read an unsigned 8-bit value (byte) at the specified address.",
         example: r#"{"address": "0x1000"}"#,
@@ -590,6 +719,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "get_u16",
         category: ToolCategory::Memory,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Read 16-bit value",
         full_desc: "Read an unsigned 16-bit value (word) at the specified address.",
         example: r#"{"address": "0x1000"}"#,
@@ -599,6 +730,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "get_u32",
         category: ToolCategory::Memory,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Read 32-bit value",
         full_desc: "Read an unsigned 32-bit value (dword) at the specified address.",
         example: r#"{"address": "0x1000"}"#,
@@ -608,6 +741,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "get_u64",
         category: ToolCategory::Memory,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Read 64-bit value",
         full_desc: "Read an unsigned 64-bit value (qword) at the specified address.",
         example: r#"{"address": "0x1000"}"#,
@@ -617,6 +752,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "get_global_value",
         category: ToolCategory::Memory,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Read global value by name or address",
         full_desc: "Read a global value by name or address. Returns value and raw bytes.",
         example: r#"{"query": "g_flag"}"#,
@@ -626,6 +763,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "int_convert",
         category: ToolCategory::Memory,
+        scope: ToolScope::Runtime,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Convert integers between bases",
         full_desc: "Convert integers between decimal/hex/binary and show ASCII bytes when possible.",
         example: r#"{"inputs": ["0x41424344", 1234]}"#,
@@ -636,6 +775,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "find_bytes",
         category: ToolCategory::Search,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Search for byte pattern",
         full_desc: "Search for a byte pattern in the database. Supports wildcards. \
                     Returns all matching addresses up to the limit.",
@@ -646,6 +787,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "search",
         category: ToolCategory::Search,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Search for text or immediate values",
         full_desc: "General search tool. Searches for text strings or immediate values \
                     in instructions. Use find_bytes for byte-pattern searches.",
@@ -656,6 +799,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "strings",
         category: ToolCategory::Search,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "List all strings in the database",
         full_desc: "List strings found in the database with pagination and optional \
                     substring filter (filter/query). Returns address and content.",
@@ -666,6 +811,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "find_string",
         category: ToolCategory::Search,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Find strings matching a query",
         full_desc: "Find strings that match a query (substring by default, optional exact match). \
                     Supports pagination.",
@@ -676,6 +823,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "analyze_strings",
         category: ToolCategory::Search,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Analyze strings with filtering",
         full_desc: "List strings with optional substring filter and pagination. \
                     Useful for finding specific string patterns like URLs or paths.",
@@ -686,6 +835,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "find_insns",
         category: ToolCategory::Search,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Find instruction sequences by mnemonic",
         full_desc: "Search for instruction mnemonic patterns. If patterns is an array, matches \
                     contiguous sequences. Each pattern matches the mnemonic substring unless it \
@@ -697,6 +848,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "find_insn_operands",
         category: ToolCategory::Search,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Find instructions by operand substring",
         full_desc: "Search for instructions whose operand text matches any provided substring. \
                     Returns address, mnemonic, operands, and disasm line.",
@@ -708,6 +861,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "segments",
         category: ToolCategory::Metadata,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "List all segments",
         full_desc: "List all segments in the database with their addresses, sizes, \
                     names, and permissions (read/write/execute).",
@@ -718,6 +873,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "addr_info",
         category: ToolCategory::Metadata,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Resolve address to segment/function/symbol",
         full_desc: "Return address context including segment info, containing function, \
                     and nearest named symbol.",
@@ -728,6 +885,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "imports",
         category: ToolCategory::Metadata,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "List imported functions",
         full_desc: "List all imported external symbols with their addresses and names.",
         example: r#"{"offset": 0, "limit": 100}"#,
@@ -737,6 +896,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "exports",
         category: ToolCategory::Metadata,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "List exported functions",
         full_desc: "List all exported functions/symbols with their addresses and names.",
         example: r#"{"offset": 0, "limit": 100}"#,
@@ -746,6 +907,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "export_funcs",
         category: ToolCategory::Metadata,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Export functions (JSON)",
         full_desc: "Export functions in JSON format. If addrs is provided, only export those functions.",
         example: r#"{"addrs": ["0x1000", "0x2000"], "format": "json"}"#,
@@ -755,6 +918,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "entrypoints",
         category: ToolCategory::Metadata,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "List entry points",
         full_desc: "List all entry points in the binary (main, DllMain, etc.).",
         example: r#"{}"#,
@@ -764,6 +929,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "lumina_lookup",
         category: ToolCategory::Metadata,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Look up Lumina metadata for a function",
         full_desc: "Query the configured Lumina server for a function signature and metadata \
                     without changing the database. Requires explicit server startup with \
@@ -775,6 +942,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "lumina_apply",
         category: ToolCategory::Editing,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Apply Lumina metadata to a function",
         full_desc: "Pull metadata from the configured Lumina server and apply it to one function. \
                     Uses IDA's upgrade policy by default; force=true may replace existing names, \
@@ -787,6 +956,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "list_globals",
         category: ToolCategory::Metadata,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "List global variables",
         full_desc: "List global variables and data items with their addresses, names, and types.",
         example: r#"{"offset": 0, "limit": 100}"#,
@@ -797,6 +968,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "local_types",
         category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "List local types",
         full_desc: "List local types (typedefs, enums, structs, etc.) with pagination and optional filter.",
         example: r#"{"query": "struct", "limit": 50}"#,
@@ -806,6 +979,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "xrefs_to_field",
         category: ToolCategory::Xrefs,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Xrefs to a struct field",
         full_desc: "Get cross-references to a struct field by struct name/ordinal and member name/index.",
         example: r#"{"name": "Outer", "member_name": "inner", "limit": 25}"#,
@@ -815,6 +990,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "declare_type",
         category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Declare a type in the local type library",
         full_desc: "Parse a C declaration and store it in the local type library (optionally replacing existing).",
         example: r#"{"decl": "typedef int mcp_int_t;", "replace": true}"#,
@@ -824,6 +1001,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "apply_types",
         category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Apply a type to an address or stack variable",
         full_desc: "Apply a named type or C declaration to an address/symbol. \
                     For stack vars, provide stack_offset or stack_name plus decl.",
@@ -834,6 +1013,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "infer_types",
         category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Infer/guess type at an address",
         full_desc: "Guess a type for an address or symbol using IDA's heuristics.",
         example: r#"{"name": "interesting_function"}"#,
@@ -843,6 +1024,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "stack_frame",
         category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Get stack frame info",
         full_desc: "Get stack frame layout for the function at an address, including \
                     args/locals ranges and per-member type info.",
@@ -853,6 +1036,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "declare_stack",
         category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Declare a stack variable",
         full_desc: "Define a stack variable in a function frame using a C declaration. \
                     Provide function address/name and stack offset (negative for locals).",
@@ -863,6 +1048,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "delete_stack",
         category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Delete a stack variable",
         full_desc: "Delete a stack variable by name or offset in a function frame.",
         example: r#"{"name": "interesting_function", "offset": -16}"#,
@@ -872,6 +1059,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "structs",
         category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "List structs with pagination",
         full_desc: "List structs (UDTs) in the database with optional name filtering.",
         example: r#"{"limit": 50, "filter": "objc"}"#,
@@ -881,6 +1070,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "struct_info",
         category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Get struct info by name or ordinal",
         full_desc: "Get struct details including member layout and sizes.",
         example: r#"{"name": "MyStruct"}"#,
@@ -890,6 +1081,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "read_struct",
         category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Read a struct instance at an address",
         full_desc: "Read raw bytes for each struct member at a given address.",
         example: r#"{"address": "0x1000", "name": "MyStruct"}"#,
@@ -899,6 +1092,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "search_structs",
         category: ToolCategory::Types,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Search structs by name",
         full_desc: "Search for structs by name with optional filter and pagination. \
                     Returns the same structure list output as structs.",
@@ -910,6 +1105,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "set_comments",
         category: ToolCategory::Editing,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Set comments at an address",
         full_desc: "Set a non-repeatable or repeatable comment at an address. \
                     Empty string clears the comment. You can also supply a symbol/function name \
@@ -921,6 +1118,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "patch_asm",
         category: ToolCategory::Editing,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Patch instructions with assembly text",
         full_desc: "Assemble a single instruction line at the target address and patch the bytes. \
                     Requires a processor module with assembler support; may fail on some targets. \
@@ -932,6 +1131,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "patch",
         category: ToolCategory::Editing,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Patch bytes at an address",
         full_desc: "Patch bytes in the database at the given address. \
                     You can also supply a symbol/function name with an optional offset.",
@@ -940,8 +1141,22 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["patch", "bytes", "edit", "modify"],
     },
     ToolInfo {
+        name: "list_patches",
+        category: ToolCategory::Editing,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
+        short_desc: "List patched bytes without mutating the database",
+        full_desc: "List patched bytes recorded by IDA, coalesced into contiguous ranges and \
+                    paginated. Optional start/end bounds use a half-open address range.",
+        example: r#"{"start": "0x1000", "end": "0x2000", "offset": 0, "limit": 100}"#,
+        default: false,
+        keywords: &["patches", "diff", "original", "modified", "bytes"],
+    },
+    ToolInfo {
         name: "rename",
         category: ToolCategory::Editing,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Rename symbols",
         full_desc: "Rename a symbol at an address. Optional flags map to IDA set_name flags. \
                     You can also supply the current name instead of an address.",
@@ -953,6 +1168,8 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
     ToolInfo {
         name: "run_script",
         category: ToolCategory::Scripting,
+        scope: ToolScope::Database,
+        requirements: ToolRequirements::BASELINE,
         short_desc: "Execute Python code via IDAPython",
         full_desc: "Execute a Python script via IDAPython in the currently open database. \
                     Provide either 'code' (inline Python) or 'file' (path to a .py file). \
