@@ -548,6 +548,10 @@ fn direct_dsc_cache_i64_path(dsc_path: &std::path::Path) -> Result<std::path::Pa
     Ok(std::env::temp_dir().join(format!("ida-mcp-dsc-{name}-{identity}.i64")))
 }
 
+fn expanded_dsc_path(path: &str) -> std::path::PathBuf {
+    crate::expand_path(path.trim())
+}
+
 fn dsc_task_key(output: &std::path::Path) -> String {
     output.display().to_string()
 }
@@ -5520,7 +5524,7 @@ impl IdaMcpServer {
 
         let file_type = crate::dsc::dsc_file_type(&req.arch, ida_version);
         let frameworks = req.frameworks.unwrap_or_default();
-        let dsc_path = std::path::Path::new(&req.path);
+        let dsc_path = expanded_dsc_path(&req.path);
         let out_i64 = dsc_path.with_extension("i64");
         // Reuse order: a sibling .i64 (legacy idat output or user-provided)
         // first, then the 9.4 direct-path cache. Pre-9.4 never considers the
@@ -5534,7 +5538,7 @@ impl IdaMcpServer {
         // derived.
         let sibling_exists = crate::ida::handlers::database::ida_database_output_exists(&out_i64);
         let cache_i64 = if !sibling_exists && idalib::SDK_VERSION >= (9, 4) {
-            match direct_dsc_cache_i64_path(dsc_path) {
+            match direct_dsc_cache_i64_path(&dsc_path) {
                 Ok(cache) => Some(cache),
                 Err(error) => return Ok(error.to_tool_result()),
             }
@@ -5574,7 +5578,7 @@ impl IdaMcpServer {
                 };
                 let dsc_ctx = DscBackgroundCtx {
                     open: DscBackgroundOpen::DirectRawDsc {
-                        open_path: dsc_path.to_path_buf(),
+                        open_path: dsc_path.clone(),
                         idb_out: idb_out.clone(),
                     },
                     module: req.module.clone(),
@@ -5623,7 +5627,7 @@ impl IdaMcpServer {
             .to_tool_result());
         }
         let idat_args = crate::dsc::idat_dsc_args(
-            dsc_path,
+            &dsc_path,
             &out_i64,
             &script_path,
             &file_type,
@@ -7357,6 +7361,22 @@ mod tests {
         contents[0x58..0x68].copy_from_slice(&uuid);
         contents.extend_from_slice(tail);
         std::fs::write(dir.join(name), contents).expect("write DSC fixture");
+    }
+
+    #[test]
+    fn open_dsc_expands_tilde_before_deriving_paths() {
+        let home = std::env::var_os("HOME").expect("HOME is required for tilde expansion");
+        let expanded = crate::server::expanded_dsc_path(
+            "~/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
+        );
+        let expected = std::path::PathBuf::from(home)
+            .join("Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e");
+
+        assert_eq!(expanded, expected);
+        assert_eq!(
+            expanded.with_extension("i64"),
+            expected.with_extension("i64")
+        );
     }
 
     /// The direct-path database name must depend on the DSC's content
