@@ -2657,11 +2657,14 @@ fn release_error_retires_worker(err: &ToolError) -> bool {
 }
 
 fn child_tool_error_retires_worker(tool: &str, err: &ToolError) -> bool {
-    matches!(
+    if matches!(
         err,
         ToolError::WorkerClosed | ToolError::WorkerCrashed { .. } | ToolError::RemoteProtocol(_)
-    ) || (tool == "debug_modules"
-        && matches!(err, ToolError::Timeout(_) | ToolError::TimeoutDetailed(_)))
+    ) {
+        return true;
+    }
+
+    tool == "debug_modules" && matches!(err, ToolError::Timeout(_) | ToolError::TimeoutDetailed(_))
 }
 
 fn open_error_releases_lease(fresh_lease: bool, err: &ToolError) -> bool {
