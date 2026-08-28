@@ -15,7 +15,7 @@
 //! | idempotent retry of an open database | default identity rules plus `open_database_matches_explicit_output` (recorded input must match) |
 //! | direct `.i64`/`.idb`/`.id0` open | exemption: the database itself is the requested object; there is no separate input to verify against |
 //! | unpacked `.id0` fallback for a missing packed path | same exemption as direct opens (`open_existing_idb`) |
-//! | DSC managed temp cache | cache filename keyed by DSC content identity (`dsc_content_identity` in `server::mod`) |
+//! | DSC managed temp cache | cache filename keyed by the DSC header UUID; inputs without a trustworthy UUID are rejected (`dsc_content_identity` in `server::mod`) |
 //! | DSC sibling `.i64` next to the cache | exemption: user-managed artifact beside their own file; delete it to force a reload (documented in `open_dsc` reuse-order comment) |
 //! | `debug_open_module` output | opened through `open_idb` with explicit `idb_out`, so the raw-input hash verification above applies |
 
@@ -273,8 +273,12 @@ fn open_database_matches_explicit_output(
     if has_ida_database_extension(requested_input) {
         return false;
     }
-    (current_path == requested_output || paths_refer_to_same_file(current_path, requested_output))
-        && recorded_input_path_matches(requested_input, recorded_input)
+    // IDA may hold the requested packed output open in unpacked form, so the
+    // retry's `.i64`/`.idb` also matches its `.id0` sibling.
+    let output_matches = current_path == requested_output
+        || paths_refer_to_same_file(current_path, requested_output)
+        || unpacked_id0_path(requested_output).as_deref() == Some(current_path);
+    output_matches && recorded_input_path_matches(requested_input, recorded_input)
 }
 
 fn validate_raw_idb_output(input: &Path, output: &Path) -> Result<(), ToolError> {
@@ -1255,6 +1259,19 @@ mod tests {
             &output,
             &raw,
             Some(&dir.join("elsewhere.i64")),
+            &recorded
+        ));
+        // The requested packed output also matches its open unpacked form.
+        assert!(open_database_matches_explicit_output(
+            &dir.join("custom.id0"),
+            &raw,
+            Some(&output),
+            &recorded
+        ));
+        assert!(!open_database_matches_explicit_output(
+            &dir.join("elsewhere.id0"),
+            &raw,
+            Some(&output),
             &recorded
         ));
 

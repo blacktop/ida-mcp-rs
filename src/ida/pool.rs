@@ -841,9 +841,11 @@ pub struct WorkspaceDatabase {
 /// or add one — with a test — rather than rely on review to notice the gap.
 ///
 /// - **I1 — pin follows lease:** a debug pin never outlives the worker lease
-///   it was set for. Enforced by [`WorkspaceDatabase::clear_handle_if_worker`]
-///   on every terminal worker loss; test
-///   `worker_loss_clears_debug_pin_only_for_the_bound_lease`.
+///   it was set for, and every pin write serializes with lease transitions
+///   under the handle mutex. Enforced by
+///   [`WorkspaceDatabase::clear_handle_if_worker`] (clear is atomic with the
+///   lease change) and [`WorkspaceDatabase::set_debug_pinned`]; test
+///   `debug_pin_survives_unrelated_worker_loss`.
 /// - **I2 — pins block reaping:** an entry with active calls, task pins, or a
 ///   debug pin is never idle-reaped. Enforced by the [`workspace_reaper`]
 ///   filter; test `workspace_idle_reaper_respects_every_lifetime_guard`.
@@ -1012,15 +1014,19 @@ impl WorkspaceRegistry {
         Some(WorkspacePin { entry })
     }
 
-    pub fn set_debug_pin(&self, database_id: &str, pinned: bool) -> bool {
-        let entries = self.entries();
-        let Some(entry) = entries.get(database_id) else {
-            return false;
+    pub async fn set_debug_pin(&self, database_id: &str, pinned: bool) -> bool {
+        let database = {
+            let entries = self.entries();
+            let Some(entry) = entries.get(database_id) else {
+                return false;
+            };
+            // Touch before clearing the pin while the registry remains
+            // locked, so the reaper cannot observe an unpinned entry with
+            // stale idle time.
+            entry.touch();
+            entry.database.clone()
         };
-        // Touch before clearing the pin while the registry remains locked, so
-        // the reaper cannot observe an unpinned entry with stale idle time.
-        entry.touch();
-        entry.database.set_debug_pinned(pinned);
+        database.set_debug_pinned(pinned).await;
         true
     }
 
@@ -1179,20 +1185,18 @@ impl WorkspaceDatabase {
         }
     }
 
-    pub fn set_debug_pinned(&self, pinned: bool) {
+    /// Every pin write serializes with lease transitions under the handle
+    /// mutex, so losing a worker can never race a pin set for the lease that
+    /// replaced it (invariant I1). Reads stay lock-free: the reaper's
+    /// snapshot is safe because a pin is only ever set inside a tool call,
+    /// whose `active_calls` guard already blocks reaping.
+    pub async fn set_debug_pinned(&self, pinned: bool) {
+        let _guard = self.handle.lock().await;
         self.debug_pinned.store(pinned, Ordering::Relaxed);
     }
 
     pub fn debug_pinned(&self) -> bool {
         self.debug_pinned.load(Ordering::Relaxed)
-    }
-
-    /// State cleanup for terminal loss of this database's bound worker. A
-    /// debugger session lives inside that child process, so it cannot survive
-    /// the worker; leaving the pin set would block idle reaping forever for a
-    /// database that can no longer serve debugger calls (invariant I1).
-    fn on_worker_lost(&self) {
-        self.debug_pinned.store(false, Ordering::Relaxed);
     }
 
     fn next_database_generation(&self) -> Result<DatabaseGeneration, ToolError> {
@@ -1255,15 +1259,17 @@ impl WorkspaceDatabase {
 
     async fn clear_handle_if_worker(&self, worker_id: usize) {
         let mut guard = self.handle.lock().await;
-        let lost = guard
+        if guard
             .as_ref()
-            .is_some_and(|lease| lease.handle.worker_id == worker_id);
-        if lost {
+            .is_some_and(|lease| lease.handle.worker_id == worker_id)
+        {
             *guard = None;
-        }
-        drop(guard);
-        if lost {
-            self.on_worker_lost();
+            // A debugger session lives inside the lost child process, so it
+            // cannot survive the worker. Clearing the pin while the lease
+            // mutex is still held keeps this atomic with the lease change: a
+            // pin set for a replacement lease can never be clobbered here
+            // (invariant I1).
+            self.debug_pinned.store(false, Ordering::Relaxed);
         }
     }
 
@@ -2850,9 +2856,9 @@ mod tests {
         assert_eq!(first_entry.pins.load(Ordering::Relaxed), 1);
         drop(pin);
         assert_eq!(first_entry.pins.load(Ordering::Relaxed), 0);
-        assert!(registry.set_debug_pin(&first_id, true));
+        assert!(registry.set_debug_pin(&first_id, true).await);
         assert!(first_entry.database.debug_pinned());
-        assert!(registry.set_debug_pin(&first_id, false));
+        assert!(registry.set_debug_pin(&first_id, false).await);
         assert!(!first_entry.database.debug_pinned());
         drop(acquired);
         assert_eq!(first_entry.active_calls.load(Ordering::Relaxed), 0);
@@ -2890,7 +2896,7 @@ mod tests {
 
         let debug_pinned = registry.allocate_database();
         let debug_pinned_id = debug_pinned.database_id().to_string();
-        assert!(registry.set_debug_pin(&debug_pinned_id, true));
+        assert!(registry.set_debug_pin(&debug_pinned_id, true).await);
         drop(debug_pinned);
 
         let legacy = registry.bind_legacy("legacy-reaper-test".to_string());
@@ -2912,31 +2918,34 @@ mod tests {
 
         drop(active);
         drop(pin);
-        assert!(registry.set_debug_pin(&debug_pinned_id, false));
+        assert!(registry.set_debug_pin(&debug_pinned_id, false).await);
         drop(legacy);
         registry.shutdown().await;
     }
 
-    /// Lifecycle invariant I1: losing the bound worker clears the debug pin,
-    /// while worker loss for a database with no bound lease leaves an
-    /// unrelated pin alone.
+    /// Lifecycle invariant I1: pin writes serialize with lease transitions
+    /// under the handle mutex, and worker loss for a database with no bound
+    /// lease leaves an unrelated pin alone. The lost-lease clear itself is a
+    /// single locked block in `clear_handle_if_worker`; exercising it end to
+    /// end requires a live pooled worker (covered by the debugger
+    /// integration tests).
     #[tokio::test]
-    async fn worker_loss_clears_debug_pin_only_for_the_bound_lease() {
+    async fn debug_pin_survives_unrelated_worker_loss() {
         let registry = WorkspaceRegistry::new(test_pool(2), Duration::from_secs(300));
         let lease = registry.allocate_database();
         let database_id = lease.database_id().to_string();
         let database = lease.database();
 
-        assert!(registry.set_debug_pin(&database_id, true));
+        assert!(registry.set_debug_pin(&database_id, true).await);
         assert!(database.debug_pinned());
-        database.on_worker_lost();
-        assert!(!database.debug_pinned());
 
         // No lease is installed, so an arbitrary worker retirement must not
         // touch this database's pin.
-        assert!(registry.set_debug_pin(&database_id, true));
         database.clear_handle_if_worker(7).await;
         assert!(database.debug_pinned());
+
+        assert!(registry.set_debug_pin(&database_id, false).await);
+        assert!(!database.debug_pinned());
 
         drop(lease);
         registry.shutdown().await;

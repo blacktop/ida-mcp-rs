@@ -483,19 +483,19 @@ fn sanitize_temp_component(value: &str) -> String {
 }
 
 /// Content identity of the DSC at `path`, used to key the managed database
-/// cache. Prefers the dyld cache header UUID (bytes 0x58..0x68, valid when
-/// `mappingOffset` places the header past it); any other readable file falls
-/// back to a digest of its leading bytes and length. Never derived from the
-/// path: DSCs are typically opened through a mount point, so a different
-/// firmware mounted at the same path must key a different database, and the
-/// same firmware must reuse its analysis wherever it is mounted.
+/// cache: the dyld cache header UUID (bytes 0x58..0x68, valid when
+/// `mappingOffset` places the header past it). Never derived from the path:
+/// DSCs are typically opened through a mount point, so a different firmware
+/// mounted at the same path must key a different database, and the same
+/// firmware must reuse its analysis wherever it is mounted. A file without a
+/// trustworthy UUID is rejected — a partial-content digest could collide, so
+/// there is no fallback identity.
 fn dsc_content_identity(path: &std::path::Path) -> Result<String, ToolError> {
-    use sha2::{Digest, Sha256};
     use std::io::Read;
 
     let read_error = |error: std::io::Error| {
         ToolError::InvalidPath(format!(
-            "failed to read DSC content for cache identity ({}): {error}",
+            "failed to read DSC header for cache identity ({}): {error}",
             path.display()
         ))
     };
@@ -523,28 +523,11 @@ fn dsc_content_identity(path: &std::path::Path) -> Result<String, ToolError> {
         }
     }
 
-    // Not a recognizable dyld cache header: digest the leading bytes plus the
-    // file length so distinct contents still key distinct databases.
-    let mut hasher = Sha256::new();
-    hasher.update(&header[..filled]);
-    let mut remaining = 1024 * 1024 - filled;
-    let mut buffer = [0u8; 64 * 1024];
-    while remaining > 0 {
-        let want = remaining.min(buffer.len());
-        let count = file.read(&mut buffer[..want]).map_err(read_error)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-        remaining -= count;
-    }
-    hasher.update(file.metadata().map_err(read_error)?.len().to_le_bytes());
-    let digest = hasher.finalize();
-    let mut identity = String::with_capacity(32);
-    for byte in &digest[..16] {
-        identity.push_str(&format!("{byte:02x}"));
-    }
-    Ok(identity)
+    Err(ToolError::InvalidParams(format!(
+        "{} does not carry a dyld_shared_cache UUID, so its generated database cannot be \
+         identified safely; open it with open_idb instead",
+        path.display()
+    )))
 }
 
 /// Deterministic per-DSC database location for the IDA 9.4 direct open path.
@@ -767,14 +750,14 @@ impl IdaMcpServer {
         registry.pin(database_id)
     }
 
-    fn set_workspace_debug_pin(&self, pinned: bool) {
+    async fn set_workspace_debug_pin(&self, pinned: bool) {
         let (Some(registry), Some(database_id)) = (
             self.workspace_registry.as_ref(),
             self.workspace_database_id.as_deref(),
         ) else {
             return;
         };
-        if !registry.set_debug_pin(database_id, pinned) {
+        if !registry.set_debug_pin(database_id, pinned).await {
             warn!(
                 database_id,
                 pinned, "debugger workspace pin target disappeared"
@@ -782,9 +765,9 @@ impl IdaMcpServer {
         }
     }
 
-    fn finish_debugger_start(&self, result: Result<Value, ToolError>) -> CallToolResult {
+    async fn finish_debugger_start(&self, result: Result<Value, ToolError>) -> CallToolResult {
         if debugger_start_retains_session(&result) {
-            self.set_workspace_debug_pin(true);
+            self.set_workspace_debug_pin(true).await;
         }
         match result {
             Ok(result) => CallToolResult::success(vec![Content::text(pretty_json(&result))]),
@@ -2977,7 +2960,7 @@ impl IdaMcpServer {
                 timeout_seconds,
             )
             .await;
-        Ok(self.finish_debugger_start(result))
+        Ok(self.finish_debugger_start(result).await)
     }
 
     #[tool(
@@ -3003,7 +2986,7 @@ impl IdaMcpServer {
             Err(error) => return Ok(error.to_tool_result()),
         };
         let result = self.worker.debug_attach(pid, timeout_seconds).await;
-        Ok(self.finish_debugger_start(result))
+        Ok(self.finish_debugger_start(result).await)
     }
 
     #[tool(
@@ -3039,7 +3022,7 @@ impl IdaMcpServer {
         };
         match self.worker.debug_stop(action, timeout_seconds).await {
             Ok(result) => {
-                self.set_workspace_debug_pin(false);
+                self.set_workspace_debug_pin(false).await;
                 Ok(CallToolResult::success(vec![Content::text(pretty_json(
                     &result,
                 ))]))
@@ -5565,9 +5548,13 @@ impl IdaMcpServer {
         // cache — those databases were written by a newer IDA and cannot be
         // opened there. Provenance: the sibling is a user-managed artifact
         // next to their own file (documented exemption — delete it to force a
-        // reload), while the managed temp cache is content-keyed by the DSC's
-        // identity so it can never serve a different firmware's analysis.
-        let cache_i64 = if idalib::SDK_VERSION >= (9, 4) {
+        // reload), while the managed temp cache is keyed by the DSC's header
+        // UUID so it can never serve a different firmware's analysis. The
+        // cache path is derived only when the sibling is absent, so a sibling
+        // database keeps working even for inputs whose identity cannot be
+        // derived.
+        let sibling_exists = crate::ida::handlers::database::ida_database_output_exists(&out_i64);
+        let cache_i64 = if !sibling_exists && idalib::SDK_VERSION >= (9, 4) {
             match direct_dsc_cache_i64_path(dsc_path) {
                 Ok(cache) => Some(cache),
                 Err(error) => return Ok(error.to_tool_result()),
@@ -5575,7 +5562,7 @@ impl IdaMcpServer {
         } else {
             None
         };
-        let existing_i64 = if crate::ida::handlers::database::ida_database_output_exists(&out_i64) {
+        let existing_i64 = if sibling_exists {
             Some(out_i64.clone())
         } else {
             cache_i64
@@ -7399,18 +7386,18 @@ mod tests {
         assert!(name.starts_with("ida-mcp-dsc-dyld_shared_cache_arm64e-"));
         assert!(name.ends_with(".i64"));
 
-        // Files without a dyld header still key by content, not path.
+        // A file without a trustworthy dyld UUID is rejected outright: a
+        // partial-content digest could collide, so no identity is derived.
         std::fs::write(mount_a.join("blob.bin"), b"blob-one").expect("write blob");
-        std::fs::write(mount_b.join("blob.bin"), b"blob-one").expect("write blob");
-        let blob_a = crate::server::direct_dsc_cache_i64_path(&mount_a.join("blob.bin"))
-            .expect("cache path for blob A");
-        let blob_b = crate::server::direct_dsc_cache_i64_path(&mount_b.join("blob.bin"))
-            .expect("cache path for blob B");
-        assert_eq!(blob_a, blob_b);
-        std::fs::write(mount_b.join("blob.bin"), b"blob-two").expect("rewrite blob");
-        let blob_changed = crate::server::direct_dsc_cache_i64_path(&mount_b.join("blob.bin"))
-            .expect("cache path for changed blob");
-        assert_ne!(blob_a, blob_changed);
+        assert!(
+            crate::server::direct_dsc_cache_i64_path(&mount_a.join("blob.bin")).is_err(),
+            "a non-DSC file must fail identity derivation"
+        );
+        write_dsc_fixture(&mount_a, "zero-uuid.dsc", [0u8; 16], b"tail");
+        assert!(
+            crate::server::direct_dsc_cache_i64_path(&mount_a.join("zero-uuid.dsc")).is_err(),
+            "an all-zero UUID is not a trustworthy identity"
+        );
 
         // An unreadable DSC is an error, never a silently path-keyed cache.
         assert!(
