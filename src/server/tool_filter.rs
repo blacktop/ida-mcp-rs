@@ -60,6 +60,7 @@ pub struct ToolFilter {
     /// to surface the `filtering_active` field).
     is_active: bool,
     debugger_enabled: bool,
+    workspace_enabled: bool,
 }
 
 impl ToolFilter {
@@ -122,6 +123,7 @@ impl ToolFilter {
             enabled,
             is_active: any_input,
             debugger_enabled: false,
+            workspace_enabled: false,
         })
     }
 
@@ -132,12 +134,18 @@ impl ToolFilter {
             enabled: tool_registry::all_tools().map(|t| t.name).collect(),
             is_active: false,
             debugger_enabled: false,
+            workspace_enabled: false,
         }
     }
 
-    pub fn with_debugger_enabled(mut self, requested: bool) -> Result<Self, ToolFilterError> {
+    pub fn with_capabilities(
+        mut self,
+        debugger_requested: bool,
+        workspace_enabled: bool,
+    ) -> Result<Self, ToolFilterError> {
         self.debugger_enabled =
-            requested && cfg!(all(target_os = "macos", target_arch = "aarch64"));
+            debugger_requested && cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        self.workspace_enabled = workspace_enabled;
         if self.enabled_count() == 0 {
             return Err(ToolFilterError::EmptyFinalSet);
         }
@@ -146,8 +154,10 @@ impl ToolFilter {
 
     pub fn is_enabled(&self, name: &str) -> bool {
         self.enabled.contains(name)
-            && tool_registry::get_tool(name)
-                .is_some_and(|tool| !tool.requirements.debugger || self.debugger_enabled)
+            && tool_registry::get_tool(name).is_some_and(|tool| {
+                (!tool.requirements.debugger || self.debugger_enabled)
+                    && (!tool.requirements.workspace || self.workspace_enabled)
+            })
     }
 
     pub fn is_active(&self) -> bool {
@@ -201,14 +211,14 @@ mod tests {
     fn debugger_tools_require_explicit_platform_gate() {
         let disabled = ToolFilter::from_inputs(&[], &[], &[], false)
             .unwrap()
-            .with_debugger_enabled(false)
+            .with_capabilities(false, false)
             .unwrap();
         assert!(!disabled.is_enabled("debug_status"));
         assert!(disabled.is_enabled("open_idb"));
 
         let requested = ToolFilter::from_inputs(&[], &[], &[], false)
             .unwrap()
-            .with_debugger_enabled(true)
+            .with_capabilities(true, false)
             .unwrap();
         assert_eq!(
             requested.is_enabled("debug_status"),
@@ -220,7 +230,7 @@ mod tests {
     fn read_only_removes_debugger_process_control() {
         let filter = ToolFilter::from_inputs(&[], &[], &[], true)
             .expect("read-only filter")
-            .with_debugger_enabled(true)
+            .with_capabilities(true, false)
             .expect("debugger gate");
 
         assert!(!filter.is_enabled("debug_launch"));
@@ -339,6 +349,24 @@ mod tests {
         )
         .expect_err("exclude wiping all includes must reject");
         assert_eq!(err, ToolFilterError::EmptyFinalSet);
+    }
+
+    #[test]
+    fn workspace_only_final_set_requires_workspace_capability() {
+        let error = ToolFilter::from_inputs(&[], &cat("debug_open_module"), &[], false)
+            .expect("known workspace tool")
+            .with_capabilities(true, false)
+            .expect_err("workspace-only selection must not start without --workspace");
+        assert_eq!(error, ToolFilterError::EmptyFinalSet);
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let filter = ToolFilter::from_inputs(&[], &cat("debug_open_module"), &[], false)
+                .expect("known workspace tool")
+                .with_capabilities(true, true)
+                .expect("supported debugger workspace tool");
+            assert!(filter.is_enabled("debug_open_module"));
+        }
     }
 
     #[test]

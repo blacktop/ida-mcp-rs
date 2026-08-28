@@ -281,4 +281,17 @@ grep -q "unknown toolset category" "$work/bad.log" || {
 }
 echo "   ✓ unknown toolset rejected at startup"
 
+# --- Phase E: runtime requirements participate in the final-set check ---
+echo "── Phase E: workspace-only selection requires --workspace ──"
+if "$BIN" serve --tools=debug_open_module --enable-debugger < /dev/null > "$work/workspace-required.log" 2>&1; then
+  echo "FAIL: workspace-only tool selection should be rejected without --workspace" >&2
+  cat "$work/workspace-required.log" >&2
+  exit 1
+fi
+grep -q "tool filter resolves to an empty set" "$work/workspace-required.log" || {
+  echo "FAIL: workspace-only selection should fail the final-set check; got: $(cat "$work/workspace-required.log")" >&2
+  exit 1
+}
+echo "   ✓ workspace requirement participates in the final-set check"
+
 echo "✅ stdio tool-filter test passed"

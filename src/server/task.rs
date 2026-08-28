@@ -100,6 +100,7 @@ pub struct TaskState {
 struct TaskEntry {
     owner: TaskOwner,
     state: TaskState,
+    workspace_database_id: Option<String>,
     cancel_token: Option<CancellationToken>,
     cancel_requested: Option<String>,
 }
@@ -109,6 +110,7 @@ impl TaskEntry {
         Self {
             owner,
             state,
+            workspace_database_id: None,
             cancel_token: None,
             cancel_requested: None,
         }
@@ -316,6 +318,22 @@ impl TaskRegistry {
         if let Some(entry) = entries.get_mut(id) {
             entry.set_cancel_token(Some(cancel_token));
         }
+    }
+
+    pub fn bind_workspace_open(&self, id: &str, database_id: &str) {
+        let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = entries.get_mut(id) {
+            entry.workspace_database_id = Some(database_id.to_string());
+        }
+    }
+
+    pub fn has_running_workspace_open(&self, database_id: &str) -> bool {
+        let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        prune_terminal_tasks(&mut entries);
+        entries.values().any(|entry| {
+            entry.state.status == TaskStatus::Running
+                && entry.workspace_database_id.as_deref() == Some(database_id)
+        })
     }
 
     /// Get a cloneable snapshot of a task's current state.

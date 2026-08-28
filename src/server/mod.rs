@@ -406,12 +406,17 @@ fn attach_workspace_database_id(response: &mut CallToolResponse, database_id: &s
     true
 }
 
-fn workspace_close_should_remove_entry(result: &Result<(), ToolError>) -> bool {
+fn workspace_close_should_remove_entry(
+    result: &Result<(), ToolError>,
+    task_registry: &task::TaskRegistry,
+    database_id: Option<&str>,
+) -> bool {
     // WorkspaceDatabase::close takes its worker lease before dispatching the
     // child close. Every later result consumes that lease, including teardown
     // errors that retire the child. NoDatabaseOpen is the one pre-dispatch
     // result and can mean a pinned background open has not installed its lease.
     !matches!(result, Err(ToolError::NoDatabaseOpen))
+        || !database_id.is_some_and(|id| task_registry.has_running_workspace_open(id))
 }
 
 /// Parameters for the background DSC loading task.
@@ -836,6 +841,17 @@ impl IdaMcpServer {
         // Check: exists, is file, no path traversal
         // IDA can open many formats: .i64, .idb, ELF, Mach-O, PE, raw binaries, etc.
         p.exists() && p.is_file() && !path.contains("..")
+    }
+
+    fn validate_open_path(path: &str) -> bool {
+        if Self::validate_path(path) {
+            return true;
+        }
+        if path.contains("..") || !Self::is_database_path(path) {
+            return false;
+        }
+        let expanded = crate::expand_path(path.trim());
+        !expanded.exists() && crate::ida::handlers::database::ida_database_output_exists(&expanded)
     }
 
     fn parse_address(s: &str) -> Result<u64, ToolError> {
@@ -1384,6 +1400,10 @@ impl IdaMcpServer {
             }
             Err(error) => return Ok(task_create_error_to_tool_error(error).to_tool_result()),
         };
+        if let Some(database_id) = self.workspace_database_id.as_deref() {
+            self.task_registry
+                .bind_workspace_open(&task_id, database_id);
+        }
 
         let backend = match &ctx.open {
             DscBackgroundOpen::DirectRawDsc { .. } => "dscu",
@@ -2286,7 +2306,7 @@ impl IdaMcpServer {
         debug!("Tool call: open_idb");
         let path = req.path.trim().to_string();
         // Validate path (prevent directory traversal, check extension)
-        if !Self::validate_path(&path) {
+        if !Self::validate_open_path(&path) {
             return Ok(ToolError::InvalidPath(path).to_tool_result().into());
         }
         let timeout_secs = match parse_optional_unsigned::<u64>(req.timeout_secs, "timeout_secs") {
@@ -3171,12 +3191,14 @@ impl IdaMcpServer {
             }
         }
         let result = self.worker.close().await;
-        if workspace_close_should_remove_entry(&result)
-            && let (Some(registry), Some(database_id)) = (
-                self.workspace_registry.as_ref(),
-                self.workspace_database_id.as_deref(),
-            )
-        {
+        if workspace_close_should_remove_entry(
+            &result,
+            &self.task_registry,
+            self.workspace_database_id.as_deref(),
+        ) && let (Some(registry), Some(database_id)) = (
+            self.workspace_registry.as_ref(),
+            self.workspace_database_id.as_deref(),
+        ) {
             let _ = registry.remove(database_id);
         }
         match result {
@@ -7314,17 +7336,70 @@ mod tests {
     }
 
     #[test]
-    fn workspace_close_retains_entry_before_background_open_installs_a_lease() {
+    fn workspace_close_retains_entry_while_background_open_is_running() {
+        let registry = task::TaskRegistry::new();
+        let task_id = registry
+            .create_keyed(&TASK_OWNER, "dsc", "/tmp/test.i64", "opening")
+            .expect("create running DSC task");
+        registry.bind_workspace_open(&task_id, "pending-database");
         let result = Err(ToolError::NoDatabaseOpen);
 
-        assert!(!workspace_close_should_remove_entry(&result));
+        assert!(!workspace_close_should_remove_entry(
+            &result,
+            &registry,
+            Some("pending-database")
+        ));
+    }
+
+    #[test]
+    fn workspace_close_removes_terminal_lease_less_entry() {
+        let registry = task::TaskRegistry::new();
+        let task_id = registry
+            .create_keyed(&TASK_OWNER, "dsc", "/tmp/test.i64", "opening")
+            .expect("create running DSC task");
+        registry.bind_workspace_open(&task_id, "terminal-database");
+        assert!(registry.finish_cancelled(&task_id, "cancelled"));
+        let result = Err(ToolError::NoDatabaseOpen);
+
+        assert!(workspace_close_should_remove_entry(
+            &result,
+            &registry,
+            Some("terminal-database")
+        ));
     }
 
     #[test]
     fn workspace_close_removes_entry_after_teardown_consumes_its_lease() {
+        let registry = task::TaskRegistry::new();
         let result = Err(ToolError::DebuggerTeardown("incomplete".to_string()));
 
-        assert!(workspace_close_should_remove_entry(&result));
+        assert!(workspace_close_should_remove_entry(
+            &result,
+            &registry,
+            Some("debug-database")
+        ));
+    }
+
+    #[test]
+    fn open_path_validation_accepts_unpacked_database_sibling() {
+        let dir = std::env::temp_dir().join(format!(
+            "ida-mcp-unpacked-open-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create unpacked database fixture directory");
+        let packed = dir.join("sample.i64");
+        let unpacked = dir.join("sample.id0");
+        std::fs::write(&unpacked, b"unpacked database").expect("write unpacked database fixture");
+
+        assert!(!IdaMcpServer::validate_path(&packed.display().to_string()));
+        assert!(IdaMcpServer::validate_open_path(
+            &packed.display().to_string()
+        ));
+        assert!(!IdaMcpServer::validate_open_path(
+            &dir.join("missing.bin").display().to_string()
+        ));
+
+        std::fs::remove_dir_all(dir).expect("remove unpacked database fixture directory");
     }
 
     fn tool_result_text(result: CallToolResult) -> String {

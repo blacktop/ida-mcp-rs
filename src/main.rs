@@ -132,14 +132,14 @@ struct ToolFilterArgs {
 }
 
 impl ToolFilterArgs {
-    fn build(&self, debugger_enabled: bool) -> Result<ToolFilter, String> {
+    fn build(&self, debugger_enabled: bool, workspace_enabled: bool) -> Result<ToolFilter, String> {
         ToolFilter::from_inputs(
             &self.toolsets,
             &self.tools,
             &self.exclude_tools,
             self.read_only,
         )
-        .and_then(|filter| filter.with_debugger_enabled(debugger_enabled))
+        .and_then(|filter| filter.with_capabilities(debugger_enabled, workspace_enabled))
         .map_err(|e| e.to_string())
     }
 }
@@ -301,16 +301,17 @@ fn main() -> anyhow::Result<()> {
     // tools, so don't reject probe runs because a bad IDA_MCP_TOOLSETS is
     // sitting in the inherited env from a sibling mcpServers.json config.
     let debugger_enabled = cli.debugger.enable_debugger;
+    let workspace = cli.workspace.clone();
+    let workspace_enabled = workspace.workspace;
     let build_filter = || {
         cli.filter
-            .build(debugger_enabled)
+            .build(debugger_enabled, workspace_enabled)
             .map(Arc::new)
             .map_err(|e| anyhow::anyhow!("invalid tool filter: {e}"))
     };
     let allow_lumina = cli.ida_network.allow_lumina;
     let mut worker_args = cli.ida_network.worker_args();
     worker_args.extend(cli.debugger.worker_args());
-    let workspace = cli.workspace.clone();
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve if workspace.workspace => {
             run_server_workspace(build_filter()?, worker_args, workspace)

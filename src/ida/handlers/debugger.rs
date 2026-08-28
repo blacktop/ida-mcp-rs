@@ -152,6 +152,16 @@ impl DebuggerRuntime {
         self.stop_helper();
     }
 
+    fn retain_session_after_start_error(
+        &mut self,
+        session: DebugSessionKind,
+        process_state: DebuggerProcessState,
+    ) {
+        if !matches!(process_state, DebuggerProcessState::NoProcess) {
+            self.session = Some(session);
+        }
+    }
+
     fn ensure_backend(&mut self, database: &IDB) -> Result<&'static str, ToolError> {
         let backend = debugger_backend(database)?;
         #[cfg(target_os = "macos")]
@@ -379,19 +389,21 @@ pub fn launch(
             runtime.session = Some(DebugSessionKind::Launched);
             Ok(session_result(database, backend, "ready", event_code, None))
         }
-        Err(error)
-            if cfg!(target_os = "macos") && macos_authorization_failure(&error.to_string()) =>
-        {
-            Ok(json!({
-            "status": "user_action_required",
-            "platform": "macos",
-            "backend": backend,
-            "process_state": process_state_name(database.debugger_process_state()),
-            "message": "macOS denied or cancelled task control. Complete IDA's Take Control authorization for this login, then retry. ida-mcp will not request root, disable SIP, change authorizationdb, or re-sign binaries.",
-            "error": error.to_string(),
-            }))
+        Err(error) => {
+            let process_state = database.debugger_process_state();
+            runtime.retain_session_after_start_error(DebugSessionKind::Launched, process_state);
+            if cfg!(target_os = "macos") && macos_authorization_failure(&error.to_string()) {
+                return Ok(json!({
+                    "status": "user_action_required",
+                    "platform": "macos",
+                    "backend": backend,
+                    "process_state": process_state_name(process_state),
+                    "message": "macOS denied or cancelled task control. Complete IDA's Take Control authorization for this login, then retry. ida-mcp will not request root, disable SIP, change authorizationdb, or re-sign binaries.",
+                    "error": error.to_string(),
+                }));
+            }
+            Err(debugger_error(error))
         }
-        Err(error) => Err(debugger_error(error)),
     }
 }
 
@@ -409,19 +421,21 @@ pub fn attach(
             runtime.session = Some(DebugSessionKind::Attached);
             Ok(session_result(database, backend, "ready", event_code, None))
         }
-        Err(error)
-            if cfg!(target_os = "macos") && macos_authorization_failure(&error.to_string()) =>
-        {
-            Ok(json!({
-                "status": "user_action_required",
-                "platform": "macos",
-                "backend": backend,
-                "process_state": process_state_name(database.debugger_process_state()),
-                "message": "macOS denied task attachment. Complete IDA's Take Control authorization for this login, then retry.",
-                "error": error.to_string(),
-            }))
+        Err(error) => {
+            let process_state = database.debugger_process_state();
+            runtime.retain_session_after_start_error(DebugSessionKind::Attached, process_state);
+            if cfg!(target_os = "macos") && macos_authorization_failure(&error.to_string()) {
+                return Ok(json!({
+                    "status": "user_action_required",
+                    "platform": "macos",
+                    "backend": backend,
+                    "process_state": process_state_name(process_state),
+                    "message": "macOS denied task attachment. Complete IDA's Take Control authorization for this login, then retry.",
+                    "error": error.to_string(),
+                }));
+            }
+            Err(debugger_error(error))
         }
-        Err(error) => Err(debugger_error(error)),
     }
 }
 
@@ -606,8 +620,8 @@ mod tests {
     use idalib::meta::FileType;
 
     use crate::ida::handlers::debugger::{
-        debugger_backend_for_target, macos_authorization_failure, DebuggerRuntime,
-        TargetArchitecture,
+        debugger_backend_for_target, macos_authorization_failure, DebugSessionKind,
+        DebuggerRuntime, TargetArchitecture,
     };
     use crate::ida::types::DebugStopAction;
 
@@ -632,6 +646,33 @@ mod tests {
             .session_kind()
             .expect_err("a fresh runtime must not claim a debug session");
         assert!(error.to_string().contains("no active debugger session"));
+    }
+
+    #[test]
+    fn active_process_retains_ownership_after_initial_wait_error() {
+        let mut launched = DebuggerRuntime::default();
+        launched.retain_session_after_start_error(
+            DebugSessionKind::Launched,
+            idalib::debugger::DebuggerProcessState::Running,
+        );
+        assert_eq!(launched.session, Some(DebugSessionKind::Launched));
+
+        let mut attached = DebuggerRuntime::default();
+        attached.retain_session_after_start_error(
+            DebugSessionKind::Attached,
+            idalib::debugger::DebuggerProcessState::Suspended,
+        );
+        assert_eq!(attached.session, Some(DebugSessionKind::Attached));
+    }
+
+    #[test]
+    fn no_process_does_not_claim_ownership_after_start_error() {
+        let mut runtime = DebuggerRuntime::default();
+        runtime.retain_session_after_start_error(
+            DebugSessionKind::Launched,
+            idalib::debugger::DebuggerProcessState::NoProcess,
+        );
+        assert_eq!(runtime.session, None);
     }
 
     #[test]
