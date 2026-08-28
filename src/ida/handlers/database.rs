@@ -1,4 +1,23 @@
 //! Database open/close handlers.
+//!
+//! # Provenance closure
+//!
+//! Every path that reuses (or overwrites) an existing on-disk artifact must
+//! verify content identity or carry a documented exemption. A new reuse path
+//! extends this table — with its verification or its exemption — before it
+//! ships; "the file exists" is never sufficient identity on its own.
+//!
+//! | reuse path | identity check |
+//! |---|---|
+//! | raw input → explicit `idb_out` | recorded input SHA-256 vs streamed hash (`existing_raw_idb_action`) |
+//! | raw input → default `<input>.i64` sibling | same hash verification, same code path |
+//! | `rebuild=true` replacement | hash or recorded-input-path match required; unrelated/corrupt outputs refused |
+//! | idempotent retry of an open database | default identity rules plus `open_database_matches_explicit_output` (recorded input must match) |
+//! | direct `.i64`/`.idb`/`.id0` open | exemption: the database itself is the requested object; there is no separate input to verify against |
+//! | unpacked `.id0` fallback for a missing packed path | same exemption as direct opens (`open_existing_idb`) |
+//! | DSC managed temp cache | cache filename keyed by DSC content identity (`dsc_content_identity` in `server::mod`) |
+//! | DSC sibling `.i64` next to the cache | exemption: user-managed artifact beside their own file; delete it to force a reload (documented in `open_dsc` reuse-order comment) |
+//! | `debug_open_module` output | opened through `open_idb` with explicit `idb_out`, so the raw-input hash verification above applies |
 
 use crate::error::ToolError;
 use crate::expand_path;
@@ -238,6 +257,26 @@ fn recorded_input_path_matches(input: &Path, recorded: &str) -> bool {
     !recorded.is_empty() && paths_refer_to_same_file(input, &expand_path(recorded))
 }
 
+/// An open database also matches a raw-input retry that named it through
+/// `idb_out`, provided the database records that same raw input. Without
+/// this, retrying an identical `open_idb` after a lost response would return
+/// `DatabaseAlreadyOpen` instead of the established idempotent info reply.
+fn open_database_matches_explicit_output(
+    current_path: &Path,
+    requested_input: &Path,
+    requested_output: Option<&Path>,
+    recorded_input: &str,
+) -> bool {
+    let Some(requested_output) = requested_output else {
+        return false;
+    };
+    if has_ida_database_extension(requested_input) {
+        return false;
+    }
+    (current_path == requested_output || paths_refer_to_same_file(current_path, requested_output))
+        && recorded_input_path_matches(requested_input, recorded_input)
+}
+
 fn validate_raw_idb_output(input: &Path, output: &Path) -> Result<(), ToolError> {
     let valid_extension = output
         .extension()
@@ -429,7 +468,15 @@ pub fn handle_open(
     // Check if a database is already open
     if let Some(db) = idb.as_ref() {
         let current_path = db.path();
-        if database_paths_match(current_path, &expanded) {
+        let requested_output = idb_out.map(expand_path);
+        if database_paths_match(current_path, &expanded)
+            || open_database_matches_explicit_output(
+                current_path,
+                &expanded,
+                requested_output.as_deref(),
+                &db.meta().input_file_path(),
+            )
+        {
             // Same database - return its info instead of reopening
             info!(path = %expanded.display(), "Database already open, returning existing info");
             return Ok(build_db_info(db, &current_path.display().to_string(), None));
@@ -906,8 +953,8 @@ mod tests {
         base_input_path_for_database, database_paths_match, existing_idb_for_raw_binary,
         existing_idb_for_raw_open, existing_raw_idb_action, has_ida_database_extension,
         idb_path_for_raw_binary, init_database_args, non_empty_trimmed,
-        recorded_input_path_matches, sha256_file, sha256_reader, validate_raw_idb_output,
-        ExistingRawIdbAction,
+        open_database_matches_explicit_output, recorded_input_path_matches, sha256_file,
+        sha256_reader, validate_raw_idb_output, ExistingRawIdbAction,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -1164,6 +1211,52 @@ mod tests {
 
         assert!(recorded_input_path_matches(&spaced, &recorded));
         assert!(!recorded_input_path_matches(&trimmed, &recorded));
+
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn explicit_output_retry_matches_only_same_input_and_output() {
+        let dir = temp_dir("explicit-output-retry");
+        fs::create_dir(&dir).expect("create temp dir");
+        let raw = dir.join("firmware.bin");
+        fs::write(&raw, b"raw").expect("write raw input");
+        let output = dir.join("custom.i64");
+        let recorded = format!("{}\0", raw.display());
+
+        assert!(open_database_matches_explicit_output(
+            &output,
+            &raw,
+            Some(&output),
+            &recorded
+        ));
+        // No idb_out on the retry: only the default identity rules apply.
+        assert!(!open_database_matches_explicit_output(
+            &output, &raw, None, &recorded
+        ));
+        // A direct database open never matches through idb_out.
+        assert!(!open_database_matches_explicit_output(
+            &output,
+            &dir.join("firmware.i64"),
+            Some(&output),
+            &recorded
+        ));
+        // Same output requested for a different raw input stays a conflict.
+        let other = dir.join("other.bin");
+        fs::write(&other, b"other").expect("write other input");
+        assert!(!open_database_matches_explicit_output(
+            &output,
+            &other,
+            Some(&output),
+            &recorded
+        ));
+        // A different output path is a different database.
+        assert!(!open_database_matches_explicit_output(
+            &output,
+            &raw,
+            Some(&dir.join("elsewhere.i64")),
+            &recorded
+        ));
 
         fs::remove_dir_all(dir).expect("remove temp dir");
     }

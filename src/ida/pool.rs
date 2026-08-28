@@ -822,8 +822,55 @@ pub struct WorkspaceDatabase {
     handle: Arc<Mutex<Option<PooledDatabaseLease>>>,
     next_database_generation: AtomicU64,
     runtime: Option<Handle>,
+    /// Lifecycle invariant I1: a debug pin never outlives the worker lease it
+    /// was set for. The pin lives here — beside the lease — so the one method
+    /// that unbinds a lost worker ([`Self::clear_handle_if_worker`]) also
+    /// clears it, keeping the idle reaper from skipping a database whose
+    /// debugger session died with its worker.
+    debug_pinned: AtomicBool,
 }
 
+/// Routes opaque database IDs to pooled worker leases.
+///
+/// # Lifecycle invariants
+///
+/// The workspace registry, the worker pool, and the debugger runtime are
+/// three interacting state machines. Every transition one of them makes must
+/// preserve these invariants; a change that adds a transition (a new
+/// retirement path, pin, or lease state) must say which invariant covers it
+/// or add one — with a test — rather than rely on review to notice the gap.
+///
+/// - **I1 — pin follows lease:** a debug pin never outlives the worker lease
+///   it was set for. Enforced by [`WorkspaceDatabase::clear_handle_if_worker`]
+///   on every terminal worker loss; test
+///   `worker_loss_clears_debug_pin_only_for_the_bound_lease`.
+/// - **I2 — pins block reaping:** an entry with active calls, task pins, or a
+///   debug pin is never idle-reaped. Enforced by the [`workspace_reaper`]
+///   filter; test `workspace_idle_reaper_respects_every_lifetime_guard`.
+/// - **I3 — close removes exactly the closable:** `close_idb` removes an
+///   entry unless a keyed background open for it is still running, so a
+///   pending open is protected while a terminal lease-less entry stays
+///   removable. Enforced by `workspace_close_should_remove_entry` +
+///   `TaskRegistry::has_running_workspace_open`; test
+///   `workspace_close_retains_entry_while_background_open_is_running`.
+/// - **I4 — retained session pins:** every debugger start that leaves the
+///   child owning a live process pins the entry, including error and
+///   `user_action_required` results. Enforced by `finish_debugger_start` over
+///   the explicit `session_retained` /
+///   [`crate::error::ToolError::DebuggerStartRetained`] signals.
+/// - **I5 — stop unpins:** a debug stop that ends ownership (including the
+///   already-exited `NoProcess` escape) clears the session and the pin.
+/// - **I6 — retirement is cancellation-safe:** worker retirement completes
+///   even if the awaiting future is dropped. Enforced by
+///   [`WorkerRetireGuard`].
+/// - **I7 — retirement is operation-scoped:** only hard transport failures
+///   retire a worker, plus debugger-op timeouts, which permanently wedge the
+///   child's serial loop. Enforced by `child_tool_error_retires_worker`; test
+///   `child_tool_error_retire_decision_is_operation_specific`.
+/// - **I8 — generations gate stale calls:** a call bound to a database
+///   generation can never reach a reopened database. Enforced by
+///   [`WorkspaceDatabase::required_handle_for_generation`], atomically with
+///   handle acquisition.
 #[derive(Clone)]
 pub struct WorkspaceRegistry {
     inner: Arc<WorkspaceRegistryInner>,
@@ -840,7 +887,6 @@ struct WorkspaceRegistryEntry {
     last_used: StdMutex<Instant>,
     active_calls: AtomicUsize,
     pins: AtomicUsize,
-    debug_pinned: AtomicBool,
     legacy: bool,
 }
 
@@ -900,7 +946,6 @@ impl WorkspaceRegistry {
             last_used: StdMutex::new(Instant::now()),
             active_calls: AtomicUsize::new(0),
             pins: AtomicUsize::new(0),
-            debug_pinned: AtomicBool::new(false),
             legacy,
         })
     }
@@ -975,7 +1020,7 @@ impl WorkspaceRegistry {
         // Touch before clearing the pin while the registry remains locked, so
         // the reaper cannot observe an unpinned entry with stale idle time.
         entry.touch();
-        entry.debug_pinned.store(pinned, Ordering::Relaxed);
+        entry.database.set_debug_pinned(pinned);
         true
     }
 
@@ -1035,7 +1080,7 @@ async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duratio
                     !entry.legacy
                         && entry.active_calls.load(Ordering::Relaxed) == 0
                         && entry.pins.load(Ordering::Relaxed) == 0
-                        && !entry.debug_pinned.load(Ordering::Relaxed)
+                        && !entry.database.debug_pinned()
                         && entry.idle_for() >= inner.idle_timeout
                 })
                 .map(|(id, _)| id.clone())
@@ -1130,7 +1175,24 @@ impl WorkspaceDatabase {
             handle: Arc::new(Mutex::new(None)),
             next_database_generation: AtomicU64::new(0),
             runtime: Handle::try_current().ok(),
+            debug_pinned: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_debug_pinned(&self, pinned: bool) {
+        self.debug_pinned.store(pinned, Ordering::Relaxed);
+    }
+
+    pub fn debug_pinned(&self) -> bool {
+        self.debug_pinned.load(Ordering::Relaxed)
+    }
+
+    /// State cleanup for terminal loss of this database's bound worker. A
+    /// debugger session lives inside that child process, so it cannot survive
+    /// the worker; leaving the pin set would block idle reaping forever for a
+    /// database that can no longer serve debugger calls (invariant I1).
+    fn on_worker_lost(&self) {
+        self.debug_pinned.store(false, Ordering::Relaxed);
     }
 
     fn next_database_generation(&self) -> Result<DatabaseGeneration, ToolError> {
@@ -1193,11 +1255,15 @@ impl WorkspaceDatabase {
 
     async fn clear_handle_if_worker(&self, worker_id: usize) {
         let mut guard = self.handle.lock().await;
-        if guard
+        let lost = guard
             .as_ref()
-            .is_some_and(|lease| lease.handle.worker_id == worker_id)
-        {
+            .is_some_and(|lease| lease.handle.worker_id == worker_id);
+        if lost {
             *guard = None;
+        }
+        drop(guard);
+        if lost {
+            self.on_worker_lost();
         }
     }
 
@@ -2785,9 +2851,9 @@ mod tests {
         drop(pin);
         assert_eq!(first_entry.pins.load(Ordering::Relaxed), 0);
         assert!(registry.set_debug_pin(&first_id, true));
-        assert!(first_entry.debug_pinned.load(Ordering::Relaxed));
+        assert!(first_entry.database.debug_pinned());
         assert!(registry.set_debug_pin(&first_id, false));
-        assert!(!first_entry.debug_pinned.load(Ordering::Relaxed));
+        assert!(!first_entry.database.debug_pinned());
         drop(acquired);
         assert_eq!(first_entry.active_calls.load(Ordering::Relaxed), 0);
 
@@ -2848,6 +2914,31 @@ mod tests {
         drop(pin);
         assert!(registry.set_debug_pin(&debug_pinned_id, false));
         drop(legacy);
+        registry.shutdown().await;
+    }
+
+    /// Lifecycle invariant I1: losing the bound worker clears the debug pin,
+    /// while worker loss for a database with no bound lease leaves an
+    /// unrelated pin alone.
+    #[tokio::test]
+    async fn worker_loss_clears_debug_pin_only_for_the_bound_lease() {
+        let registry = WorkspaceRegistry::new(test_pool(2), Duration::from_secs(300));
+        let lease = registry.allocate_database();
+        let database_id = lease.database_id().to_string();
+        let database = lease.database();
+
+        assert!(registry.set_debug_pin(&database_id, true));
+        assert!(database.debug_pinned());
+        database.on_worker_lost();
+        assert!(!database.debug_pinned());
+
+        // No lease is installed, so an arbitrary worker retirement must not
+        // touch this database's pin.
+        assert!(registry.set_debug_pin(&database_id, true));
+        database.clear_handle_if_worker(7).await;
+        assert!(database.debug_pinned());
+
+        drop(lease);
         registry.shutdown().await;
     }
 

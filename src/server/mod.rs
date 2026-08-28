@@ -482,28 +482,87 @@ fn sanitize_temp_component(value: &str) -> String {
     }
 }
 
+/// Content identity of the DSC at `path`, used to key the managed database
+/// cache. Prefers the dyld cache header UUID (bytes 0x58..0x68, valid when
+/// `mappingOffset` places the header past it); any other readable file falls
+/// back to a digest of its leading bytes and length. Never derived from the
+/// path: DSCs are typically opened through a mount point, so a different
+/// firmware mounted at the same path must key a different database, and the
+/// same firmware must reuse its analysis wherever it is mounted.
+fn dsc_content_identity(path: &std::path::Path) -> Result<String, ToolError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let read_error = |error: std::io::Error| {
+        ToolError::InvalidPath(format!(
+            "failed to read DSC content for cache identity ({}): {error}",
+            path.display()
+        ))
+    };
+    let mut file = std::fs::File::open(path).map_err(read_error)?;
+    let mut header = [0u8; 0x68];
+    let mut filled = 0usize;
+    while filled < header.len() {
+        let count = file.read(&mut header[filled..]).map_err(read_error)?;
+        if count == 0 {
+            break;
+        }
+        filled += count;
+    }
+
+    if filled == header.len() && header.starts_with(b"dyld_v1") {
+        let mapping_offset =
+            u32::from_le_bytes([header[0x10], header[0x11], header[0x12], header[0x13]]);
+        let uuid = &header[0x58..0x68];
+        if mapping_offset as usize >= header.len() && uuid.iter().any(|byte| *byte != 0) {
+            let mut identity = String::with_capacity(32);
+            for byte in uuid {
+                identity.push_str(&format!("{byte:02x}"));
+            }
+            return Ok(identity);
+        }
+    }
+
+    // Not a recognizable dyld cache header: digest the leading bytes plus the
+    // file length so distinct contents still key distinct databases.
+    let mut hasher = Sha256::new();
+    hasher.update(&header[..filled]);
+    let mut remaining = 1024 * 1024 - filled;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buffer.len());
+        let count = file.read(&mut buffer[..want]).map_err(read_error)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        remaining -= count;
+    }
+    hasher.update(file.metadata().map_err(read_error)?.len().to_le_bytes());
+    let digest = hasher.finalize();
+    let mut identity = String::with_capacity(32);
+    for byte in &digest[..16] {
+        identity.push_str(&format!("{byte:02x}"));
+    }
+    Ok(identity)
+}
+
 /// Deterministic per-DSC database location for the IDA 9.4 direct open path.
 ///
 /// DSCs commonly sit on read-only mounts, so the generated database cannot
 /// reliably live next to them the way the legacy idat path's sibling `.i64`
-/// does. Deriving the name from the absolute DSC path — never pid or time —
-/// means every `open_dsc` of the same cache resolves to one file: repeat opens
-/// reuse the analyzed database (with any renames/comments) instead of leaking
-/// a fresh multi-GB orphan per call.
-fn direct_dsc_cache_i64_path(dsc_path: &std::path::Path) -> std::path::PathBuf {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let absolute = dsc_path
-        .canonicalize()
-        .unwrap_or_else(|_| dsc_path.to_path_buf());
-    let name = absolute
+/// does. The name is keyed by the cache's content identity — never pid, time,
+/// or mount path — so every `open_dsc` of the same firmware resolves to one
+/// reusable file, and a different firmware at the same mount path can never
+/// silently serve the previous firmware's analysis.
+fn direct_dsc_cache_i64_path(dsc_path: &std::path::Path) -> Result<std::path::PathBuf, ToolError> {
+    let name = dsc_path
         .file_name()
         .and_then(|name| name.to_str())
         .map(sanitize_temp_component)
         .unwrap_or_else(|| "dsc".to_string());
-    let mut hasher = DefaultHasher::new();
-    absolute.hash(&mut hasher);
-    let hash = hasher.finish();
-    std::env::temp_dir().join(format!("ida-mcp-dsc-{name}-{hash:016x}.i64"))
+    let identity = dsc_content_identity(dsc_path)?;
+    Ok(std::env::temp_dir().join(format!("ida-mcp-dsc-{name}-{identity}.i64")))
 }
 
 fn dsc_task_key(output: &std::path::Path) -> String {
@@ -5504,16 +5563,24 @@ impl IdaMcpServer {
         // Reuse order: a sibling .i64 (legacy idat output or user-provided)
         // first, then the 9.4 direct-path cache. Pre-9.4 never considers the
         // cache — those databases were written by a newer IDA and cannot be
-        // opened there.
-        let cache_i64 = direct_dsc_cache_i64_path(dsc_path);
-        let existing_i64 = if crate::ida::handlers::database::ida_database_output_exists(&out_i64) {
-            Some(out_i64.clone())
-        } else if idalib::SDK_VERSION >= (9, 4)
-            && crate::ida::handlers::database::ida_database_output_exists(&cache_i64)
-        {
-            Some(cache_i64.clone())
+        // opened there. Provenance: the sibling is a user-managed artifact
+        // next to their own file (documented exemption — delete it to force a
+        // reload), while the managed temp cache is content-keyed by the DSC's
+        // identity so it can never serve a different firmware's analysis.
+        let cache_i64 = if idalib::SDK_VERSION >= (9, 4) {
+            match direct_dsc_cache_i64_path(dsc_path) {
+                Ok(cache) => Some(cache),
+                Err(error) => return Ok(error.to_tool_result()),
+            }
         } else {
             None
+        };
+        let existing_i64 = if crate::ida::handlers::database::ida_database_output_exists(&out_i64) {
+            Some(out_i64.clone())
+        } else {
+            cache_i64
+                .clone()
+                .filter(|cache| crate::ida::handlers::database::ida_database_output_exists(cache))
         };
         match dsc_open_plan(idalib::SDK_VERSION, existing_i64.is_some()) {
             // Existing .i64 databases are already in IDA's database format.
@@ -5531,7 +5598,14 @@ impl IdaMcpServer {
             // Do not pass the legacy -T file-type selector here. IDA 9.4's
             // direct idalib open path rejects it with "Unknown switch '-T'".
             DscOpenPlan::BackgroundDirectRawDsc => {
-                let idb_out = cache_i64;
+                // dsc_open_plan selects this arm only on SDK >= 9.4, where the
+                // content-keyed cache path was just computed.
+                let Some(idb_out) = cache_i64 else {
+                    return Ok(ToolError::IdaError(
+                        "direct DSC open selected without a cache path".to_string(),
+                    )
+                    .to_tool_result());
+                };
                 let dsc_ctx = DscBackgroundCtx {
                     open: DscBackgroundOpen::DirectRawDsc {
                         open_path: dsc_path.to_path_buf(),
@@ -7274,26 +7348,77 @@ mod tests {
         assert_eq!(dsc_open_plan((10, 0), true), DscOpenPlan::DirectExistingI64);
     }
 
-    /// The direct-path database name must depend only on the DSC's absolute
-    /// path — never pid or time — so repeat opens resolve to one reusable
-    /// file instead of accumulating orphans.
-    #[test]
-    fn direct_dsc_cache_path_is_deterministic_per_dsc() {
-        let dsc = std::path::Path::new("/nonexistent/A/dyld_shared_cache_arm64e");
-        let first = crate::server::direct_dsc_cache_i64_path(dsc);
-        let second = crate::server::direct_dsc_cache_i64_path(dsc);
-        let other = crate::server::direct_dsc_cache_i64_path(std::path::Path::new(
-            "/nonexistent/B/dyld_shared_cache_arm64e",
-        ));
+    fn write_dsc_fixture(dir: &std::path::Path, name: &str, uuid: [u8; 16], tail: &[u8]) {
+        let mut contents = vec![0u8; 0x68];
+        contents[..7].copy_from_slice(b"dyld_v1");
+        contents[0x10..0x14].copy_from_slice(&0x200u32.to_le_bytes());
+        contents[0x58..0x68].copy_from_slice(&uuid);
+        contents.extend_from_slice(tail);
+        std::fs::write(dir.join(name), contents).expect("write DSC fixture");
+    }
 
-        assert_eq!(first, second);
-        assert_ne!(first, other, "different DSC paths must not collide");
-        let name = first
+    /// The direct-path database name must depend on the DSC's content
+    /// identity — never pid, time, or mount path — so repeat opens of the
+    /// same firmware resolve to one reusable file, a remounted different
+    /// firmware never inherits stale analysis, and the same firmware reuses
+    /// its database from any mount path.
+    #[test]
+    fn direct_dsc_cache_path_is_keyed_by_content_identity() {
+        let dir = std::env::temp_dir().join(format!("ida-mcp-dsc-key-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let mount_a = dir.join("A");
+        let mount_b = dir.join("B");
+        std::fs::create_dir_all(&mount_a).expect("create mount A");
+        std::fs::create_dir_all(&mount_b).expect("create mount B");
+
+        // Same firmware (same UUID) at two mount paths: one cache database.
+        write_dsc_fixture(&mount_a, "dyld_shared_cache_arm64e", [0xAA; 16], b"first");
+        write_dsc_fixture(&mount_b, "dyld_shared_cache_arm64e", [0xAA; 16], b"second");
+        let at_a =
+            crate::server::direct_dsc_cache_i64_path(&mount_a.join("dyld_shared_cache_arm64e"))
+                .expect("cache path for mount A");
+        let at_b =
+            crate::server::direct_dsc_cache_i64_path(&mount_b.join("dyld_shared_cache_arm64e"))
+                .expect("cache path for mount B");
+        assert_eq!(at_a, at_b, "same firmware must share one cache database");
+
+        // Different firmware mounted at the same path: a different database.
+        write_dsc_fixture(&mount_a, "dyld_shared_cache_arm64e", [0xBB; 16], b"first");
+        let replaced =
+            crate::server::direct_dsc_cache_i64_path(&mount_a.join("dyld_shared_cache_arm64e"))
+                .expect("cache path for replaced firmware");
+        assert_ne!(
+            at_a, replaced,
+            "different firmware at the same path must not collide"
+        );
+
+        let name = at_a
             .file_name()
             .and_then(|name| name.to_str())
             .expect("cache path should have a printable file name");
         assert!(name.starts_with("ida-mcp-dsc-dyld_shared_cache_arm64e-"));
         assert!(name.ends_with(".i64"));
+
+        // Files without a dyld header still key by content, not path.
+        std::fs::write(mount_a.join("blob.bin"), b"blob-one").expect("write blob");
+        std::fs::write(mount_b.join("blob.bin"), b"blob-one").expect("write blob");
+        let blob_a = crate::server::direct_dsc_cache_i64_path(&mount_a.join("blob.bin"))
+            .expect("cache path for blob A");
+        let blob_b = crate::server::direct_dsc_cache_i64_path(&mount_b.join("blob.bin"))
+            .expect("cache path for blob B");
+        assert_eq!(blob_a, blob_b);
+        std::fs::write(mount_b.join("blob.bin"), b"blob-two").expect("rewrite blob");
+        let blob_changed = crate::server::direct_dsc_cache_i64_path(&mount_b.join("blob.bin"))
+            .expect("cache path for changed blob");
+        assert_ne!(blob_a, blob_changed);
+
+        // An unreadable DSC is an error, never a silently path-keyed cache.
+        assert!(
+            crate::server::direct_dsc_cache_i64_path(&dir.join("missing.dsc")).is_err(),
+            "unreadable DSC must fail identity derivation"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
     #[test]
