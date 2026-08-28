@@ -1222,8 +1222,10 @@ impl WorkspaceDatabase {
             Ok(result) => {
                 if let Some(err) = remote::result_error(&result, tool) {
                     if child_tool_error_retires_worker(tool, &err) {
+                        let mut retire_guard = WorkerRetireGuard::call(&handle, tool);
                         self.clear_handle_if_worker(handle.worker_id).await;
                         self.pool.mark_dead(&handle.slot).await;
+                        retire_guard.disarm();
                     }
                     return Err(err);
                 }
