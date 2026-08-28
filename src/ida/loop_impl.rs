@@ -788,12 +788,6 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 );
                 let _ = resp.send(result);
             }
-            IdaRequest::DebugProcessState { resp } => {
-                let result = crate::crash_guard::crash_guarded("debug_process_state", || {
-                    debugger::process_state(&idb)
-                });
-                let _ = resp.send(result);
-            }
             IdaRequest::DebugStop {
                 action,
                 timeout_seconds,
@@ -2103,7 +2097,6 @@ fn reject_with_error(req: IdaRequest, err: ToolError) {
         IdaRequest::DebugLaunch { resp, .. } => reject!(resp, err),
         IdaRequest::DebugAttach { resp, .. } => reject!(resp, err),
         IdaRequest::DebugModules { resp } => reject!(resp, err),
-        IdaRequest::DebugProcessState { resp } => reject!(resp, err),
         IdaRequest::DebugStop { resp, .. } => reject!(resp, err),
         IdaRequest::AnalysisStatus { resp, .. } => reject!(resp, err),
         IdaRequest::DscLoadImage { resp, .. } => reject!(resp, err),

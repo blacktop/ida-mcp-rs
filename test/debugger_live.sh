@@ -319,11 +319,11 @@ case "$launch_status" in
     debuggee_pid=""
     echo "   debugger launch, module-to-IDB open, terminal stop, and external-exit stop/close recovery passed"
 
-    # Debug-pin reaping uses a second server with a 2-second idle TTL. First,
-    # kill only the debuggee and make no further calls on its database: the
-    # worker must affirmatively observe no_process, clear the stale pin, and
-    # let the normal idle reaper invalidate the handle.
-    cp "$FIXTURE_IDB" "$tmpdir/debugger2.i64"
+    # Debug-pin reaping uses a second server with a 2-second idle TTL. It
+    # covers terminal worker loss only. A target killed outside ida-mcp is a
+    # documented limitation, not an oracle: IDA's process state is a cached
+    # getter, so nothing can observe that exit until a call drains the
+    # pending debug event.
     cp "$FIXTURE" "$tmpdir/external-debuggee-2"
     chmod 0755 "$tmpdir/external-debuggee-2"
     external2_path="$(cd "$tmpdir" && pwd -P)/external-debuggee-2"
@@ -362,66 +362,6 @@ case "$launch_status" in
     send2 '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"debugger-reap-test","version":"0.1"},"capabilities":{}}}'
     wait_response2 1 30 >/dev/null
     send2 '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
-    open2_request="$(jq -cn --arg path "$tmpdir/debugger2.i64" \
-      '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$path}}}')"
-    send2 "$open2_request"
-    open2_response="$(wait_response2 2 120)"
-    assert_ok "open reaper-test database" "$open2_response"
-    reap_id="$(result_text <<<"$open2_response" | jq -r '.database_id // empty')"
-    [[ -n "$reap_id" ]] || { echo "reaper-test open returned no database_id" >&2; exit 1; }
-
-    launch2_request="$(jq -cn --arg id "$reap_id" --arg path "$external2_path" \
-      '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"debug_launch",arguments:{database_id:$id,path:$path,timeout_secs:10}}}')"
-    send2 "$launch2_request"
-    launch2_response="$(wait_response2 3 30)"
-    assert_ok "launch target for stale-pin reaping" "$launch2_response"
-    jq -e '.status == "ready"' >/dev/null \
-      <<<"$(result_text <<<"$launch2_response")" || {
-      echo "FAIL: reaper-test launch did not reach ready" >&2
-      result_text <<<"$launch2_response" >&2
-      exit 1
-    }
-    for _ in $(seq 1 20); do
-      debuggee2_pid="$(ps -axo pid=,command= 2>/dev/null \
-        | awk -v target="$external2_path" '$2 == target { print $1; exit }' || true)"
-      [[ -n "$debuggee2_pid" ]] && break
-      sleep 0.1
-    done
-    [[ -n "$debuggee2_pid" ]] || {
-      echo "could not identify the stale-pin debuggee" >&2
-      exit 1
-    }
-    kill -KILL "$debuggee2_pid"
-    debuggee2_pid=""
-
-    exited_reap_seen=0
-    for _ in $(seq 1 200); do
-      if grep -q "debugger target exited; clearing stale workspace pin" \
-          "$stderr2_log" 2>/dev/null \
-        && grep -q "reaping idle workspace database" "$stderr2_log" 2>/dev/null; then
-        exited_reap_seen=1
-        break
-      fi
-      sleep 0.1
-    done
-    [[ "$exited_reap_seen" == "1" ]] || {
-      echo "FAIL: reaper did not clear the debug pin after target exit" >&2
-      tail -40 "$stderr2_log" >&2
-      exit 1
-    }
-
-    exited_status_request="$(jq -cn --arg id "$reap_id" \
-      '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"debug_modules",arguments:{database_id:$id}}}')"
-    send2 "$exited_status_request"
-    exited_status_response="$(wait_response2 4 15)"
-    jq -e '
-      .error.code == -32602 and (.error.message | contains("unknown or expired"))
-    ' >/dev/null <<<"$exited_status_response" || {
-      echo "FAIL: target-exit-reaped database id was not invalidated" >&2
-      jq . <<<"$exited_status_response" >&2
-      exit 1
-    }
-    echo "   external target exit cleared the stale debug pin and reaped the database"
 
     # Open a fresh lease on the same server, then kill the pooled worker
     # itself (not the debuggee) with no further calls on its database. This

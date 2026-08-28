@@ -295,6 +295,13 @@ In workspace mode, a successfully launched or attached debug session pins its
 database against the idle TTL until `debug_stop` succeeds or `close_idb`
 releases the database.
 
+Known limitation — a target that exits on its own keeps its pin. IDA's
+process state is a cached value that only refreshes when a call drains the
+pending debug event, so a debuggee killed outside ida-mcp is not observable in
+the background. Its database stays pinned (and exempt from the idle TTL) until
+`debug_stop`, `close_idb`, or worker loss clears it. Both `debug_stop` and
+`close_idb` handle an already-exited target correctly.
+
 Known limitation — worker loss does not stop the debuggee. If the worker
 process hosting a live debug session is killed, crashes, or ida-mcp retires it
 after a wedged debugger call, that process may never run its own teardown, so

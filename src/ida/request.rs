@@ -52,9 +52,6 @@ pub enum IdaRequest {
     DebugModules {
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
-    DebugProcessState {
-        resp: oneshot::Sender<Result<String, ToolError>>,
-    },
     DebugStop {
         action: DebugStopAction,
         timeout_seconds: u32,

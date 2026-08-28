@@ -2886,12 +2886,10 @@ impl IdaMcpServer {
     #[instrument(skip_all)]
     async fn debug_status(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: debug_status");
-        let mut status = crate::ida::handlers::debugger::runtime_status();
-        if matches!(self.mode, ServerMode::Worker)
-            && let Some(Ok(process_state)) = self.worker.local_debug_process_state().await
-        {
-            status["process_state"] = json!(process_state);
-        }
+        // Backend/authorization readiness only. Live process state is not
+        // reported here: it would have to be a database-scoped query
+        // dispatched to the selected worker, never inferred by the parent.
+        let status = crate::ida::handlers::debugger::runtime_status();
         Ok(CallToolResult::success(vec![Content::text(pretty_json(
             &status,
         ))]))

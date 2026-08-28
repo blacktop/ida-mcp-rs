@@ -17,8 +17,6 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Debugger module enumeration has no SDK-level timeout, so bound the caller
 /// and pooled-child watchdog explicitly instead of waiting forever.
 pub(crate) const DEBUG_MODULES_TIMEOUT_SECS: u64 = 120;
-/// Process-state probes are single SDK reads used by the workspace reaper.
-const DEBUG_PROCESS_STATE_TIMEOUT_SECS: u64 = 2;
 /// Maximum allowed timeout (10 minutes)
 pub const MAX_TIMEOUT_SECS: u64 = 600;
 /// Maximum time to retry enqueuing close requests when the queue is full.
@@ -374,12 +372,6 @@ impl IdaWorker {
         let (tx, rx) = oneshot::channel();
         self.try_send(IdaRequest::DebugModules { resp: tx })?;
         Self::recv_with_timeout(rx, Some(DEBUG_MODULES_TIMEOUT_SECS)).await
-    }
-
-    async fn debug_process_state(&self) -> Result<String, ToolError> {
-        let (tx, rx) = oneshot::channel();
-        self.try_send(IdaRequest::DebugProcessState { resp: tx })?;
-        Self::recv_with_timeout(rx, Some(DEBUG_PROCESS_STATE_TIMEOUT_SECS)).await
     }
 
     pub async fn debug_stop(
@@ -1660,13 +1652,6 @@ impl WorkerBackend {
     /// worker. Pooled parents expose runtime readiness without recursively
     /// routing `debug_status`; child workers use this to publish the
     /// affirmative IDA state consumed by the workspace reaper.
-    pub(crate) async fn local_debug_process_state(&self) -> Option<Result<String, ToolError>> {
-        match self {
-            Self::Local(worker) => Some(worker.debug_process_state().await),
-            Self::Pooled(_) => None,
-        }
-    }
-
     pub async fn debug_stop(
         &self,
         action: DebugStopAction,
