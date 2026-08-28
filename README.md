@@ -296,13 +296,16 @@ database against the idle TTL until `debug_stop` succeeds or `close_idb`
 releases the database.
 
 Known limitation — worker loss does not stop the debuggee. If the worker
-process hosting a live debug session dies out of band (it is killed, or ida-mcp
-retires it after a wedged debugger call), that process never runs its own
-teardown, so IDA's debug-server helper is reparented instead of terminated and
-the target may keep running. ida-mcp reports every such loss as a
-`Debugger session lost` error that says the target may still be alive, clears
-the handle's debug pin so the database can be reaped, and never claims the
-debuggee ended. Cleaning up a stray helper or debuggee is currently manual.
+process hosting a live debug session is killed, crashes, or ida-mcp retires it
+after a wedged debugger call, that process may never run its own teardown, so
+IDA's debug-server helper can be reparented instead of terminated and the
+target may keep running. When an in-flight tool call detects or causes that
+retirement, ida-mcp returns a `Debugger session lost` error saying the target
+may still be alive, clears the handle's debug pin, and never claims the
+debuggee ended. A leased worker can also die while no request is in flight to
+carry an error; `list_databases` then reports `no_worker`, and an enabled
+workspace TTL eventually expires the handle. Cleaning up a stray helper or
+debuggee is currently manual.
 
 The first enabled platform is macOS on Apple Silicon. ida-mcp connects through
 IDA's signed loopback `mac_server_arm` helper. macOS may require IDA's supported

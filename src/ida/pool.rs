@@ -942,11 +942,8 @@ struct DispatchedCall {
 
 /// Worker binding of one workspace database, as seen by `list_databases`.
 enum LeaseSnapshot {
-    /// A worker is bound; `path` is absent only when its slot was busy.
-    Bound {
-        path: Option<PathBuf>,
-        debug_pinned: bool,
-    },
+    /// A worker is bound to a completed database open.
+    Bound { path: PathBuf, debug_pinned: bool },
     /// No worker is bound: the database is allocated but not yet open, or
     /// its worker was lost.
     NoWorker,
@@ -1127,7 +1124,7 @@ impl WorkspaceRegistry {
             let active_calls = entry.active_calls.load(Ordering::Relaxed);
             let (path, state, debug_pinned) = match entry.database.lease_snapshot() {
                 LeaseSnapshot::Bound { path, debug_pinned } => (
-                    path.map(|path| path.display().to_string()),
+                    Some(path.display().to_string()),
                     if active_calls > 0 { "busy" } else { "open" },
                     debug_pinned,
                 ),
@@ -1375,6 +1372,13 @@ impl WorkspaceDatabase {
         let Some(lease) = guard.as_ref() else {
             return LeaseSnapshot::NoWorker;
         };
+        // `call_lock` covers the complete remote operation, including
+        // background opens whose registry-level active-call guard has already
+        // been released. Holding it also prevents a call from starting while
+        // the child state below is being classified.
+        let Ok(_call_guard) = lease.handle.slot.call_lock.try_lock() else {
+            return LeaseSnapshot::Busy;
+        };
         // Contention is reported as busy rather than as a bound worker with
         // an unknown path: `open` with `path: null` would misdescribe a
         // database that is simply mid-call.
@@ -1391,8 +1395,15 @@ impl WorkspaceDatabase {
         {
             return LeaseSnapshot::NoWorker;
         }
+        // The worker lease is installed before open_idb starts, while the
+        // path is published only after that call succeeds. The narrow
+        // post-call handoff must remain busy rather than claiming an open
+        // database without an addressable path.
+        let Some(path) = child.idb_path.clone() else {
+            return LeaseSnapshot::Busy;
+        };
         LeaseSnapshot::Bound {
-            path: child.idb_path.clone(),
+            path,
             debug_pinned: lease.debug_pinned,
         }
     }
