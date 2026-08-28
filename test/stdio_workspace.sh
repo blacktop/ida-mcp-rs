@@ -228,6 +228,23 @@ send "$runtime_with_id"
 jq -e '.error.code == -32602 and (.error.message | contains("runtime-scoped"))' \
   >/dev/null <<<"$(wait_response 9 30)"
 
+# Handle discovery: both open databases must be re-addressable from
+# list_databases alone, which is how an agent recovers after a lost response.
+send '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"list_databases","arguments":{}}}'
+list_databases_response="$(wait_response 20 30)"
+assert_ok "list workspace databases" "$list_databases_response"
+list_databases_text="$(result_text <<<"$list_databases_response")"
+jq -e --arg first "$first_id" --arg second "$second_id" '
+  .count >= 2
+  and ([.databases[].database_id] | index($first) != null and index($second) != null)
+  and (.databases[] | select(.database_id == $first) | .state == "open" and (.path | length) > 0)
+' >/dev/null <<<"$list_databases_text" || {
+  echo "FAIL: list_databases did not report both open handles with paths" >&2
+  printf '%s\n' "$list_databases_text" >&2
+  exit 1
+}
+echo "   list_databases re-addressed both open handles"
+
 close_first="$(jq -cn --arg id "$first_id" \
   '{jsonrpc:"2.0",id:10,method:"tools/call",params:{name:"close_idb",arguments:{database_id:$id}}}')"
 send "$close_first"
@@ -238,6 +255,17 @@ stale_first="$(jq -cn --arg id "$first_id" \
 send "$stale_first"
 jq -e '.error.code == -32602 and (.error.message | contains("unknown or expired"))' \
   >/dev/null <<<"$(wait_response 11 30)"
+
+# A closed handle disappears from discovery too.
+send '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"list_databases","arguments":{}}}'
+after_close_text="$(result_text <<<"$(wait_response 21 30)")"
+jq -e --arg first "$first_id" --arg second "$second_id" '
+  ([.databases[].database_id] | index($first) == null and index($second) != null)
+' >/dev/null <<<"$after_close_text" || {
+  echo "FAIL: list_databases still reports the closed handle" >&2
+  printf '%s\n' "$after_close_text" >&2
+  exit 1
+}
 
 list_second="$(jq -cn --arg id "$second_id" \
   '{jsonrpc:"2.0",id:12,method:"tools/call",params:{name:"list_functions",arguments:{database_id:$id,limit:1}}}')"

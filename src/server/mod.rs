@@ -5824,6 +5824,41 @@ impl IdaMcpServer {
     }
 
     #[tool(
+        description = "List every workspace database_id this server routes, with its path and \
+        lifecycle state. Use it to recover a handle after a lost response or a stateless HTTP \
+        reconnect. Read-only; workspace mode only."
+    )]
+    #[instrument(skip_all)]
+    async fn list_databases(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: list_databases");
+        let Some(registry) = self.workspace_registry.as_ref() else {
+            return Ok(ToolError::InvalidParams(
+                "list_databases requires workspace mode; start the server with --workspace"
+                    .to_string(),
+            )
+            .to_tool_result());
+        };
+        let databases: Vec<Value> = registry
+            .list_databases()
+            .into_iter()
+            .map(|summary| {
+                json!({
+                    "database_id": summary.database_id,
+                    "path": summary.path,
+                    "state": summary.state,
+                    "idle_seconds": summary.idle_seconds,
+                    "active_calls": summary.active_calls,
+                    "pinned": summary.pinned,
+                    "debug_pinned": summary.debug_pinned,
+                })
+            })
+            .collect();
+        Ok(CallToolResult::success(vec![Content::text(pretty_json(
+            &json!({ "count": databases.len(), "databases": databases }),
+        ))]))
+    }
+
+    #[tool(
         description = "Check the status of a background task (e.g. DSC loading). \
         Returns the current status: 'running' (with a progress message), \
         'completed' (with the result — database is already open), \
@@ -6214,6 +6249,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "debug_stop" => Some(schema::<DebugStopRequest>()),
         "debug_open_module" => Some(schema::<DebugOpenModuleRequest>()),
         "analysis_status" => Some(schema::<EmptyParams>()),
+        "list_databases" => Some(schema::<EmptyParams>()),
         "tool_catalog" => Some(schema::<ToolCatalogRequest>()),
         "tool_help" => Some(schema::<ToolHelpRequest>()),
         "recent_operations" => Some(schema::<RecentOperationsRequest>()),
@@ -7890,8 +7926,11 @@ mod tests {
 
     #[test]
     fn default_tool_schema_snapshot() {
+        // Default mode: no --workspace, no --enable-debugger. This digest is
+        // the locked promise that opt-in capabilities never alter the schemas
+        // an ordinary client sees.
         let schemas = crate::tool_registry::all_tools()
-            .filter(|tool| !tool.requirements.debugger)
+            .filter(|tool| !tool.requirements.debugger && !tool.requirements.workspace)
             .map(|tool| {
                 json!({
                     "name": tool.name,

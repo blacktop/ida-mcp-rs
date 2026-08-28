@@ -199,10 +199,13 @@ mod tests {
         assert!(f.is_enabled("run_script"));
         assert!(f.is_enabled("patch"));
         assert!(!f.is_enabled("debug_status"));
+        // Workspace-gated tools are absent from default mode for the same
+        // reason debugger tools are: their capability was never enabled.
+        assert!(!f.is_enabled("list_databases"));
         assert_eq!(
             f.enabled_count(),
             tool_registry::all_tools()
-                .filter(|tool| !tool.requirements.debugger)
+                .filter(|tool| !tool.requirements.debugger && !tool.requirements.workspace)
                 .count()
         );
     }

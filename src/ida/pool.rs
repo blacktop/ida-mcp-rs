@@ -851,6 +851,11 @@ pub struct WorkspaceDatabase {
 /// - **I2 — pins block reaping:** an entry with active calls, task pins, or a
 ///   debug pin is never idle-reaped. Enforced by the [`workspace_reaper`]
 ///   filter; test `workspace_idle_reaper_respects_every_lifetime_guard`.
+///   Guard release publishes the refreshed idle timestamp *before*
+///   decrementing its counter ([`WorkspaceLease`]/[`WorkspacePin`] `Drop`),
+///   so a call outliving the TTL can never expose a zero guard count beside
+///   a stale timestamp to a reaper pass in progress; test
+///   `guard_release_refreshes_idle_time_before_dropping_its_count`.
 /// - **I3 — close removes exactly the closable:** `close_idb` removes an
 ///   entry unless a keyed background open for it is still running, so a
 ///   pending open is protected while a terminal lease-less entry stays
@@ -933,6 +938,32 @@ struct PooledDatabaseLease {
 struct DispatchedCall {
     result: Result<CallToolResult, ToolError>,
     lease: Option<(usize, DatabaseGeneration)>,
+}
+
+/// Worker binding of one workspace database, as seen by `list_databases`.
+enum LeaseSnapshot {
+    /// A worker is bound; `path` is absent only when its slot was busy.
+    Bound {
+        path: Option<PathBuf>,
+        debug_pinned: bool,
+    },
+    /// No worker is bound: the database is allocated but not yet open, or
+    /// its worker was lost.
+    NoWorker,
+    /// The lease is locked by an in-flight operation.
+    Busy,
+}
+
+/// One row of `list_databases`: enough to re-address a handle after a lost
+/// response or a stateless HTTP reconnect, and nothing internal.
+pub struct WorkspaceDatabaseSummary {
+    pub database_id: String,
+    pub path: Option<String>,
+    pub state: &'static str,
+    pub idle_seconds: u64,
+    pub active_calls: usize,
+    pub pinned: bool,
+    pub debug_pinned: bool,
 }
 
 /// Outcome of the reaper's debug-pin probe for one workspace entry.
@@ -1055,6 +1086,47 @@ impl WorkspaceRegistry {
         };
         entry.touch();
         Some(WorkspacePin { entry })
+    }
+
+    /// Snapshot every workspace database handle for discovery. Legacy
+    /// session bindings are internal routing state and never listed. The
+    /// registry lock is released before probing worker state so one busy
+    /// database cannot stall the listing.
+    pub fn list_databases(&self) -> Vec<WorkspaceDatabaseSummary> {
+        let entries = {
+            let entries = self.entries();
+            let mut collected = Vec::with_capacity(entries.len());
+            for (database_id, entry) in entries.iter() {
+                if !entry.legacy {
+                    collected.push((database_id.clone(), entry.clone()));
+                }
+            }
+            collected
+        };
+        let mut summaries = Vec::with_capacity(entries.len());
+        for (database_id, entry) in entries {
+            let active_calls = entry.active_calls.load(Ordering::Relaxed);
+            let (path, state, debug_pinned) = match entry.database.lease_snapshot() {
+                LeaseSnapshot::Bound { path, debug_pinned } => (
+                    path.map(|path| path.display().to_string()),
+                    if active_calls > 0 { "busy" } else { "open" },
+                    debug_pinned,
+                ),
+                LeaseSnapshot::NoWorker => (None, "no_worker", false),
+                LeaseSnapshot::Busy => (None, "busy", false),
+            };
+            summaries.push(WorkspaceDatabaseSummary {
+                database_id,
+                path,
+                state,
+                idle_seconds: entry.idle_for().as_secs(),
+                active_calls,
+                pinned: entry.pins.load(Ordering::Relaxed) > 0,
+                debug_pinned,
+            });
+        }
+        summaries.sort_by(|left, right| left.database_id.cmp(&right.database_id));
+        summaries
     }
 
     pub async fn close_database(&self, database_id: &str) -> Result<(), ToolError> {
@@ -1199,15 +1271,21 @@ impl WorkspaceLease {
 
 impl Drop for WorkspaceLease {
     fn drop(&mut self) {
-        self.entry.active_calls.fetch_sub(1, Ordering::Relaxed);
+        // Publish the fresh idle timestamp before releasing the guard
+        // (invariant I2). A call outliving the TTL would otherwise expose a
+        // zero guard count alongside its stale timestamp, and a reaper pass
+        // landing in that window would reap a database that was in use one
+        // instant earlier.
         self.entry.touch();
+        self.entry.active_calls.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 impl Drop for WorkspacePin {
     fn drop(&mut self) {
-        self.entry.pins.fetch_sub(1, Ordering::Relaxed);
+        // Same ordering rule as WorkspaceLease: timestamp first, then guard.
         self.entry.touch();
+        self.entry.pins.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1265,6 +1343,30 @@ impl WorkspaceDatabase {
         }
         current.debug_pinned = pinned;
         true
+    }
+
+    /// Read-only snapshot of this database's worker binding for
+    /// `list_databases`. Uses `try_lock` throughout: a database mid-call
+    /// reports `busy` rather than blocking a discovery request behind a
+    /// long-running analysis.
+    fn lease_snapshot(&self) -> LeaseSnapshot {
+        let Ok(guard) = self.handle.try_lock() else {
+            return LeaseSnapshot::Busy;
+        };
+        let Some(lease) = guard.as_ref() else {
+            return LeaseSnapshot::NoWorker;
+        };
+        let path = lease
+            .handle
+            .slot
+            .child
+            .try_lock()
+            .ok()
+            .and_then(|child| child.idb_path.clone());
+        LeaseSnapshot::Bound {
+            path,
+            debug_pinned: lease.debug_pinned,
+        }
     }
 
     /// Reaper-side debug-pin gate via `try_lock` probes — contended state
@@ -1744,9 +1846,16 @@ impl WorkspaceDatabase {
                     "retained debugger session lost its lease before pinning; \
                      reporting the session as lost"
                 );
+                // Do not claim the debuggee ended. A worker killed outside
+                // its own control (SIGKILL, crash) never runs
+                // DebuggerRuntime::drop, so its debug-server helper is
+                // reparented rather than terminated and can keep the target
+                // process alive.
                 return Err(ToolError::DebuggerSessionLost(format!(
                     "{tool} started a debugger session, but its worker was lost before the \
-                     session could be tracked; the debuggee ended with the worker — retry {tool}"
+                     session could be tracked; ida-mcp no longer controls that session and the \
+                     target process may still be running — check for a stray debuggee before \
+                     retrying {tool}"
                 )));
             }
         }
@@ -3012,8 +3121,10 @@ mod tests {
     use crate::ida::worker::DEBUG_MODULES_TIMEOUT_SECS;
     use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
+    use std::time::Instant;
 
     fn test_pool(max_workers: usize) -> WorkerPool {
         WorkerPool::new(WorkerPoolConfig {
@@ -3153,6 +3264,83 @@ mod tests {
         drop(guard);
 
         drop(lease);
+        registry.shutdown().await;
+    }
+
+    /// Lifecycle invariant I2: a guard release must never expose a zero
+    /// guard count beside a stale idle timestamp, or a reaper pass landing in
+    /// that window reaps a database that was in use an instant earlier. A
+    /// concurrent sampler watches for that pair while long-idle leases are
+    /// released; with the decrement ordered first it is observable, with the
+    /// timestamp published first it cannot occur.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guard_release_refreshes_idle_time_before_dropping_its_count() {
+        let registry = WorkspaceRegistry::new(test_pool(2), Duration::from_secs(300));
+        let lease = registry.allocate_database();
+        let database_id = lease.database_id().to_string();
+        drop(lease);
+        let entry = registry
+            .entries()
+            .get(&database_id)
+            .cloned()
+            .expect("allocated database remains registered");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let violations = Arc::new(AtomicUsize::new(0));
+        let sampler = {
+            let entry = entry.clone();
+            let stop = stop.clone();
+            let violations = violations.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // Read the timestamp and both counts as one snapshot,
+                    // holding the lock `touch` uses. Sampling them as three
+                    // independent loads would report torn states that never
+                    // existed simultaneously.
+                    let idle = {
+                        let last_used = match entry.last_used.lock() {
+                            Ok(last_used) => last_used,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        let idle = last_used.elapsed();
+                        let guards = entry.active_calls.load(Ordering::Relaxed)
+                            + entry.pins.load(Ordering::Relaxed);
+                        (guards == 0).then_some(idle)
+                    };
+                    if idle.is_some_and(|idle| idle >= Duration::from_secs(30)) {
+                        violations.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::hint::spin_loop();
+                }
+            })
+        };
+
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("test clock supports a 60s offset");
+        for _ in 0..5_000 {
+            let held = registry.acquire(&database_id).expect("database is routed");
+            match entry.last_used.lock() {
+                Ok(mut last_used) => *last_used = stale,
+                Err(poisoned) => *poisoned.into_inner() = stale,
+            }
+            drop(held);
+
+            let pin = registry.pin(&database_id).expect("database can be pinned");
+            match entry.last_used.lock() {
+                Ok(mut last_used) => *last_used = stale,
+                Err(poisoned) => *poisoned.into_inner() = stale,
+            }
+            drop(pin);
+        }
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().expect("sampler thread finishes");
+
+        assert_eq!(
+            violations.load(Ordering::Relaxed),
+            0,
+            "a released guard exposed a stale idle timestamp to a concurrent reaper"
+        );
         registry.shutdown().await;
     }
 

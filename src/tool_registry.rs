@@ -1222,6 +1222,27 @@ pub static TOOL_REGISTRY: &[ToolInfo] = &[
         keywords: &["debugger", "stop", "detach", "terminate", "process"],
     },
     ToolInfo {
+        name: "list_databases",
+        category: ToolCategory::Core,
+        scope: ToolScope::Runtime,
+        requirements: ToolRequirements {
+            workspace: true,
+            debugger: false,
+            experimental: false,
+        },
+        short_desc: "List open workspace database handles",
+        full_desc: "List every database_id this workspace server currently routes, with the \
+                    database path when a worker is bound and its lifecycle state: 'open', \
+                    'busy' (a call is in flight), or 'no_worker' (allocated or opening in the \
+                    background, or its worker was lost). Also reports idle seconds and whether \
+                    the handle is pinned by a background task or a live debugger session. Use \
+                    it to recover a database_id after a lost response or a stateless HTTP \
+                    reconnect. Read-only: it never opens, closes, or modifies a database.",
+        example: r#"{}"#,
+        default: false,
+        keywords: &["workspace", "databases", "list", "handles", "database_id", "discover"],
+    },
+    ToolInfo {
         name: "debug_open_module",
         category: ToolCategory::Debug,
         scope: ToolScope::Database,
@@ -1393,6 +1414,18 @@ mod tests {
                     tool.requirements.workspace,
                     tool.name == "debug_open_module"
                 );
+            } else if tool.name == "list_databases" {
+                // The only non-debugger tool gated on a server capability:
+                // opaque handles exist solely in workspace mode.
+                assert_eq!(
+                    tool.requirements,
+                    ToolRequirements {
+                        workspace: true,
+                        debugger: false,
+                        experimental: false,
+                    }
+                );
+                assert_eq!(tool.scope, ToolScope::Runtime);
             } else {
                 assert_eq!(tool.requirements, ToolRequirements::BASELINE);
             }
@@ -1413,6 +1446,7 @@ mod tests {
                 "task_status",
                 "int_convert",
                 "debug_status",
+                "list_databases",
             ])
         );
     }

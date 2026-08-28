@@ -416,12 +416,29 @@ case "$launch_status" in
       exit 1
     }
 
+    # Record what actually happens to the debug-server helper and the target
+    # after an out-of-band worker kill. SIGKILL bypasses DebuggerRuntime::drop,
+    # so the helper is reparented rather than terminated and can keep the
+    # target alive. Assert that observed reality here: the server-side error
+    # text must not promise the debuggee ended, and the leak is documented.
+    helper_alive=0
+    debuggee_alive=0
+    [[ -n "${helper2_pid:-}" ]] && kill -0 "$helper2_pid" >/dev/null 2>&1 && helper_alive=1
+    [[ -n "${debuggee2_pid:-}" ]] && kill -0 "$debuggee2_pid" >/dev/null 2>&1 && debuggee_alive=1
+    if [[ "$helper_alive" == "1" || "$debuggee_alive" == "1" ]]; then
+      echo "   worker SIGKILL orphans its debug helper (helper_alive=$helper_alive," \
+        "debuggee_alive=$debuggee_alive) — ida-mcp must not claim the debuggee ended"
+    else
+      echo "   worker SIGKILL also ended the debug helper and target"
+    fi
+
     # Retire the orphaned helper chain now that the oracle has its evidence;
     # their inherited fifo fds must not outlive this section.
     for orphan in "${helper2_pid:-}" "${debuggee2_pid:-}"; do
       [[ -n "$orphan" ]] && kill -KILL "$orphan" >/dev/null 2>&1 || true
     done
     debuggee2_pid=""
+    helper2_pid=""
 
     status2_request="$(jq -cn --arg id "$reap_id" \
       '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"debug_modules",arguments:{database_id:$id}}}')"
