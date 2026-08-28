@@ -233,6 +233,12 @@ as `tool_catalog` reject it. `close_idb(database_id: ...)` invalidates only the
 selected handle. Idle handles are reaped after 30 minutes by default; use
 `--workspace-idle-timeout-secs 0` to disable that database TTL.
 
+`list_databases` recovers handles: it returns every routed `database_id` with
+its database path and lifecycle state (`open`, `busy`, or `no_worker`), so an
+agent that lost a response — or reconnected over stateless HTTP — can re-address
+an open database instead of stranding it until the TTL expires. It is read-only
+and, like every workspace tool, is absent unless the server runs `--workspace`.
+
 Workspace routing and legacy pooled HTTP share one internal registry. The
 legacy session behavior below is preserved, but there is no second independent
 session-to-worker lease map.
@@ -288,6 +294,15 @@ database remains at its on-disk preferred addresses.
 In workspace mode, a successfully launched or attached debug session pins its
 database against the idle TTL until `debug_stop` succeeds or `close_idb`
 releases the database.
+
+Known limitation — worker loss does not stop the debuggee. If the worker
+process hosting a live debug session dies out of band (it is killed, or ida-mcp
+retires it after a wedged debugger call), that process never runs its own
+teardown, so IDA's debug-server helper is reparented instead of terminated and
+the target may keep running. ida-mcp reports every such loss as a
+`Debugger session lost` error that says the target may still be alive, clears
+the handle's debug pin so the database can be reaped, and never claims the
+debuggee ended. Cleaning up a stray helper or debuggee is currently manual.
 
 The first enabled platform is macOS on Apple Silicon. ida-mcp connects through
 IDA's signed loopback `mac_server_arm` helper. macOS may require IDA's supported

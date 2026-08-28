@@ -416,11 +416,13 @@ case "$launch_status" in
       exit 1
     }
 
-    # Record what actually happens to the debug-server helper and the target
-    # after an out-of-band worker kill. SIGKILL bypasses DebuggerRuntime::drop,
-    # so the helper is reparented rather than terminated and can keep the
-    # target alive. Assert that observed reality here: the server-side error
-    # text must not promise the debuggee ended, and the leak is documented.
+    # Characterize (do not assert) what survives an out-of-band worker kill:
+    # SIGKILL bypasses DebuggerRuntime::drop, so the helper is reparented
+    # rather than terminated and can keep the target alive. Either outcome is
+    # reported for the record. The matching server contract — that a retired
+    # debug-pinned worker reports a lost session and never claims the debuggee
+    # ended — is asserted deterministically by the unit test
+    # `retiring_a_debug_pinned_worker_reports_the_session_as_lost`.
     helper_alive=0
     debuggee_alive=0
     [[ -n "${helper2_pid:-}" ]] && kill -0 "$helper2_pid" >/dev/null 2>&1 && helper_alive=1

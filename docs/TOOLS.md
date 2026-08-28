@@ -5,10 +5,11 @@
 
 ## Discovery Workflow
 
-- `tools/list` returns 75 baseline tools by default (81 registered including opt-in debugger tools)
+- `tools/list` returns 75 baseline tools by default (82 registered including opt-in workspace and debugger tools)
 - `tool_catalog(query=...)` searches all tools by intent
 - `tool_help(name=...)` returns full documentation and schema
 - Debugger tools require `--enable-debugger`; `debug_open_module` also requires `--workspace`
+- `--workspace` routes several databases by `database_id`; `list_databases` recovers a handle after a lost response or reconnect
 - Call `close_idb` when done to release locks; in multi-client servers coordinate before closing (HTTP/SSE requires the close_token from `open_idb` unless the request is in the owning legacy session)
 
 Note: `open_idb` accepts .i64/.idb or raw binaries (Mach-O/ELF/PE). Raw binaries are
@@ -29,6 +30,7 @@ Database open/close and discovery tools
 | `dsc_add_dylib` | Load an additional dylib into an open DSC database |
 | `dsc_add_region` | Load a DSC memory region by address (data/GOT/stubs) |
 | `idb_meta` | Get database metadata and summary |
+| `list_databases` | List open workspace database handles |
 | `load_debug_info` | Load external debug info (e.g., dSYM/DWARF) |
 | `open_dsc` | Open a dyld_shared_cache and load one module; use dsc_add_dylib/dsc_add_region for more |
 | `open_idb` | Open an IDA database or raw binary |

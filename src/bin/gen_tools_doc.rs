@@ -44,9 +44,11 @@ fn main() {
     }
 
     let tool_count = TOOL_REGISTRY.len();
+    // Baseline is what a default server advertises: every opt-in capability
+    // gate must be excluded, not only the debugger one.
     let baseline_tool_count = TOOL_REGISTRY
         .iter()
-        .filter(|tool| !tool.requirements.debugger)
+        .filter(|tool| !tool.requirements.debugger && !tool.requirements.workspace)
         .count();
 
     let mut out = String::new();
@@ -60,7 +62,7 @@ fn main() {
     let _ = writeln!(out, "## Discovery Workflow\n");
     let _ = writeln!(
         out,
-        "- `tools/list` returns {baseline_tool_count} baseline tools by default ({tool_count} registered including opt-in debugger tools)"
+        "- `tools/list` returns {baseline_tool_count} baseline tools by default ({tool_count} registered including opt-in workspace and debugger tools)"
     );
     let _ = writeln!(
         out,
@@ -73,6 +75,10 @@ fn main() {
     let _ = writeln!(
         out,
         "- Debugger tools require `--enable-debugger`; `debug_open_module` also requires `--workspace`"
+    );
+    let _ = writeln!(
+        out,
+        "- `--workspace` routes several databases by `database_id`; `list_databases` recovers a handle after a lost response or reconnect"
     );
     let _ = writeln!(
         out,

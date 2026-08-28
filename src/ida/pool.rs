@@ -979,6 +979,25 @@ enum DebugPinReapDecision {
     DeadWorker(Arc<ChildSlot>),
 }
 
+/// Report the loss of a worker that was hosting a live debugger session.
+///
+/// Any server-initiated retirement of a debug-pinned lease — a wedged
+/// `debug_modules`, a crashed child, a dropped transport — ends ida-mcp's
+/// control of that session without ending the debuggee: the worker never runs
+/// `DebuggerRuntime::drop`, so its debug-server helper is reparented rather
+/// than terminated. A bare timeout or transport error would hide that, so the
+/// error names it. Non-debugger losses keep their original error.
+fn debugger_worker_loss_error(tool: &str, error: ToolError, debug_pinned: bool) -> ToolError {
+    if !debug_pinned {
+        return error;
+    }
+    ToolError::DebuggerSessionLost(format!(
+        "{tool} lost the worker hosting this database's debugger session ({error}); ida-mcp no \
+         longer controls that session and the target process may still be running — check for a \
+         stray debuggee, then reopen the database to start a new session"
+    ))
+}
+
 /// Whether a debugger start left the child owning a live process: a `ready`
 /// result, a `user_action_required` result whose process survived, or the
 /// dedicated retained-start error all report it explicitly.
@@ -1356,15 +1375,24 @@ impl WorkspaceDatabase {
         let Some(lease) = guard.as_ref() else {
             return LeaseSnapshot::NoWorker;
         };
-        let path = lease
-            .handle
-            .slot
-            .child
-            .try_lock()
-            .ok()
-            .and_then(|child| child.idb_path.clone());
+        // Contention is reported as busy rather than as a bound worker with
+        // an unknown path: `open` with `path: null` would misdescribe a
+        // database that is simply mid-call.
+        let Ok(child) = lease.handle.slot.child.try_lock() else {
+            return LeaseSnapshot::Busy;
+        };
+        // A closed transport means the worker is gone even though the lease
+        // survives until a dispatch or the reaper clears it. Reporting it as
+        // `open` would advertise a handle no call can serve.
+        if child
+            .service
+            .as_ref()
+            .is_none_or(|service| service.is_transport_closed())
+        {
+            return LeaseSnapshot::NoWorker;
+        }
         LeaseSnapshot::Bound {
-            path,
+            path: child.idb_path.clone(),
             debug_pinned: lease.debug_pinned,
         }
     }
@@ -1462,7 +1490,10 @@ impl WorkspaceDatabase {
         }
     }
 
-    async fn clear_handle_if_worker(&self, worker_id: usize) {
+    /// Unbind a lost worker. Returns whether the cleared lease held a debug
+    /// pin, so the caller can report a live debugger session ending with its
+    /// worker instead of a bare transport error.
+    async fn clear_handle_if_worker(&self, worker_id: usize) -> bool {
         let mut guard = self.handle.lock().await;
         if guard
             .as_ref()
@@ -1470,8 +1501,11 @@ impl WorkspaceDatabase {
         {
             // The debug pin lives inside the lease, so dropping the lease
             // erases it structurally (invariant I1) — no separate cleanup.
+            let debug_pinned = guard.as_ref().is_some_and(|lease| lease.debug_pinned);
             *guard = None;
+            return debug_pinned;
         }
+        false
     }
 
     /// Call a child tool, optionally bound to one database lifetime (see
@@ -1529,18 +1563,20 @@ impl WorkspaceDatabase {
                 if let Some(err) = remote::result_error(&result, tool) {
                     if child_tool_error_retires_worker(tool, &err) {
                         let mut retire_guard = WorkerRetireGuard::call(&handle, tool);
-                        self.clear_handle_if_worker(handle.worker_id).await;
+                        let debug_pinned = self.clear_handle_if_worker(handle.worker_id).await;
                         self.pool.mark_dead(&handle.slot).await;
                         retire_guard.disarm();
+                        Err(debugger_worker_loss_error(tool, err, debug_pinned))
+                    } else {
+                        Err(err)
                     }
-                    Err(err)
                 } else {
                     Ok(result)
                 }
             }
             Err(err) => {
-                self.clear_handle_if_worker(handle.worker_id).await;
-                Err(err)
+                let debug_pinned = self.clear_handle_if_worker(handle.worker_id).await;
+                Err(debugger_worker_loss_error(tool, err, debug_pinned))
             }
         };
         DispatchedCall { result, lease }
@@ -3112,10 +3148,10 @@ mod tests {
     use crate::error::ToolError;
     use crate::ida::pool::{
         analyze_funcs_child_args, child_tool_error_retires_worker, debug_start_retains_session,
-        extract_first_matches, find_bytes_child_args, lumina_apply_child_args,
-        open_error_releases_lease, open_idb_child_args, release_error_retires_worker,
-        require_lease_generation, run_script_child_args, search_child_args, DebugPinReapDecision,
-        WorkerPool, WorkerPoolConfig, WorkspaceRegistry,
+        debugger_worker_loss_error, extract_first_matches, find_bytes_child_args,
+        lumina_apply_child_args, open_error_releases_lease, open_idb_child_args,
+        release_error_retires_worker, require_lease_generation, run_script_child_args,
+        search_child_args, DebugPinReapDecision, WorkerPool, WorkerPoolConfig, WorkspaceRegistry,
     };
     use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget};
     use crate::ida::worker::DEBUG_MODULES_TIMEOUT_SECS;
@@ -3342,6 +3378,43 @@ mod tests {
             "a released guard exposed a stale idle timestamp to a concurrent reaper"
         );
         registry.shutdown().await;
+    }
+
+    /// Every server-initiated retirement of a debug-pinned lease must report
+    /// the lost session truthfully — never a bare timeout — and must not
+    /// claim the debuggee ended. Losses with no debugger session keep their
+    /// original error so ordinary retries are unaffected.
+    #[test]
+    fn retiring_a_debug_pinned_worker_reports_the_session_as_lost() {
+        let wedged = debugger_worker_loss_error(
+            "debug_modules",
+            ToolError::Timeout(DEBUG_MODULES_TIMEOUT_SECS),
+            true,
+        );
+        let ToolError::DebuggerSessionLost(message) = &wedged else {
+            panic!("a wedged debugger worker must report a lost session, got: {wedged}");
+        };
+        assert!(message.contains("debug_modules"));
+        assert!(message.contains("may still be running"));
+        assert!(!message.contains("ended with the worker"));
+
+        let crashed = debugger_worker_loss_error(
+            "debug_modules",
+            ToolError::WorkerCrashed {
+                worker_id: 3,
+                last_op: "debug_modules".to_string(),
+            },
+            true,
+        );
+        assert!(matches!(crashed, ToolError::DebuggerSessionLost(_)));
+
+        // No debugger session: the original error survives unchanged.
+        let plain = debugger_worker_loss_error(
+            "run_script",
+            ToolError::Timeout(DEBUG_MODULES_TIMEOUT_SECS),
+            false,
+        );
+        assert!(matches!(plain, ToolError::Timeout(_)));
     }
 
     /// Ownership signals that must pin: an explicit `session_retained`
