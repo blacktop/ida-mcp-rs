@@ -28,19 +28,28 @@ server_pid=""
 server2_pid=""
 debuggee_pid=""
 debuggee2_pid=""
+helper2_pid=""
 source_closed=0
 
 cleanup() {
   { exec 3>&-; } 2>/dev/null || true
   { exec 4>&-; } 2>/dev/null || true
-  for victim in "${debuggee_pid:-}" "${debuggee2_pid:-}"; do
+  # Orphaned helpers hold inherited fifo write fds; they must die before the
+  # servers can see stdin EOF and finish their runtime shutdown.
+  for victim in "${debuggee_pid:-}" "${debuggee2_pid:-}" "${helper2_pid:-}"; do
     [[ -n "$victim" ]] && kill -KILL "$victim" >/dev/null 2>&1 || true
   done
   for srv in "${server_pid:-}" "${server2_pid:-}"; do
-    if [[ -n "$srv" ]]; then
-      kill "$srv" >/dev/null 2>&1 || true
-      wait "$srv" >/dev/null 2>&1 || true
-    fi
+    [[ -n "$srv" ]] || continue
+    kill "$srv" >/dev/null 2>&1 || true
+    for _ in $(seq 1 50); do
+      kill -0 "$srv" >/dev/null 2>&1 || break
+      sleep 0.1
+    done
+    # A leaked pipe fd anywhere in the process tree can pin the server's
+    # stdin read past its graceful shutdown; never hang the harness on it.
+    kill -KILL "$srv" >/dev/null 2>&1 || true
+    wait "$srv" >/dev/null 2>&1 || true
   done
   rm -rf "$tmpdir"
 }
@@ -372,15 +381,24 @@ case "$launch_status" in
       result_text <<<"$launch2_response" >&2
       exit 1
     }
-    debuggee2_pid="$(ps -axo pid=,command= 2>/dev/null \
-      | awk -v target="$external2_path" '$2 == target { print $1; exit }' || true)"
-
+    # Capture the whole helper chain BEFORE killing the worker: SIGKILLing it
+    # orphans its mac_server helper (and the suspended debuggee), and the
+    # orphaned helper holds inherited fifo write fds that would otherwise
+    # keep both servers' stdin open forever.
+    for _ in $(seq 1 20); do
+      debuggee2_pid="$(ps -axo pid=,command= 2>/dev/null \
+        | awk -v target="$external2_path" '$2 == target { print $1; exit }' || true)"
+      [[ -n "$debuggee2_pid" ]] && break
+      sleep 0.1
+    done
     worker2_pid="$(ps -axo pid=,ppid=,command= 2>/dev/null \
       | awk -v ppid="$server2_pid" '$2 == ppid && /worker/ { print $1; exit }' || true)"
     [[ -n "$worker2_pid" ]] || {
       echo "could not identify the pooled worker child of the reaper-test server" >&2
       exit 1
     }
+    helper2_pid="$(ps -axo pid=,ppid=,command= 2>/dev/null \
+      | awk -v ppid="$worker2_pid" '$2 == ppid && /mac_server/ { print $1; exit }' || true)"
     kill -KILL "$worker2_pid"
 
     reap_seen=0
@@ -398,8 +416,15 @@ case "$launch_status" in
       exit 1
     }
 
+    # Retire the orphaned helper chain now that the oracle has its evidence;
+    # their inherited fifo fds must not outlive this section.
+    for orphan in "${helper2_pid:-}" "${debuggee2_pid:-}"; do
+      [[ -n "$orphan" ]] && kill -KILL "$orphan" >/dev/null 2>&1 || true
+    done
+    debuggee2_pid=""
+
     status2_request="$(jq -cn --arg id "$reap_id" \
-      '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"debug_status",arguments:{database_id:$id}}}')"
+      '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"debug_modules",arguments:{database_id:$id}}}')"
     send2 "$status2_request"
     status2_response="$(wait_response2 4 15)"
     jq -e '
