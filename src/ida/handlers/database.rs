@@ -473,23 +473,24 @@ pub fn handle_open(
     if let Some(db) = idb.as_ref() {
         let current_path = db.path();
         let requested_output = idb_out.map(expand_path);
-        if database_paths_match(current_path, &expanded)
-            || open_database_matches_explicit_output(
+        let same_database = match requested_output.as_deref() {
+            Some(output) => open_database_matches_explicit_output(
                 current_path,
                 &expanded,
-                requested_output.as_deref(),
+                Some(output),
                 &db.meta().input_file_path(),
-            )
-        {
+            ),
+            None => database_paths_match(current_path, &expanded),
+        };
+        if same_database {
             // Same database - return its info instead of reopening
             info!(path = %expanded.display(), "Database already open, returning existing info");
             return Ok(build_db_info(db, &current_path.display().to_string(), None));
-        } else {
-            // Different database - tell them to close first
-            return Err(ToolError::DatabaseAlreadyOpen(
-                current_path.display().to_string(),
-            ));
         }
+        // Different database - tell them to close first
+        return Err(ToolError::DatabaseAlreadyOpen(
+            current_path.display().to_string(),
+        ));
     }
 
     // Check file exists
@@ -1261,6 +1262,15 @@ mod tests {
             Some(&dir.join("elsewhere.i64")),
             &recorded
         ));
+        // An explicit output makes that output the request identity. Do not
+        // silently return a default sibling that happens to be open.
+        assert!(!open_database_matches_explicit_output(
+            &dir.join("firmware.bin.i64"),
+            &raw,
+            Some(&output),
+            &recorded
+        ));
+        assert!(database_paths_match(&dir.join("firmware.bin.i64"), &raw));
         // The requested packed output also matches its open unpacked form.
         assert!(open_database_matches_explicit_output(
             &dir.join("custom.id0"),

@@ -486,6 +486,11 @@ pub fn modules(runtime: &mut DebuggerRuntime, idb: &Option<IDB>) -> Result<Value
     }))
 }
 
+pub fn process_state(idb: &Option<IDB>) -> Result<String, ToolError> {
+    let database = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    Ok(process_state_name(database.debugger_process_state()))
+}
+
 pub fn stop(
     runtime: &mut DebuggerRuntime,
     idb: &Option<IDB>,

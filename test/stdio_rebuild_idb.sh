@@ -229,6 +229,24 @@ orig_resp="$(wait_response 4 15)"
 assert_ok "Phase 3 original lookup" "$orig_resp"
 echo "   ✓ interesting_function resolves again"
 
+conflicting_output="$tmpdir/conflicting-output.i64"
+send "$(jq -cn --arg p "$raw" --arg out "$conflicting_output" \
+  '{jsonrpc:"2.0",id:5,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
+conflicting_response="$(wait_response 5 15)"
+assert_err "Phase 3 explicit output retry against default open" "$conflicting_response"
+echo "$conflicting_response" | jq -e '
+  .result.content[0].text | contains("A database is already open")
+' >/dev/null || {
+  echo "❌ explicit output retry failed for the wrong reason" >&2
+  echo "$conflicting_response" | jq . >&2
+  exit 1
+}
+[[ ! -e "$conflicting_output" ]] || {
+  echo "❌ explicit output retry silently created the wrong database" >&2
+  exit 1
+}
+echo "   ✓ explicit output retry did not adopt the default open database"
+
 send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
 wait_response 99 30 >/dev/null
 stop_server

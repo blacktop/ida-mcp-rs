@@ -319,10 +319,10 @@ case "$launch_status" in
     debuggee_pid=""
     echo "   debugger launch, module-to-IDB open, terminal stop, and external-exit stop/close recovery passed"
 
-    # Out-of-band worker death: kill the pooled worker itself (not the
-    # debuggee) with no further calls on its database, and prove the reaper
-    # detects the dead transport, clears the debug-pinned lease, and reaps
-    # the entry. A second server with a 2-second idle TTL keeps this bounded.
+    # Debug-pin reaping uses a second server with a 2-second idle TTL. First,
+    # kill only the debuggee and make no further calls on its database: the
+    # worker must affirmatively observe no_process, clear the stale pin, and
+    # let the normal idle reaper invalidate the handle.
     cp "$FIXTURE_IDB" "$tmpdir/debugger2.i64"
     cp "$FIXTURE" "$tmpdir/external-debuggee-2"
     chmod 0755 "$tmpdir/external-debuggee-2"
@@ -374,13 +374,81 @@ case "$launch_status" in
       '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"debug_launch",arguments:{database_id:$id,path:$path,timeout_secs:10}}}')"
     send2 "$launch2_request"
     launch2_response="$(wait_response2 3 30)"
-    assert_ok "launch target for out-of-band worker death" "$launch2_response"
+    assert_ok "launch target for stale-pin reaping" "$launch2_response"
     jq -e '.status == "ready"' >/dev/null \
       <<<"$(result_text <<<"$launch2_response")" || {
       echo "FAIL: reaper-test launch did not reach ready" >&2
       result_text <<<"$launch2_response" >&2
       exit 1
     }
+    for _ in $(seq 1 20); do
+      debuggee2_pid="$(ps -axo pid=,command= 2>/dev/null \
+        | awk -v target="$external2_path" '$2 == target { print $1; exit }' || true)"
+      [[ -n "$debuggee2_pid" ]] && break
+      sleep 0.1
+    done
+    [[ -n "$debuggee2_pid" ]] || {
+      echo "could not identify the stale-pin debuggee" >&2
+      exit 1
+    }
+    kill -KILL "$debuggee2_pid"
+    debuggee2_pid=""
+
+    exited_reap_seen=0
+    for _ in $(seq 1 200); do
+      if grep -q "debugger target exited; clearing stale workspace pin" \
+          "$stderr2_log" 2>/dev/null \
+        && grep -q "reaping idle workspace database" "$stderr2_log" 2>/dev/null; then
+        exited_reap_seen=1
+        break
+      fi
+      sleep 0.1
+    done
+    [[ "$exited_reap_seen" == "1" ]] || {
+      echo "FAIL: reaper did not clear the debug pin after target exit" >&2
+      tail -40 "$stderr2_log" >&2
+      exit 1
+    }
+
+    exited_status_request="$(jq -cn --arg id "$reap_id" \
+      '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"debug_modules",arguments:{database_id:$id}}}')"
+    send2 "$exited_status_request"
+    exited_status_response="$(wait_response2 4 15)"
+    jq -e '
+      .error.code == -32602 and (.error.message | contains("unknown or expired"))
+    ' >/dev/null <<<"$exited_status_response" || {
+      echo "FAIL: target-exit-reaped database id was not invalidated" >&2
+      jq . <<<"$exited_status_response" >&2
+      exit 1
+    }
+    echo "   external target exit cleared the stale debug pin and reaped the database"
+
+    # Open a fresh lease on the same server, then kill the pooled worker
+    # itself (not the debuggee) with no further calls on its database. This
+    # preserves the separate terminal-transport-loss oracle.
+    cp "$FIXTURE_IDB" "$tmpdir/debugger3.i64"
+    open3_request="$(jq -cn --arg path "$tmpdir/debugger3.i64" \
+      '{jsonrpc:"2.0",id:5,method:"tools/call",params:{name:"open_idb",arguments:{path:$path}}}')"
+    send2 "$open3_request"
+    open3_response="$(wait_response2 5 120)"
+    assert_ok "open worker-loss reaper database" "$open3_response"
+    worker_reap_id="$(result_text <<<"$open3_response" | jq -r '.database_id // empty')"
+    [[ -n "$worker_reap_id" ]] || {
+      echo "worker-loss reaper open returned no database_id" >&2
+      exit 1
+    }
+    launch3_request="$(jq -cn --arg id "$worker_reap_id" --arg path "$external2_path" \
+      '{jsonrpc:"2.0",id:6,method:"tools/call",params:{name:"debug_launch",arguments:{database_id:$id,path:$path,timeout_secs:10}}}')"
+    send2 "$launch3_request"
+    launch3_response="$(wait_response2 6 30)"
+    assert_ok "launch target for out-of-band worker death" "$launch3_response"
+    jq -e '.status == "ready"' >/dev/null \
+      <<<"$(result_text <<<"$launch3_response")" || {
+      echo "FAIL: worker-loss launch did not reach ready" >&2
+      result_text <<<"$launch3_response" >&2
+      exit 1
+    }
+
     # Capture the whole helper chain BEFORE killing the worker: SIGKILLing it
     # orphans its mac_server helper (and the suspended debuggee), and the
     # orphaned helper holds inherited fifo write fds that would otherwise
@@ -391,6 +459,10 @@ case "$launch_status" in
       [[ -n "$debuggee2_pid" ]] && break
       sleep 0.1
     done
+    [[ -n "$debuggee2_pid" ]] || {
+      echo "could not identify the worker-loss debuggee" >&2
+      exit 1
+    }
     worker2_pid="$(ps -axo pid=,ppid=,command= 2>/dev/null \
       | awk -v ppid="$server2_pid" '$2 == ppid && /worker/ { print $1; exit }' || true)"
     [[ -n "$worker2_pid" ]] || {
@@ -442,10 +514,10 @@ case "$launch_status" in
     debuggee2_pid=""
     helper2_pid=""
 
-    status2_request="$(jq -cn --arg id "$reap_id" \
-      '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"debug_modules",arguments:{database_id:$id}}}')"
+    status2_request="$(jq -cn --arg id "$worker_reap_id" \
+      '{jsonrpc:"2.0",id:7,method:"tools/call",params:{name:"debug_modules",arguments:{database_id:$id}}}')"
     send2 "$status2_request"
-    status2_response="$(wait_response2 4 15)"
+    status2_response="$(wait_response2 7 15)"
     jq -e '
       .error.code == -32602 and (.error.message | contains("unknown or expired"))
     ' >/dev/null <<<"$status2_response" || {

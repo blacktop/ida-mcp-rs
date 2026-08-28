@@ -2882,7 +2882,12 @@ impl IdaMcpServer {
     #[instrument(skip_all)]
     async fn debug_status(&self) -> Result<CallToolResult, McpError> {
         debug!("Tool call: debug_status");
-        let status = crate::ida::handlers::debugger::runtime_status();
+        let mut status = crate::ida::handlers::debugger::runtime_status();
+        if matches!(self.mode, ServerMode::Worker)
+            && let Some(Ok(process_state)) = self.worker.local_debug_process_state().await
+        {
+            status["process_state"] = json!(process_state);
+        }
         Ok(CallToolResult::success(vec![Content::text(pretty_json(
             &status,
         ))]))
