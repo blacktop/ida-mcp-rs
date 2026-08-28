@@ -185,18 +185,17 @@ fn existing_raw_idb_action(
     }
 }
 
-fn sha256_file(path: &Path) -> Result<[u8; 32], ToolError> {
-    let mut file = File::open(path).map_err(|error| {
-        ToolError::OpenFailed(format!(
-            "failed to read input for SHA-256 verification ({}): {error}",
-            path.display()
-        ))
-    })?;
+fn sha256_reader(
+    reader: &mut impl Read,
+    path: &Path,
+    cancel: Option<&CancellationToken>,
+) -> Result<[u8; 32], ToolError> {
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
 
     loop {
-        let count = file.read(&mut buffer).map_err(|error| {
+        ensure_not_cancelled(cancel)?;
+        let count = reader.read(&mut buffer).map_err(|error| {
             ToolError::OpenFailed(format!(
                 "failed while hashing input ({}): {error}",
                 path.display()
@@ -207,11 +206,22 @@ fn sha256_file(path: &Path) -> Result<[u8; 32], ToolError> {
         }
         hasher.update(&buffer[..count]);
     }
+    ensure_not_cancelled(cancel)?;
 
     let digest = hasher.finalize();
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&digest);
     Ok(hash)
+}
+
+fn sha256_file(path: &Path, cancel: Option<&CancellationToken>) -> Result<[u8; 32], ToolError> {
+    let mut file = File::open(path).map_err(|error| {
+        ToolError::OpenFailed(format!(
+            "failed to read input for SHA-256 verification ({}): {error}",
+            path.display()
+        ))
+    })?;
+    sha256_reader(&mut file, path, cancel)
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
@@ -224,8 +234,7 @@ fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
 fn recorded_input_path_matches(input: &Path, recorded: &str) -> bool {
     // IDA's get_input_file_path/getinf_buf length may include the trailing C
     // terminator. Treat it as transport padding, never as part of the path.
-    let recorded =
-        recorded.trim_matches(|character: char| character == '\0' || character.is_whitespace());
+    let recorded = recorded.trim_end_matches('\0');
     !recorded.is_empty() && paths_refer_to_same_file(input, &expand_path(recorded))
 }
 
@@ -538,7 +547,7 @@ pub fn handle_open(
             release_mcp_lock_file(mcp_lock);
             return Err(error);
         }
-        let input_hash = match sha256_file(&expanded) {
+        let input_hash = match sha256_file(&expanded, cancel.as_ref()) {
             Ok(hash) => hash,
             Err(error) => {
                 drop(candidate);
@@ -887,16 +896,37 @@ pub fn handle_load_debug_info(
 mod tests {
     use std::{
         fs,
+        io::{Cursor, Read},
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use crate::error::ToolError;
     use crate::ida::handlers::database::{
         base_input_path_for_database, database_paths_match, existing_idb_for_raw_binary,
         existing_idb_for_raw_open, existing_raw_idb_action, has_ida_database_extension,
         idb_path_for_raw_binary, init_database_args, non_empty_trimmed,
-        recorded_input_path_matches, sha256_file, validate_raw_idb_output, ExistingRawIdbAction,
+        recorded_input_path_matches, sha256_file, sha256_reader, validate_raw_idb_output,
+        ExistingRawIdbAction,
     };
+    use tokio_util::sync::CancellationToken;
+
+    struct CancelAfterFirstRead {
+        inner: Cursor<Vec<u8>>,
+        cancel: CancellationToken,
+        reads: usize,
+    }
+
+    impl Read for CancelAfterFirstRead {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(buffer)?;
+            self.reads += 1;
+            if count > 0 && self.reads == 1 {
+                self.cancel.cancel();
+            }
+            Ok(count)
+        }
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -1123,6 +1153,22 @@ mod tests {
     }
 
     #[test]
+    fn recorded_input_path_preserves_filename_whitespace() {
+        let dir = temp_dir("recorded-input-path-whitespace");
+        fs::create_dir(&dir).expect("create temp dir");
+        let spaced = dir.join(" sample.bin ");
+        let trimmed = dir.join("sample.bin");
+        fs::write(&spaced, b"spaced").expect("write spaced input");
+        fs::write(&trimmed, b"trimmed").expect("write trimmed input");
+        let recorded = format!("{}\0", spaced.display());
+
+        assert!(recorded_input_path_matches(&spaced, &recorded));
+        assert!(!recorded_input_path_matches(&trimmed, &recorded));
+
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
     fn raw_idb_output_requires_safe_database_path() {
         let dir = temp_dir("validate-idb-out");
         fs::create_dir(&dir).expect("create temp dir");
@@ -1162,7 +1208,7 @@ mod tests {
         fs::write(&input, b"abc").expect("write input");
 
         assert_eq!(
-            sha256_file(&input).expect("hash input"),
+            sha256_file(&input, None).expect("hash input"),
             [
                 0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
                 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
@@ -1171,5 +1217,21 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn input_hash_stops_between_reads_after_cancellation() {
+        let cancel = CancellationToken::new();
+        let mut reader = CancelAfterFirstRead {
+            inner: Cursor::new(vec![0u8; 128 * 1024]),
+            cancel: cancel.clone(),
+            reads: 0,
+        };
+
+        let error = sha256_reader(&mut reader, Path::new("large-input.bin"), Some(&cancel))
+            .expect_err("hashing must stop after cancellation");
+
+        assert!(matches!(error, ToolError::Cancelled(_)));
+        assert_eq!(reader.reads, 1, "no read may begin after cancellation");
     }
 }

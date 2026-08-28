@@ -1221,7 +1221,7 @@ impl WorkspaceDatabase {
         {
             Ok(result) => {
                 if let Some(err) = remote::result_error(&result, tool) {
-                    if child_tool_error_retires_worker(&err) {
+                    if child_tool_error_retires_worker(tool, &err) {
                         self.clear_handle_if_worker(handle.worker_id).await;
                         self.pool.mark_dead(&handle.slot).await;
                     }
@@ -2654,11 +2654,12 @@ fn release_error_retires_worker(err: &ToolError) -> bool {
     )
 }
 
-fn child_tool_error_retires_worker(err: &ToolError) -> bool {
+fn child_tool_error_retires_worker(tool: &str, err: &ToolError) -> bool {
     matches!(
         err,
         ToolError::WorkerClosed | ToolError::WorkerCrashed { .. } | ToolError::RemoteProtocol(_)
-    )
+    ) || (tool == "debug_modules"
+        && matches!(err, ToolError::Timeout(_) | ToolError::TimeoutDetailed(_)))
 }
 
 fn open_error_releases_lease(fresh_lease: bool, err: &ToolError) -> bool {
@@ -2736,6 +2737,7 @@ mod tests {
         run_script_child_args, search_child_args, WorkerPool, WorkerPoolConfig, WorkspaceRegistry,
     };
     use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget};
+    use crate::ida::worker::DEBUG_MODULES_TIMEOUT_SECS;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
@@ -2968,14 +2970,27 @@ mod tests {
     }
 
     #[test]
-    fn child_tool_error_retire_decision_keeps_routine_timeouts_reusable() {
+    fn child_tool_error_retire_decision_is_operation_specific() {
         assert!(!child_tool_error_retires_worker(
+            "run_script",
             &ToolError::TimeoutDetailed("run_script timed out after 5 seconds".to_string())
         ));
-        assert!(!child_tool_error_retires_worker(&ToolError::Cancelled(
-            "run_script cancelled".to_string()
-        )));
-        assert!(child_tool_error_retires_worker(&ToolError::WorkerClosed));
+        assert!(!child_tool_error_retires_worker(
+            "run_script",
+            &ToolError::Cancelled("run_script cancelled".to_string())
+        ));
+        assert!(child_tool_error_retires_worker(
+            "debug_modules",
+            &ToolError::Timeout(DEBUG_MODULES_TIMEOUT_SECS)
+        ));
+        assert!(child_tool_error_retires_worker(
+            "debug_modules",
+            &ToolError::TimeoutDetailed("debug_modules timed out".to_string())
+        ));
+        assert!(child_tool_error_retires_worker(
+            "run_script",
+            &ToolError::WorkerClosed
+        ));
     }
 
     #[test]
