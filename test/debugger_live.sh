@@ -25,18 +25,23 @@ fifo="$tmpdir/in.fifo"
 stdout_log="$tmpdir/server.out"
 stderr_log="$tmpdir/server.err"
 server_pid=""
+server2_pid=""
 debuggee_pid=""
+debuggee2_pid=""
 source_closed=0
 
 cleanup() {
   { exec 3>&-; } 2>/dev/null || true
-  if [[ -n "${debuggee_pid:-}" ]]; then
-    kill -KILL "$debuggee_pid" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "${server_pid:-}" ]]; then
-    kill "$server_pid" >/dev/null 2>&1 || true
-    wait "$server_pid" >/dev/null 2>&1 || true
-  fi
+  { exec 4>&-; } 2>/dev/null || true
+  for victim in "${debuggee_pid:-}" "${debuggee2_pid:-}"; do
+    [[ -n "$victim" ]] && kill -KILL "$victim" >/dev/null 2>&1 || true
+  done
+  for srv in "${server_pid:-}" "${server2_pid:-}"; do
+    if [[ -n "$srv" ]]; then
+      kill "$srv" >/dev/null 2>&1 || true
+      wait "$srv" >/dev/null 2>&1 || true
+    fi
+  done
   rm -rf "$tmpdir"
 }
 trap cleanup EXIT INT TERM
@@ -304,6 +309,107 @@ case "$launch_status" in
     source_closed=1
     debuggee_pid=""
     echo "   debugger launch, module-to-IDB open, terminal stop, and external-exit stop/close recovery passed"
+
+    # Out-of-band worker death: kill the pooled worker itself (not the
+    # debuggee) with no further calls on its database, and prove the reaper
+    # detects the dead transport, clears the debug-pinned lease, and reaps
+    # the entry. A second server with a 2-second idle TTL keeps this bounded.
+    cp "$FIXTURE_IDB" "$tmpdir/debugger2.i64"
+    cp "$FIXTURE" "$tmpdir/external-debuggee-2"
+    chmod 0755 "$tmpdir/external-debuggee-2"
+    external2_path="$(cd "$tmpdir" && pwd -P)/external-debuggee-2"
+    fifo2="$tmpdir/in2.fifo"
+    stdout2_log="$tmpdir/server2.out"
+    stderr2_log="$tmpdir/server2.err"
+    mkfifo "$fifo2"
+    RUST_LOG="${RUST_LOG:-ida_mcp=info}" "$BIN" --workspace --workspace-max-workers 2 \
+      --enable-debugger --workspace-idle-timeout-secs 2 \
+      <"$fifo2" >"$stdout2_log" 2>"$stderr2_log" &
+    server2_pid=$!
+    exec 4>"$fifo2"
+    send2() { printf '%s\n' "$1" >&4; }
+    wait_response2() {
+      local id="$1" timeout="${2:-30}" elapsed=0 line
+      while ((elapsed < timeout * 10)); do
+        line="$(jq -cR "fromjson? | select(.id == $id and (has(\"result\") or has(\"error\")))" \
+          "$stdout2_log" 2>/dev/null | tail -1 || true)"
+        if [[ -n "$line" ]]; then
+          printf '%s\n' "$line"
+          return 0
+        fi
+        if ! kill -0 "$server2_pid" >/dev/null 2>&1; then
+          echo "reaper-test server exited while waiting for response id=$id" >&2
+          cat "$stderr2_log" >&2
+          return 1
+        fi
+        sleep 0.1
+        elapsed=$((elapsed + 1))
+      done
+      echo "timed out waiting for reaper-test response id=$id" >&2
+      cat "$stderr2_log" >&2
+      return 1
+    }
+
+    send2 '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"debugger-reap-test","version":"0.1"},"capabilities":{}}}'
+    wait_response2 1 30 >/dev/null
+    send2 '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+    open2_request="$(jq -cn --arg path "$tmpdir/debugger2.i64" \
+      '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$path}}}')"
+    send2 "$open2_request"
+    open2_response="$(wait_response2 2 120)"
+    assert_ok "open reaper-test database" "$open2_response"
+    reap_id="$(result_text <<<"$open2_response" | jq -r '.database_id // empty')"
+    [[ -n "$reap_id" ]] || { echo "reaper-test open returned no database_id" >&2; exit 1; }
+
+    launch2_request="$(jq -cn --arg id "$reap_id" --arg path "$external2_path" \
+      '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"debug_launch",arguments:{database_id:$id,path:$path,timeout_secs:10}}}')"
+    send2 "$launch2_request"
+    launch2_response="$(wait_response2 3 30)"
+    assert_ok "launch target for out-of-band worker death" "$launch2_response"
+    jq -e '.status == "ready"' >/dev/null \
+      <<<"$(result_text <<<"$launch2_response")" || {
+      echo "FAIL: reaper-test launch did not reach ready" >&2
+      result_text <<<"$launch2_response" >&2
+      exit 1
+    }
+    debuggee2_pid="$(ps -axo pid=,command= 2>/dev/null \
+      | awk -v target="$external2_path" '$2 == target { print $1; exit }' || true)"
+
+    worker2_pid="$(ps -axo pid=,ppid=,command= 2>/dev/null \
+      | awk -v ppid="$server2_pid" '$2 == ppid && /worker/ { print $1; exit }' || true)"
+    [[ -n "$worker2_pid" ]] || {
+      echo "could not identify the pooled worker child of the reaper-test server" >&2
+      exit 1
+    }
+    kill -KILL "$worker2_pid"
+
+    reap_seen=0
+    for _ in $(seq 1 200); do
+      if grep -q "debug-pinned worker exited out of band" "$stderr2_log" 2>/dev/null \
+        && grep -q "reaping idle workspace database" "$stderr2_log" 2>/dev/null; then
+        reap_seen=1
+        break
+      fi
+      sleep 0.1
+    done
+    [[ "$reap_seen" == "1" ]] || {
+      echo "FAIL: reaper did not clear the debug-pinned lease after out-of-band worker death" >&2
+      tail -40 "$stderr2_log" >&2
+      exit 1
+    }
+
+    status2_request="$(jq -cn --arg id "$reap_id" \
+      '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"debug_status",arguments:{database_id:$id}}}')"
+    send2 "$status2_request"
+    status2_response="$(wait_response2 4 15)"
+    jq -e '
+      .error.code == -32602 and (.error.message | contains("unknown or expired"))
+    ' >/dev/null <<<"$status2_response" || {
+      echo "FAIL: reaped database id was not invalidated" >&2
+      jq . <<<"$status2_response" >&2
+      exit 1
+    }
+    echo "   out-of-band worker death cleared the debug pin and reaped the database"
     ;;
   user_action_required)
     launch_text="$(result_text <<<"$launch_response")"

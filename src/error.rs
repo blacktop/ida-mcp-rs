@@ -101,6 +101,9 @@ pub enum ToolError {
     #[error("{DEBUGGER_START_RETAINED_PREFIX}{0}")]
     DebuggerStartRetained(String),
 
+    #[error("Debugger session lost: {0}")]
+    DebuggerSessionLost(String),
+
     #[error("Not supported: {0}")]
     NotSupported(String),
 
