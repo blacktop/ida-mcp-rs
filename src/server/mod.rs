@@ -750,25 +750,11 @@ impl IdaMcpServer {
         registry.pin(database_id)
     }
 
-    async fn set_workspace_debug_pin(&self, pinned: bool) {
-        let (Some(registry), Some(database_id)) = (
-            self.workspace_registry.as_ref(),
-            self.workspace_database_id.as_deref(),
-        ) else {
-            return;
-        };
-        if !registry.set_debug_pin(database_id, pinned).await {
-            warn!(
-                database_id,
-                pinned, "debugger workspace pin target disappeared"
-            );
-        }
-    }
-
-    async fn finish_debugger_start(&self, result: Result<Value, ToolError>) -> CallToolResult {
-        if debugger_start_retains_session(&result) {
-            self.set_workspace_debug_pin(true).await;
-        }
+    /// Shape a debugger-start outcome for the client. Workspace debug
+    /// pinning happens inside the pooled dispatch itself
+    /// (`WorkspaceDatabase::debug_start`), bound to the lease that served
+    /// the call, so no pin bookkeeping belongs here.
+    fn finish_debugger_start(result: Result<Value, ToolError>) -> CallToolResult {
         match result {
             Ok(result) => CallToolResult::success(vec![Content::text(pretty_json(&result))]),
             Err(error) => error.to_tool_result(),
@@ -2109,17 +2095,6 @@ fn parse_debug_timeout(value: Option<i64>, default: u32) -> Result<u32, ToolErro
     Ok(timeout)
 }
 
-fn debugger_start_retains_session(result: &Result<Value, ToolError>) -> bool {
-    match result {
-        Ok(value) => value
-            .get("session_retained")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        Err(ToolError::DebuggerStartRetained(_)) => true,
-        Err(_) => false,
-    }
-}
-
 fn select_runtime_module(modules: &Value, query: &str) -> Result<Value, ToolError> {
     if query.is_empty() {
         return Err(ToolError::InvalidParams(
@@ -2960,7 +2935,7 @@ impl IdaMcpServer {
                 timeout_seconds,
             )
             .await;
-        Ok(self.finish_debugger_start(result).await)
+        Ok(Self::finish_debugger_start(result))
     }
 
     #[tool(
@@ -2986,7 +2961,7 @@ impl IdaMcpServer {
             Err(error) => return Ok(error.to_tool_result()),
         };
         let result = self.worker.debug_attach(pid, timeout_seconds).await;
-        Ok(self.finish_debugger_start(result).await)
+        Ok(Self::finish_debugger_start(result))
     }
 
     #[tool(
@@ -3020,13 +2995,12 @@ impl IdaMcpServer {
             Ok(timeout) => timeout,
             Err(error) => return Ok(error.to_tool_result()),
         };
+        // Workspace debug-pin release happens inside the pooled debug_stop
+        // dispatch, bound to the lease that served it.
         match self.worker.debug_stop(action, timeout_seconds).await {
-            Ok(result) => {
-                self.set_workspace_debug_pin(false).await;
-                Ok(CallToolResult::success(vec![Content::text(pretty_json(
-                    &result,
-                ))]))
-            }
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &result,
+            ))])),
             Err(error) => Ok(error.to_tool_result()),
         }
     }
@@ -6949,8 +6923,8 @@ mod tests {
     use crate::server::{
         add_workspace_database_id_schema, add_workspace_schema, apply_close_metadata,
         apply_task_update, attach_workspace_database_id, call_tool_result_to_value,
-        checked_runtime_slide, close_hint_for, debugger_start_retains_session, dsc_open_plan,
-        is_sessionless_request_meta, materialize_task_response, normalize_schema_value,
+        checked_runtime_slide, close_hint_for, dsc_open_plan, is_sessionless_request_meta,
+        materialize_task_response, normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
         run_script_truncate_chars, select_runtime_module, supported_protocol_versions, task,
@@ -7600,28 +7574,6 @@ mod tests {
         );
         assert!(select_runtime_module(&modules, "libsame.dylib").is_err());
         assert!(select_runtime_module(&modules, "missing.dylib").is_err());
-    }
-
-    #[test]
-    fn debugger_start_pins_whenever_worker_retains_ownership() {
-        assert!(debugger_start_retains_session(&Ok(json!({
-            "status": "ready",
-            "session_retained": true
-        }))));
-        assert!(debugger_start_retains_session(&Ok(json!({
-            "status": "user_action_required",
-            "session_retained": true
-        }))));
-        assert!(!debugger_start_retains_session(&Ok(json!({
-            "status": "user_action_required",
-            "session_retained": false
-        }))));
-        assert!(debugger_start_retains_session(&Err(
-            ToolError::DebuggerStartRetained("initial wait failed".to_string())
-        )));
-        assert!(!debugger_start_retains_session(&Err(ToolError::IdaError(
-            "start failed before process creation".to_string()
-        ))));
     }
 
     #[test]

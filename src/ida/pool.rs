@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -822,12 +822,6 @@ pub struct WorkspaceDatabase {
     handle: Arc<Mutex<Option<PooledDatabaseLease>>>,
     next_database_generation: AtomicU64,
     runtime: Option<Handle>,
-    /// Lifecycle invariant I1: a debug pin never outlives the worker lease it
-    /// was set for. The pin lives here — beside the lease — so the one method
-    /// that unbinds a lost worker ([`Self::clear_handle_if_worker`]) also
-    /// clears it, keeping the idle reaper from skipping a database whose
-    /// debugger session died with its worker.
-    debug_pinned: AtomicBool,
 }
 
 /// Routes opaque database IDs to pooled worker leases.
@@ -840,12 +834,16 @@ pub struct WorkspaceDatabase {
 /// retirement path, pin, or lease state) must say which invariant covers it
 /// or add one — with a test — rather than rely on review to notice the gap.
 ///
-/// - **I1 — pin follows lease:** a debug pin never outlives the worker lease
-///   it was set for, and every pin write serializes with lease transitions
-///   under the handle mutex. Enforced by
-///   [`WorkspaceDatabase::clear_handle_if_worker`] (clear is atomic with the
-///   lease change) and [`WorkspaceDatabase::set_debug_pinned`]; test
-///   `debug_pin_survives_unrelated_worker_loss`.
+/// - **I1 — pin is lease state:** the debug pin is a field of
+///   [`PooledDatabaseLease`], so it structurally cannot outlive the worker or
+///   database generation that produced it, and it is applied only by
+///   `WorkspaceDatabase::set_debug_pin_for_lease`, which re-checks the
+///   dispatching (worker, generation) pair under the lease mutex — a stale
+///   start completion pins nothing. The reaper reads it via `try_lock`
+///   (`debug_pin_blocks_reap`), treating contention as busy, so no
+///   cross-atomic memory-ordering contract is needed; tests
+///   `debug_pin_cannot_exist_without_its_lease` and
+///   `debug_start_pins_whenever_worker_retains_ownership`.
 /// - **I2 — pins block reaping:** an entry with active calls, task pins, or a
 ///   debug pin is never idle-reaped. Enforced by the [`workspace_reaper`]
 ///   filter; test `workspace_idle_reaper_respects_every_lifetime_guard`.
@@ -917,6 +915,34 @@ pub enum PooledDatabaseBinding {
 struct PooledDatabaseLease {
     handle: PooledWorkerHandle,
     generation: DatabaseGeneration,
+    /// Invariant I1: the debug pin lives inside the lease it protects, so it
+    /// structurally cannot outlive the worker or database generation that
+    /// produced it — releasing or replacing the lease erases the pin with it.
+    /// It is applied only through [`WorkspaceDatabase::set_debug_pin_for_lease`],
+    /// which re-checks the dispatching (worker, generation) pair under this
+    /// same mutex.
+    debug_pinned: bool,
+}
+
+/// A child-tool outcome plus the lease that served it, kept even for failed
+/// calls so debugger completions can bind pin decisions to their ownership.
+struct DispatchedCall {
+    result: Result<CallToolResult, ToolError>,
+    lease: Option<(usize, DatabaseGeneration)>,
+}
+
+/// Whether a debugger start left the child owning a live process: a `ready`
+/// result, a `user_action_required` result whose process survived, or the
+/// dedicated retained-start error all report it explicitly.
+fn debug_start_retains_session(result: &Result<Value, ToolError>) -> bool {
+    match result {
+        Ok(value) => value
+            .get("session_retained")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        Err(ToolError::DebuggerStartRetained(_)) => true,
+        Err(_) => false,
+    }
 }
 
 impl WorkspaceRegistry {
@@ -1014,22 +1040,6 @@ impl WorkspaceRegistry {
         Some(WorkspacePin { entry })
     }
 
-    pub async fn set_debug_pin(&self, database_id: &str, pinned: bool) -> bool {
-        let database = {
-            let entries = self.entries();
-            let Some(entry) = entries.get(database_id) else {
-                return false;
-            };
-            // Touch before clearing the pin while the registry remains
-            // locked, so the reaper cannot observe an unpinned entry with
-            // stale idle time.
-            entry.touch();
-            entry.database.clone()
-        };
-        database.set_debug_pinned(pinned).await;
-        true
-    }
-
     pub async fn close_database(&self, database_id: &str) -> Result<(), ToolError> {
         let database = self.remove(database_id).ok_or_else(|| {
             ToolError::InvalidParams(format!("unknown database_id: {database_id}"))
@@ -1086,7 +1096,7 @@ async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duratio
                     !entry.legacy
                         && entry.active_calls.load(Ordering::Relaxed) == 0
                         && entry.pins.load(Ordering::Relaxed) == 0
-                        && !entry.database.debug_pinned()
+                        && !entry.database.debug_pin_blocks_reap()
                         && entry.idle_for() >= inner.idle_timeout
                 })
                 .map(|(id, _)| id.clone())
@@ -1181,22 +1191,38 @@ impl WorkspaceDatabase {
             handle: Arc::new(Mutex::new(None)),
             next_database_generation: AtomicU64::new(0),
             runtime: Handle::try_current().ok(),
-            debug_pinned: AtomicBool::new(false),
         }
     }
 
-    /// Every pin write serializes with lease transitions under the handle
-    /// mutex, so losing a worker can never race a pin set for the lease that
-    /// replaced it (invariant I1). Reads stay lock-free: the reaper's
-    /// snapshot is safe because a pin is only ever set inside a tool call,
-    /// whose `active_calls` guard already blocks reaping.
-    pub async fn set_debug_pinned(&self, pinned: bool) {
-        let _guard = self.handle.lock().await;
-        self.debug_pinned.store(pinned, Ordering::Relaxed);
+    /// Apply a debug-pin decision produced by a debugger call dispatched on
+    /// `lease` (worker id, database generation). The pin mutates only while
+    /// that exact lease is still installed, so a completion whose worker was
+    /// lost or whose database was replaced applies nothing (invariant I1).
+    async fn set_debug_pin_for_lease(
+        &self,
+        lease: (usize, DatabaseGeneration),
+        pinned: bool,
+    ) -> bool {
+        let mut guard = self.handle.lock().await;
+        let Some(current) = guard.as_mut() else {
+            return false;
+        };
+        if current.handle.worker_id != lease.0 || current.generation != lease.1 {
+            return false;
+        }
+        current.debug_pinned = pinned;
+        true
     }
 
-    pub fn debug_pinned(&self) -> bool {
-        self.debug_pinned.load(Ordering::Relaxed)
+    /// Reaper-side pin check. `try_lock` keeps the read consistent with
+    /// lease state without a cross-atomic ordering contract; a contended
+    /// lock means the database is mid-operation, which the reaper must treat
+    /// as busy anyway.
+    fn debug_pin_blocks_reap(&self) -> bool {
+        match self.handle.try_lock() {
+            Ok(guard) => guard.as_ref().is_some_and(|lease| lease.debug_pinned),
+            Err(_) => true,
+        }
     }
 
     fn next_database_generation(&self) -> Result<DatabaseGeneration, ToolError> {
@@ -1226,6 +1252,7 @@ impl WorkspaceDatabase {
         *guard = Some(PooledDatabaseLease {
             handle: handle.clone(),
             generation,
+            debug_pinned: false,
         });
         Ok((handle, generation, true))
     }
@@ -1240,11 +1267,11 @@ impl WorkspaceDatabase {
     async fn required_handle_for_generation(
         &self,
         expected_generation: Option<DatabaseGeneration>,
-    ) -> Result<PooledWorkerHandle, ToolError> {
+    ) -> Result<(PooledWorkerHandle, DatabaseGeneration), ToolError> {
         let guard = self.handle.lock().await;
         let lease = guard.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
         require_lease_generation(lease.generation, expected_generation)?;
-        Ok(lease.handle.clone())
+        Ok((lease.handle.clone(), lease.generation))
     }
 
     async fn take_handle(&self) -> Option<PooledDatabaseLease> {
@@ -1263,13 +1290,9 @@ impl WorkspaceDatabase {
             .as_ref()
             .is_some_and(|lease| lease.handle.worker_id == worker_id)
         {
+            // The debug pin lives inside the lease, so dropping the lease
+            // erases it structurally (invariant I1) — no separate cleanup.
             *guard = None;
-            // A debugger session lives inside the lost child process, so it
-            // cannot survive the worker. Clearing the pin while the lease
-            // mutex is still held keeps this atomic with the lease change: a
-            // pin set for a replacement lease can never be clobbered here
-            // (invariant I1).
-            self.debug_pinned.store(false, Ordering::Relaxed);
         }
     }
 
@@ -1283,14 +1306,47 @@ impl WorkspaceDatabase {
         cancel: Option<CancellationToken>,
         expected_generation: Option<DatabaseGeneration>,
     ) -> Result<CallToolResult, ToolError> {
-        let handle = self
+        self.dispatch_result_for_generation(tool, args, timeout_secs, cancel, expected_generation)
+            .await
+            .result
+    }
+
+    /// Like [`Self::call_result_for_generation`], but also reports which
+    /// lease (worker id, database generation) served the call — even when the
+    /// call itself failed — so debugger completions can bind their pin
+    /// decision to the exact ownership that produced them (invariant I1).
+    async fn dispatch_result_for_generation(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_secs: Option<u64>,
+        cancel: Option<CancellationToken>,
+        expected_generation: Option<DatabaseGeneration>,
+    ) -> DispatchedCall {
+        let (handle, generation) = match self
             .required_handle_for_generation(expected_generation)
-            .await?;
-        let timeout = self.pool.worker_op_timeout(timeout_secs);
-        match handle
-            .call_tool(tool, remote::json_object(args)?, timeout, cancel)
             .await
         {
+            Ok(dispatched) => dispatched,
+            Err(err) => {
+                return DispatchedCall {
+                    result: Err(err),
+                    lease: None,
+                };
+            }
+        };
+        let lease = Some((handle.worker_id, generation));
+        let args = match remote::json_object(args) {
+            Ok(args) => args,
+            Err(err) => {
+                return DispatchedCall {
+                    result: Err(err),
+                    lease,
+                };
+            }
+        };
+        let timeout = self.pool.worker_op_timeout(timeout_secs);
+        let result = match handle.call_tool(tool, args, timeout, cancel).await {
             Ok(result) => {
                 if let Some(err) = remote::result_error(&result, tool) {
                     if child_tool_error_retires_worker(tool, &err) {
@@ -1299,15 +1355,17 @@ impl WorkspaceDatabase {
                         self.pool.mark_dead(&handle.slot).await;
                         retire_guard.disarm();
                     }
-                    return Err(err);
+                    Err(err)
+                } else {
+                    Ok(result)
                 }
-                Ok(result)
             }
             Err(err) => {
                 self.clear_handle_if_worker(handle.worker_id).await;
                 Err(err)
             }
-        }
+        };
+        DispatchedCall { result, lease }
     }
 
     async fn call_json<T: DeserializeOwned>(
@@ -1549,7 +1607,7 @@ impl WorkspaceDatabase {
         start_directory: Option<String>,
         timeout_seconds: u32,
     ) -> Result<Value, ToolError> {
-        self.call_value(
+        self.debug_start(
             "debug_launch",
             json!({
                 "path": path,
@@ -1557,20 +1615,64 @@ impl WorkspaceDatabase {
                 "start_directory": start_directory,
                 "timeout_secs": timeout_seconds,
             }),
-            Some(u64::from(timeout_seconds).saturating_add(5)),
-            None,
+            timeout_seconds,
         )
         .await
     }
 
     pub async fn debug_attach(&self, pid: u32, timeout_seconds: u32) -> Result<Value, ToolError> {
-        self.call_value(
+        self.debug_start(
             "debug_attach",
             json!({ "pid": pid, "timeout_secs": timeout_seconds }),
-            Some(u64::from(timeout_seconds).saturating_add(5)),
-            None,
+            timeout_seconds,
         )
         .await
+    }
+
+    /// Dispatch a debugger start and pin this database while the child owns a
+    /// live process. The pin is applied against the exact lease that served
+    /// the call, so a completion that raced worker loss or a database
+    /// replacement pins nothing (invariant I1) — the session it reports died
+    /// with its worker.
+    async fn debug_start(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_seconds: u32,
+    ) -> Result<Value, ToolError> {
+        let dispatched = self
+            .dispatch_result_for_generation(
+                tool,
+                args,
+                Some(u64::from(timeout_seconds).saturating_add(5)),
+                None,
+                None,
+            )
+            .await;
+        let result = dispatched
+            .result
+            .and_then(|result| remote::parse_value(result, tool));
+        if debug_start_retains_session(&result) {
+            match dispatched.lease {
+                Some(lease) => {
+                    if !self.set_debug_pin_for_lease(lease, true).await {
+                        warn!(
+                            session_id = %self.session_id,
+                            tool,
+                            "retained debugger session lost its lease before pinning; \
+                             the session ended with its worker"
+                        );
+                    }
+                }
+                None => {
+                    warn!(
+                        session_id = %self.session_id,
+                        tool, "retained debugger session has no dispatch lease to pin"
+                    );
+                }
+            }
+        }
+        result
     }
 
     pub async fn debug_modules(&self) -> Result<Value, ToolError> {
@@ -1588,13 +1690,27 @@ impl WorkspaceDatabase {
         action: DebugStopAction,
         timeout_seconds: u32,
     ) -> Result<Value, ToolError> {
-        self.call_value(
-            "debug_stop",
-            json!({ "action": action.as_str(), "timeout_secs": timeout_seconds }),
-            Some(u64::from(timeout_seconds).saturating_add(5)),
-            None,
-        )
-        .await
+        let dispatched = self
+            .dispatch_result_for_generation(
+                "debug_stop",
+                json!({ "action": action.as_str(), "timeout_secs": timeout_seconds }),
+                Some(u64::from(timeout_seconds).saturating_add(5)),
+                None,
+                None,
+            )
+            .await;
+        let result = dispatched
+            .result
+            .and_then(|result| remote::parse_value(result, "debug_stop"));
+        // A successful stop ended ownership for the lease that served it; a
+        // failed stop keeps the session (and its pin) fail-closed. A stale
+        // lease needs no clearing — its pin died with it.
+        if result.is_ok()
+            && let Some(lease) = dispatched.lease
+        {
+            let _ = self.set_debug_pin_for_lease(lease, false).await;
+        }
+        result
     }
 
     pub async fn analysis_status(&self) -> Result<AnalysisStatus, ToolError> {
@@ -2808,10 +2924,11 @@ fn log_stderr_line(worker_id: usize, line: &[u8]) {
 mod tests {
     use crate::error::ToolError;
     use crate::ida::pool::{
-        analyze_funcs_child_args, child_tool_error_retires_worker, extract_first_matches,
-        find_bytes_child_args, lumina_apply_child_args, open_error_releases_lease,
-        open_idb_child_args, release_error_retires_worker, require_lease_generation,
-        run_script_child_args, search_child_args, WorkerPool, WorkerPoolConfig, WorkspaceRegistry,
+        analyze_funcs_child_args, child_tool_error_retires_worker, debug_start_retains_session,
+        extract_first_matches, find_bytes_child_args, lumina_apply_child_args,
+        open_error_releases_lease, open_idb_child_args, release_error_retires_worker,
+        require_lease_generation, run_script_child_args, search_child_args, WorkerPool,
+        WorkerPoolConfig, WorkspaceRegistry,
     };
     use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget};
     use crate::ida::worker::DEBUG_MODULES_TIMEOUT_SECS;
@@ -2856,10 +2973,6 @@ mod tests {
         assert_eq!(first_entry.pins.load(Ordering::Relaxed), 1);
         drop(pin);
         assert_eq!(first_entry.pins.load(Ordering::Relaxed), 0);
-        assert!(registry.set_debug_pin(&first_id, true).await);
-        assert!(first_entry.database.debug_pinned());
-        assert!(registry.set_debug_pin(&first_id, false).await);
-        assert!(!first_entry.database.debug_pinned());
         drop(acquired);
         assert_eq!(first_entry.active_calls.load(Ordering::Relaxed), 0);
 
@@ -2894,10 +3007,13 @@ mod tests {
             .expect("allocated database can be pinned");
         drop(pinned);
 
-        let debug_pinned = registry.allocate_database();
-        let debug_pinned_id = debug_pinned.database_id().to_string();
-        assert!(registry.set_debug_pin(&debug_pinned_id, true).await);
-        drop(debug_pinned);
+        // A held handle mutex stands in for a live debugger dispatch: the
+        // reaper's try_lock read must treat contention as pinned/busy.
+        let debug_busy = registry.allocate_database();
+        let debug_busy_id = debug_busy.database_id().to_string();
+        let debug_busy_database = debug_busy.database();
+        let debug_busy_guard = debug_busy_database.handle.lock().await;
+        drop(debug_busy);
 
         let legacy = registry.bind_legacy("legacy-reaper-test".to_string());
         let legacy_id = legacy.database_id.clone();
@@ -2912,43 +3028,72 @@ mod tests {
             assert!(!entries.contains_key(&idle_id));
             assert!(entries.contains_key(&active_id));
             assert!(entries.contains_key(&pinned_id));
-            assert!(entries.contains_key(&debug_pinned_id));
+            assert!(entries.contains_key(&debug_busy_id));
             assert!(entries.contains_key(&legacy_id));
         }
 
         drop(active);
         drop(pin);
-        assert!(registry.set_debug_pin(&debug_pinned_id, false).await);
+        drop(debug_busy_guard);
         drop(legacy);
         registry.shutdown().await;
     }
 
-    /// Lifecycle invariant I1: pin writes serialize with lease transitions
-    /// under the handle mutex, and worker loss for a database with no bound
-    /// lease leaves an unrelated pin alone. The lost-lease clear itself is a
-    /// single locked block in `clear_handle_if_worker`; exercising it end to
-    /// end requires a live pooled worker (covered by the debugger
-    /// integration tests).
+    /// Lifecycle invariant I1: a debug pin exists only inside a worker lease,
+    /// so it structurally cannot outlive the ownership that produced it. A
+    /// pin decision from a dispatch whose lease is gone applies nothing, a
+    /// lease-less database never reports a blocking pin, and a contended
+    /// lease mutex reads as busy. The matching-lease apply path needs a live
+    /// pooled worker and is covered by the debugger integration tests.
     #[tokio::test]
-    async fn debug_pin_survives_unrelated_worker_loss() {
+    async fn debug_pin_cannot_exist_without_its_lease() {
         let registry = WorkspaceRegistry::new(test_pool(2), Duration::from_secs(300));
         let lease = registry.allocate_database();
-        let database_id = lease.database_id().to_string();
         let database = lease.database();
 
-        assert!(registry.set_debug_pin(&database_id, true).await);
-        assert!(database.debug_pinned());
+        // A completion for a lease that no longer exists applies nothing.
+        assert!(
+            !database
+                .set_debug_pin_for_lease((7, DatabaseGeneration(1)), true)
+                .await
+        );
+        assert!(!database.debug_pin_blocks_reap());
 
-        // No lease is installed, so an arbitrary worker retirement must not
-        // touch this database's pin.
+        // Worker loss with no lease installed is a no-op, not a panic.
         database.clear_handle_if_worker(7).await;
-        assert!(database.debug_pinned());
+        assert!(!database.debug_pin_blocks_reap());
 
-        assert!(registry.set_debug_pin(&database_id, false).await);
-        assert!(!database.debug_pinned());
+        // A contended lease mutex reads as busy rather than unpinned.
+        let guard = database.handle.lock().await;
+        assert!(database.debug_pin_blocks_reap());
+        drop(guard);
 
         drop(lease);
         registry.shutdown().await;
+    }
+
+    /// Ownership signals that must pin: an explicit `session_retained`
+    /// result or the dedicated retained-start error, and nothing else.
+    #[test]
+    fn debug_start_pins_whenever_worker_retains_ownership() {
+        assert!(debug_start_retains_session(&Ok(json!({
+            "status": "ready",
+            "session_retained": true
+        }))));
+        assert!(debug_start_retains_session(&Ok(json!({
+            "status": "user_action_required",
+            "session_retained": true
+        }))));
+        assert!(!debug_start_retains_session(&Ok(json!({
+            "status": "user_action_required",
+            "session_retained": false
+        }))));
+        assert!(debug_start_retains_session(&Err(
+            ToolError::DebuggerStartRetained("initial wait failed".to_string())
+        )));
+        assert!(!debug_start_retains_session(&Err(ToolError::IdaError(
+            "start failed before process creation".to_string()
+        ))));
     }
 
     #[test]
