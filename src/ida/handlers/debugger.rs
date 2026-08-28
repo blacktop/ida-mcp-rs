@@ -138,6 +138,16 @@ impl Drop for DebuggerRuntime {
 }
 
 impl DebuggerRuntime {
+    fn ensure_start_allowed(&self) -> Result<(), ToolError> {
+        if self.session.is_some() {
+            return Err(ToolError::InvalidParams(
+                "a debugger session is already active; call debug_stop before starting another"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn session_kind(&self) -> Result<DebugSessionKind, ToolError> {
         self.session.ok_or_else(|| {
             ToolError::InvalidParams(
@@ -156,10 +166,12 @@ impl DebuggerRuntime {
         &mut self,
         session: DebugSessionKind,
         process_state: DebuggerProcessState,
-    ) {
-        if !matches!(process_state, DebuggerProcessState::NoProcess) {
+    ) -> bool {
+        let retained = !matches!(process_state, DebuggerProcessState::NoProcess);
+        if retained && self.session.is_none() {
             self.session = Some(session);
         }
+        retained
     }
 
     fn ensure_backend(&mut self, database: &IDB) -> Result<&'static str, ToolError> {
@@ -383,26 +395,29 @@ pub fn launch(
 ) -> Result<Value, ToolError> {
     validate_timeout(timeout_seconds)?;
     let database = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    runtime.ensure_start_allowed()?;
     let backend = runtime.ensure_backend(database)?;
     match database.debugger_launch(path, arguments, start_directory, timeout_seconds) {
         Ok(event_code) => {
             runtime.session = Some(DebugSessionKind::Launched);
-            Ok(session_result(database, backend, "ready", event_code, None))
+            Ok(start_session_result(database, backend, event_code))
         }
         Err(error) => {
             let process_state = database.debugger_process_state();
-            runtime.retain_session_after_start_error(DebugSessionKind::Launched, process_state);
+            let retained =
+                runtime.retain_session_after_start_error(DebugSessionKind::Launched, process_state);
             if cfg!(target_os = "macos") && macos_authorization_failure(&error.to_string()) {
                 return Ok(json!({
                     "status": "user_action_required",
                     "platform": "macos",
                     "backend": backend,
                     "process_state": process_state_name(process_state),
+                    "session_retained": retained,
                     "message": "macOS denied or cancelled task control. Complete IDA's Take Control authorization for this login, then retry. ida-mcp will not request root, disable SIP, change authorizationdb, or re-sign binaries.",
                     "error": error.to_string(),
                 }));
             }
-            Err(debugger_error(error))
+            Err(start_error(error, retained))
         }
     }
 }
@@ -415,26 +430,29 @@ pub fn attach(
 ) -> Result<Value, ToolError> {
     validate_timeout(timeout_seconds)?;
     let database = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+    runtime.ensure_start_allowed()?;
     let backend = runtime.ensure_backend(database)?;
     match database.debugger_attach(pid, timeout_seconds) {
         Ok(event_code) => {
             runtime.session = Some(DebugSessionKind::Attached);
-            Ok(session_result(database, backend, "ready", event_code, None))
+            Ok(start_session_result(database, backend, event_code))
         }
         Err(error) => {
             let process_state = database.debugger_process_state();
-            runtime.retain_session_after_start_error(DebugSessionKind::Attached, process_state);
+            let retained =
+                runtime.retain_session_after_start_error(DebugSessionKind::Attached, process_state);
             if cfg!(target_os = "macos") && macos_authorization_failure(&error.to_string()) {
                 return Ok(json!({
                     "status": "user_action_required",
                     "platform": "macos",
                     "backend": backend,
                     "process_state": process_state_name(process_state),
+                    "session_retained": retained,
                     "message": "macOS denied task attachment. Complete IDA's Take Control authorization for this login, then retry.",
                     "error": error.to_string(),
                 }));
             }
-            Err(debugger_error(error))
+            Err(start_error(error, retained))
         }
     }
 }
@@ -544,6 +562,12 @@ fn session_result(
     result
 }
 
+fn start_session_result(database: &IDB, backend: &str, event_code: i32) -> Value {
+    let mut result = session_result(database, backend, "ready", event_code, None);
+    result["session_retained"] = json!(true);
+    result
+}
+
 fn process_state_name(state: DebuggerProcessState) -> String {
     match state {
         DebuggerProcessState::Suspended => "suspended".to_string(),
@@ -555,6 +579,15 @@ fn process_state_name(state: DebuggerProcessState) -> String {
 
 fn debugger_error(error: idalib::IDAError) -> ToolError {
     ToolError::IdaError(format!("IDA debugger operation failed: {error}"))
+}
+
+fn start_error(error: idalib::IDAError, session_retained: bool) -> ToolError {
+    let error = debugger_error(error);
+    if session_retained {
+        ToolError::DebuggerStartRetained(error.to_string())
+    } else {
+        error
+    }
 }
 
 fn macos_authorization_failure(message: &str) -> bool {
@@ -619,6 +652,7 @@ fn find_macos_helper<'a>(ida_dirs: impl IntoIterator<Item = &'a Path>) -> Option
 mod tests {
     use idalib::meta::FileType;
 
+    use crate::error::ToolError;
     use crate::ida::handlers::debugger::{
         debugger_backend_for_target, macos_authorization_failure, DebugSessionKind,
         DebuggerRuntime, TargetArchitecture,
@@ -651,27 +685,44 @@ mod tests {
     #[test]
     fn active_process_retains_ownership_after_initial_wait_error() {
         let mut launched = DebuggerRuntime::default();
-        launched.retain_session_after_start_error(
+        assert!(launched.retain_session_after_start_error(
             DebugSessionKind::Launched,
             idalib::debugger::DebuggerProcessState::Running,
-        );
+        ));
         assert_eq!(launched.session, Some(DebugSessionKind::Launched));
 
         let mut attached = DebuggerRuntime::default();
-        attached.retain_session_after_start_error(
+        assert!(attached.retain_session_after_start_error(
             DebugSessionKind::Attached,
             idalib::debugger::DebuggerProcessState::Suspended,
-        );
+        ));
         assert_eq!(attached.session, Some(DebugSessionKind::Attached));
+    }
+
+    #[test]
+    fn second_start_is_rejected_without_changing_ownership() {
+        let mut runtime = DebuggerRuntime::default();
+        runtime.session = Some(DebugSessionKind::Attached);
+
+        let error = runtime
+            .ensure_start_allowed()
+            .expect_err("an active session must reject another start");
+        assert!(matches!(error, ToolError::InvalidParams(_)));
+
+        assert!(runtime.retain_session_after_start_error(
+            DebugSessionKind::Launched,
+            idalib::debugger::DebuggerProcessState::Running,
+        ));
+        assert_eq!(runtime.session, Some(DebugSessionKind::Attached));
     }
 
     #[test]
     fn no_process_does_not_claim_ownership_after_start_error() {
         let mut runtime = DebuggerRuntime::default();
-        runtime.retain_session_after_start_error(
+        assert!(!runtime.retain_session_after_start_error(
             DebugSessionKind::Launched,
             idalib::debugger::DebuggerProcessState::NoProcess,
-        );
+        ));
         assert_eq!(runtime.session, None);
     }
 

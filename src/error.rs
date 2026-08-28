@@ -6,6 +6,9 @@
 use rmcp::model::{CallToolResult, ContentBlock as Content};
 use thiserror::Error;
 
+pub(crate) const DEBUGGER_START_RETAINED_PREFIX: &str =
+    "Debugger start incomplete; active session retained: ";
+
 /// Tool execution errors - returned with is_error: true in CallToolResult
 #[derive(Error, Debug)]
 pub enum ToolError {
@@ -94,6 +97,9 @@ pub enum ToolError {
 
     #[error("Debugger teardown incomplete: {0}")]
     DebuggerTeardown(String),
+
+    #[error("{DEBUGGER_START_RETAINED_PREFIX}{0}")]
+    DebuggerStartRetained(String),
 
     #[error("Not supported: {0}")]
     NotSupported(String),

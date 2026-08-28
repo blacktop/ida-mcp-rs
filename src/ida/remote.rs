@@ -1,6 +1,6 @@
 //! Helpers for calling a child `ida-mcp worker` over MCP stdio.
 
-use crate::error::ToolError;
+use crate::error::{ToolError, DEBUGGER_START_RETAINED_PREFIX};
 use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject};
 use rmcp::service::{Peer, RoleClient};
 use serde::de::DeserializeOwned;
@@ -83,6 +83,9 @@ pub(crate) fn result_error(result: &CallToolResult, tool: &str) -> Option<ToolEr
 }
 
 fn classify_child_error(message: String) -> ToolError {
+    if let Some(detail) = message.strip_prefix(DEBUGGER_START_RETAINED_PREFIX) {
+        return ToolError::DebuggerStartRetained(detail.to_string());
+    }
     let lowered = message.to_ascii_lowercase();
     if lowered.contains("worker channel closed") {
         return ToolError::WorkerClosed;
@@ -211,6 +214,19 @@ mod tests {
 
         assert!(
             matches!(err, ToolError::DebuggerTeardown(message) if message.contains("timed out"))
+        );
+    }
+
+    #[test]
+    fn parse_value_preserves_retained_debugger_start_errors() {
+        let result =
+            ToolError::DebuggerStartRetained("initial wait cancelled".to_string()).to_tool_result();
+
+        let err = parse_value(result, "debug_launch")
+            .expect_err("retained debugger ownership must remain typed");
+
+        assert!(
+            matches!(err, ToolError::DebuggerStartRetained(message) if message.contains("cancelled"))
         );
     }
 

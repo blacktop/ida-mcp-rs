@@ -723,6 +723,16 @@ impl IdaMcpServer {
         }
     }
 
+    fn finish_debugger_start(&self, result: Result<Value, ToolError>) -> CallToolResult {
+        if debugger_start_retains_session(&result) {
+            self.set_workspace_debug_pin(true);
+        }
+        match result {
+            Ok(result) => CallToolResult::success(vec![Content::text(pretty_json(&result))]),
+            Err(error) => error.to_tool_result(),
+        }
+    }
+
     fn workspace_task_key(&self, key: &str) -> String {
         match self.workspace_database_id.as_deref() {
             Some(database_id) => format!("{database_id}:{key}"),
@@ -2057,6 +2067,17 @@ fn parse_debug_timeout(value: Option<i64>, default: u32) -> Result<u32, ToolErro
     Ok(timeout)
 }
 
+fn debugger_start_retains_session(result: &Result<Value, ToolError>) -> bool {
+    match result {
+        Ok(value) => value
+            .get("session_retained")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        Err(ToolError::DebuggerStartRetained(_)) => true,
+        Err(_) => false,
+    }
+}
+
 fn select_runtime_module(modules: &Value, query: &str) -> Result<Value, ToolError> {
     if query.is_empty() {
         return Err(ToolError::InvalidParams(
@@ -2888,7 +2909,7 @@ impl IdaMcpServer {
             Ok(timeout) => timeout,
             Err(error) => return Ok(error.to_tool_result()),
         };
-        match self
+        let result = self
             .worker
             .debug_launch(
                 &expanded.display().to_string(),
@@ -2896,18 +2917,8 @@ impl IdaMcpServer {
                 start_directory.map(|path| path.display().to_string()),
                 timeout_seconds,
             )
-            .await
-        {
-            Ok(result) => {
-                if result.get("status").and_then(Value::as_str) == Some("ready") {
-                    self.set_workspace_debug_pin(true);
-                }
-                Ok(CallToolResult::success(vec![Content::text(pretty_json(
-                    &result,
-                ))]))
-            }
-            Err(error) => Ok(error.to_tool_result()),
-        }
+            .await;
+        Ok(self.finish_debugger_start(result))
     }
 
     #[tool(
@@ -2932,17 +2943,8 @@ impl IdaMcpServer {
             Ok(timeout) => timeout,
             Err(error) => return Ok(error.to_tool_result()),
         };
-        match self.worker.debug_attach(pid, timeout_seconds).await {
-            Ok(result) => {
-                if result.get("status").and_then(Value::as_str) == Some("ready") {
-                    self.set_workspace_debug_pin(true);
-                }
-                Ok(CallToolResult::success(vec![Content::text(pretty_json(
-                    &result,
-                ))]))
-            }
-            Err(error) => Ok(error.to_tool_result()),
-        }
+        let result = self.worker.debug_attach(pid, timeout_seconds).await;
+        Ok(self.finish_debugger_start(result))
     }
 
     #[tool(
@@ -6886,8 +6888,8 @@ mod tests {
     use crate::server::{
         add_workspace_database_id_schema, add_workspace_schema, apply_close_metadata,
         apply_task_update, attach_workspace_database_id, call_tool_result_to_value,
-        checked_runtime_slide, close_hint_for, dsc_open_plan, is_sessionless_request_meta,
-        materialize_task_response, normalize_schema_value,
+        checked_runtime_slide, close_hint_for, debugger_start_retains_session, dsc_open_plan,
+        is_sessionless_request_meta, materialize_task_response, normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
         run_script_truncate_chars, select_runtime_module, supported_protocol_versions, task,
@@ -7486,6 +7488,28 @@ mod tests {
         );
         assert!(select_runtime_module(&modules, "libsame.dylib").is_err());
         assert!(select_runtime_module(&modules, "missing.dylib").is_err());
+    }
+
+    #[test]
+    fn debugger_start_pins_whenever_worker_retains_ownership() {
+        assert!(debugger_start_retains_session(&Ok(json!({
+            "status": "ready",
+            "session_retained": true
+        }))));
+        assert!(debugger_start_retains_session(&Ok(json!({
+            "status": "user_action_required",
+            "session_retained": true
+        }))));
+        assert!(!debugger_start_retains_session(&Ok(json!({
+            "status": "user_action_required",
+            "session_retained": false
+        }))));
+        assert!(debugger_start_retains_session(&Err(
+            ToolError::DebuggerStartRetained("initial wait failed".to_string())
+        )));
+        assert!(!debugger_start_retains_session(&Err(ToolError::IdaError(
+            "start failed before process creation".to_string()
+        ))));
     }
 
     #[test]

@@ -146,6 +146,19 @@ ready=0
 case "$launch_status" in
   ready)
     ready=1
+    second_start_request="$(jq -cn --arg id "$source_id" \
+      '{jsonrpc:"2.0",id:17,method:"tools/call",params:{name:"debug_attach",arguments:{database_id:$id,pid:2000000000,timeout_secs:5}}}')"
+    send "$second_start_request"
+    second_start_response="$(wait_response 17 15)"
+    jq -e '
+      .result.isError == true
+      and (.result.content[0].text | contains("debugger session is already active"))
+    ' >/dev/null <<<"$second_start_response" || {
+      echo "FAIL: a second debugger start was not rejected before changing ownership" >&2
+      jq . <<<"$second_start_response" >&2
+      exit 1
+    }
+
     modules_request="$(jq -cn --arg id "$source_id" \
       '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"debug_modules",arguments:{database_id:$id}}}')"
     send "$modules_request"
