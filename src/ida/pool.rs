@@ -852,6 +852,18 @@ impl PooledWorkerHandle {
 
         match result {
             Ok(Ok(result)) => {
+                if tracks_open
+                    && let Some(err) = remote::result_error(&result, tool)
+                    && unsettled_open_error_retires_worker(&err)
+                {
+                    // A timeout/cancellation response bounds the caller's
+                    // wait, not the native IDA open. Keep the pre-dispatch
+                    // artifact snapshot attached while retirement settles
+                    // the child and cleans only this generation's output.
+                    self.pool.mark_dead(&self.slot).await;
+                    retire_guard.disarm();
+                    return Err(err);
+                }
                 if tracks_open {
                     let mut child = self.slot.child.lock().await;
                     child.pending_open_artifacts = None;
@@ -968,6 +980,10 @@ pub struct WorkspaceDatabase {
 ///   retirement cleans only artifacts protected by the killed worker's exact
 ///   output lock. Enforced by `open_dispatch_tracks_the_effective_output_before_child_dispatch`,
 ///   the database artifact-cleanup tests, and `test-pool-second-open`.
+///   Timeout, cancellation, and closed-worker error responses do not prove
+///   the native open settled: they retire the child with its artifact
+///   snapshot intact. Enforced by `unsettled_open_errors_require_retirement`
+///   and `test-pool-open-timeout`.
 #[derive(Clone)]
 pub struct WorkspaceRegistry {
     inner: Arc<WorkspaceRegistryInner>,
@@ -3261,6 +3277,16 @@ fn child_tool_error_retires_worker(tool: &str, err: &ToolError) -> bool {
     ) && matches!(err, ToolError::Timeout(_) | ToolError::TimeoutDetailed(_))
 }
 
+fn unsettled_open_error_retires_worker(err: &ToolError) -> bool {
+    matches!(
+        err,
+        ToolError::Timeout(_)
+            | ToolError::TimeoutDetailed(_)
+            | ToolError::Cancelled(_)
+            | ToolError::WorkerClosed
+    )
+}
+
 fn open_error_releases_lease(fresh_lease: bool, err: &ToolError) -> bool {
     fresh_lease
         || matches!(
@@ -3335,8 +3361,9 @@ mod tests {
         debugger_worker_loss_error, extract_first_matches, find_bytes_child_args,
         lumina_apply_child_args, open_error_releases_lease, open_idb_child_args,
         release_error_retires_worker, require_lease_generation, run_script_child_args,
-        search_child_args, LeaseReapDecision, OpenDispatch, WorkerPool, WorkerPoolConfig,
-        WorkspaceRegistry, CHILD_TIMEOUT_GRACE_SECS, MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS,
+        search_child_args, unsettled_open_error_retires_worker, LeaseReapDecision, OpenDispatch,
+        WorkerPool, WorkerPoolConfig, WorkspaceRegistry, CHILD_TIMEOUT_GRACE_SECS,
+        MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS,
     };
     use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget};
     use crate::ida::worker::{
@@ -4007,6 +4034,24 @@ mod tests {
     #[test]
     fn open_failure_releases_existing_lease_for_closed_worker() {
         assert!(open_error_releases_lease(false, &ToolError::WorkerClosed));
+    }
+
+    #[test]
+    fn unsettled_open_errors_require_retirement() {
+        for error in [
+            ToolError::Timeout(5),
+            ToolError::TimeoutDetailed("open_idb timed out".to_string()),
+            ToolError::Cancelled("open_idb cancelled".to_string()),
+            ToolError::WorkerClosed,
+        ] {
+            assert!(unsettled_open_error_retires_worker(&error));
+        }
+        assert!(!unsettled_open_error_retires_worker(
+            &ToolError::InvalidParams("bad processor".to_string())
+        ));
+        assert!(!unsettled_open_error_retires_worker(&ToolError::IdaError(
+            "unsupported input".to_string()
+        )));
     }
 
     #[tokio::test]

@@ -49,10 +49,18 @@ send() { printf '%s\n' "$1" >&3; }
 
 wait_response() {
   local id="$1" timeout="${2:-90}" elapsed=0 line
+  local count_file="$tmpdir/response-$id.count" consumed=0 wanted
+  if [[ -f "$count_file" ]]; then
+    read -r consumed <"$count_file" || consumed=0
+  fi
+  wanted=$((consumed + 1))
   while (( elapsed < timeout * 10 )); do
+    # JSON-RPC permits sequential ID reuse. Consume the next matching
+    # response instead of returning a stale match from the append-only log.
     line="$(jq -cR "fromjson? | select(.id == $id and (has(\"result\") or has(\"error\")))" \
-      "$stdout_log" 2>/dev/null | tail -1 || true)"
+      "$stdout_log" 2>/dev/null | sed -n "${wanted}p" || true)"
     if [[ -n "$line" ]]; then
+      printf '%s\n' "$wanted" >"$count_file"
       printf '%s\n' "$line"
       return 0
     fi

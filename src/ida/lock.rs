@@ -116,7 +116,7 @@ fn reclaim_mcp_lock_path(lock_path: &Path, expected_pid: Option<u32>) -> Option<
         return None;
     }
     let recorded_pid = read_lock_file_pid_from_file(&file);
-    if recorded_pid != expected_pid || read_lock_file_pid(lock_path) != recorded_pid {
+    if recorded_pid != expected_pid || !lock_path_names_file(&file, lock_path) {
         return None;
     }
 
@@ -254,9 +254,12 @@ fn read_lock_file_pid(lock_path: &Path) -> Option<u32> {
 }
 
 fn read_lock_file_pid_from_file(file: &File) -> Option<u32> {
-    let mut file = file.try_clone().ok()?;
-    file.seek(std::io::SeekFrom::Start(0)).ok()?;
-    let reader = BufReader::new(file);
+    // POSIX process locks are released when *any* descriptor for the same
+    // inode is closed. Read through the descriptor that owns the lock: a
+    // cloned or freshly-opened descriptor would silently unlock cleanup when
+    // it went out of scope.
+    let mut reader = BufReader::new(file);
+    reader.seek(std::io::SeekFrom::Start(0)).ok()?;
 
     for line in reader.lines().map_while(Result::ok) {
         if let Some(pid_str) = line.strip_prefix("pid=") {
@@ -264,6 +267,24 @@ fn read_lock_file_pid_from_file(file: &File) -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(unix)]
+fn lock_path_names_file(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(file_metadata) = file.metadata() else {
+        return false;
+    };
+    let Ok(path_metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    file_metadata.dev() == path_metadata.dev() && file_metadata.ino() == path_metadata.ino()
+}
+
+#[cfg(not(unix))]
+fn lock_path_names_file(_file: &File, path: &Path) -> bool {
+    path.exists()
 }
 
 /// Check if a process with the given PID is still running.
@@ -443,5 +464,65 @@ fn locked_by_pid_from_fd(file: &File) -> Option<u32> {
         None
     } else {
         Some(fl.l_pid as u32)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use crate::ida::lock::{reclaim_mcp_lock_path, try_lock_file};
+    use std::fs::{self, OpenOptions};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const LOCK_PROBE_PATH: &str = "IDA_MCP_LOCK_PROBE_PATH";
+
+    #[test]
+    fn mcp_lock_probe_subprocess() {
+        let Some(path) = std::env::var_os(LOCK_PROBE_PATH) else {
+            return;
+        };
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("probe should open the parent's lock file");
+        assert!(
+            try_lock_file(&file).is_err(),
+            "another process acquired the reclaimed lock"
+        );
+    }
+
+    #[test]
+    fn reclaimed_lock_remains_held_after_owner_validation() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock should follow the Unix epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("ida-mcp-lock-{}-{unique}.imcp", std::process::id()));
+        let recorded_pid = 424_242;
+        fs::write(&path, format!("pid={recorded_pid}\n"))
+            .expect("test should create its lock file");
+
+        let lock = reclaim_mcp_lock_path(&path, Some(recorded_pid))
+            .expect("test should reclaim the unlocked file");
+        let output = Command::new(std::env::current_exe().expect("test binary should be known"))
+            .arg("mcp_lock_probe_subprocess")
+            .arg("--nocapture")
+            .env(LOCK_PROBE_PATH, &path)
+            .output()
+            .expect("lock probe subprocess should run");
+
+        assert!(
+            output.status.success(),
+            "lock probe failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(lock);
+        assert!(
+            !path.exists(),
+            "dropping the reclaimed lock should unlink it"
+        );
     }
 }
