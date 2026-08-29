@@ -280,11 +280,16 @@ debug_launch(database_id: "…", path: "/absolute/path/to/program")
 debug_modules(database_id: "…")
 debug_open_module(
   database_id: "…",
-  module: "/usr/lib/libobjc.A.dylib",
-  idb_out: "~/ida-work/libobjc.i64"
+  module: "/opt/homebrew/lib/libplugin.dylib",
+  idb_out: "~/ida-work/libplugin.i64"
 )
 debug_stop(database_id: "…", action: "auto")
 ```
+
+`debug_open_module` needs a module with an on-disk image, which in practice
+means your own binaries and dlopen'd plugins. macOS system libraries such as
+`/usr/lib/libobjc.A.dylib` are dyld-shared-cache-resident and have no file on
+disk; open those with `open_dsc`/`dsc_add_dylib` instead.
 
 `debug_open_module.idb_out` is always required. Runtime modules often live in
 read-only system directories, and silently writing an IDB next to them is not a

@@ -3087,10 +3087,22 @@ impl IdaMcpServer {
         };
         let module_path = module_path.to_string();
         let expanded_module = crate::expand_path(&module_path);
-        if !expanded_module.is_absolute() || !expanded_module.is_file() {
+        if !expanded_module.is_absolute() {
             return Ok(
                 ToolError::InvalidPath(expanded_module.display().to_string()).to_tool_result(),
             );
+        }
+        if !expanded_module.is_file() {
+            // Most macOS system libraries have no on-disk image: they live
+            // only inside the dyld shared cache. Say so instead of returning
+            // a bare "invalid path" for a module debug_modules just listed.
+            return Ok(ToolError::InvalidPath(format!(
+                "{} is mapped at runtime but has no on-disk image; system libraries usually live \
+                 only inside the dyld shared cache — open those with open_dsc/dsc_add_dylib \
+                 instead of debug_open_module",
+                expanded_module.display()
+            ))
+            .to_tool_result());
         }
         if expanded_module == output {
             return Ok(ToolError::InvalidParams(
@@ -3384,7 +3396,11 @@ impl IdaMcpServer {
         }) {
             return Ok(CallToolResult::success(vec![Content::text(pretty_json(
                 &json!({
-                    "error": disabled_tool_message(&req.name, self.workspace_enabled()),
+                    "error": disabled_tool_message(
+                        &req.name,
+                        self.workspace_enabled(),
+                        self.filter.debugger_enabled(),
+                    ),
                     "filtering_active": self.filter.is_active(),
                     "hint": "call tool_catalog to see enabled tools",
                 }),
@@ -6851,13 +6867,17 @@ fn normalize_tool_schemas(result: &mut ListToolsResult) {
 
 /// Error message for a filter-rejected tool/call. Centralized so the
 /// dispatch and tool_help paths return identical wording.
-fn disabled_tool_message(name: &str, workspace: bool) -> String {
+fn disabled_tool_message(name: &str, workspace: bool, debugger: bool) -> String {
     if tool_registry::get_tool(name).is_some_and(|tool| tool.requirements.workspace && !workspace) {
         return format!(
             "tool '{name}' requires explicit --workspace startup; call tool_catalog to see enabled tools"
         );
     }
-    if tool_registry::get_tool(name).is_some_and(|tool| tool.requirements.debugger) {
+    // Only blame the debugger gate when it is actually closed. A debugger
+    // tool rejected while the gate is open was filtered by --read-only or a
+    // tool/toolset selection, and saying otherwise sends the caller to add a
+    // flag they already passed.
+    if !debugger && tool_registry::get_tool(name).is_some_and(|tool| tool.requirements.debugger) {
         return format!(
             "tool '{name}' requires explicit --enable-debugger startup and a platform whose native debugger integration gate has passed; call tool_catalog to see enabled tools"
         );
@@ -6915,7 +6935,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
         if tool_registry::get_tool(&params.name).is_some() && !self.filter.is_enabled(&params.name)
         {
             return Err(McpError::invalid_params(
-                disabled_tool_message(&params.name, self.workspace),
+                disabled_tool_message(&params.name, self.workspace, self.filter.debugger_enabled()),
                 None,
             ));
         }
@@ -6923,7 +6943,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
             .is_some_and(|tool| tool.requirements.workspace && !self.workspace)
         {
             return Err(McpError::invalid_params(
-                disabled_tool_message(&params.name, self.workspace),
+                disabled_tool_message(&params.name, self.workspace, self.filter.debugger_enabled()),
                 None,
             ));
         }
@@ -6982,8 +7002,8 @@ mod tests {
     use crate::server::{
         add_workspace_database_id_schema, add_workspace_schema, apply_close_metadata,
         apply_task_update, attach_workspace_database_id, call_tool_result_to_value,
-        checked_runtime_slide, close_hint_for, dsc_open_plan, is_sessionless_request_meta,
-        materialize_task_response, normalize_schema_value,
+        checked_runtime_slide, close_hint_for, disabled_tool_message, dsc_open_plan,
+        is_sessionless_request_meta, materialize_task_response, normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
         run_script_truncate_chars, select_runtime_module, supported_protocol_versions, task,
@@ -7662,6 +7682,23 @@ mod tests {
         );
         assert!(select_runtime_module(&modules, "libsame.dylib").is_err());
         assert!(select_runtime_module(&modules, "missing.dylib").is_err());
+    }
+
+    /// A debugger tool rejected while --enable-debugger is already active was
+    /// filtered by something else (--read-only, --toolsets, --tools). Never
+    /// tell the caller to pass a flag they passed.
+    #[test]
+    fn disabled_message_blames_the_gate_only_when_the_gate_is_closed() {
+        let gate_closed = disabled_tool_message("debug_launch", true, false);
+        assert!(gate_closed.contains("--enable-debugger"));
+
+        let gate_open = disabled_tool_message("debug_launch", true, true);
+        assert!(!gate_open.contains("--enable-debugger"));
+        assert!(gate_open.contains("--read-only"));
+
+        // Workspace gating still takes precedence and is unaffected.
+        let workspace_closed = disabled_tool_message("list_databases", false, true);
+        assert!(workspace_closed.contains("--workspace"));
     }
 
     #[test]

@@ -1648,10 +1648,6 @@ impl WorkerBackend {
         }
     }
 
-    /// Query process state only when this server owns the in-process IDA
-    /// worker. Pooled parents expose runtime readiness without recursively
-    /// routing `debug_status`; child workers use this to publish the
-    /// affirmative IDA state consumed by the workspace reaper.
     pub async fn debug_stop(
         &self,
         action: DebugStopAction,

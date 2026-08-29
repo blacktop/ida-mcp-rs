@@ -379,13 +379,55 @@ fn open_existing_idb(
     database.map(|database| (database, opened_path))
 }
 
-fn remove_new_database_artifacts(output: &Path) {
-    for candidate in database_artifact_paths(output) {
-        match fs::remove_file(&candidate) {
-            Ok(()) => info!(path = %candidate.display(), "Removed partial IDA database artifact"),
+/// Pre-open identity of one database artifact.
+///
+/// A `rebuild=true` open intends to replace an existing provenance-matched
+/// database, so failure cleanup cannot simply delete every artifact path: an
+/// open that fails *before* IDA writes anything (missing input, license
+/// refusal) would otherwise destroy the user's analyzed database that this
+/// call never touched. Comparing against this snapshot removes only what the
+/// call actually created or modified.
+struct ArtifactSnapshot {
+    path: PathBuf,
+    before: Option<(u64, Option<std::time::SystemTime>)>,
+}
+
+fn artifact_identity(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()))
+}
+
+fn snapshot_database_artifacts(output: &Path) -> Vec<ArtifactSnapshot> {
+    database_artifact_paths(output)
+        .into_iter()
+        .map(|path| ArtifactSnapshot {
+            before: artifact_identity(&path),
+            path,
+        })
+        .collect()
+}
+
+fn remove_new_database_artifacts(artifacts: &[ArtifactSnapshot]) {
+    for artifact in artifacts {
+        let now = artifact_identity(&artifact.path);
+        let touched_by_this_call = match (&artifact.before, &now) {
+            // Nothing is there now: nothing to clean up.
+            (_, None) => false,
+            // Created by this call.
+            (None, Some(_)) => true,
+            // Rewritten by this call.
+            (Some(before), Some(now)) => before != now,
+        };
+        if !touched_by_this_call {
+            continue;
+        }
+        match fs::remove_file(&artifact.path) {
+            Ok(()) => {
+                info!(path = %artifact.path.display(), "Removed partial IDA database artifact")
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => warn!(
-                path = %candidate.display(),
+                path = %artifact.path.display(),
                 error = %error,
                 "Failed to remove partial IDA database artifact"
             ),
@@ -393,16 +435,16 @@ fn remove_new_database_artifacts(output: &Path) {
     }
 }
 
-fn cleanup_open_artifacts_before_unlock(mcp_lock: McpLock, output: &Path, remove_artifacts: bool) {
-    if remove_artifacts {
-        remove_new_database_artifacts(output);
+fn cleanup_open_artifacts_before_unlock(mcp_lock: McpLock, artifacts: Option<&[ArtifactSnapshot]>) {
+    if let Some(artifacts) = artifacts {
+        remove_new_database_artifacts(artifacts);
     }
     release_mcp_lock_file(mcp_lock);
 }
 
-fn cleanup_failed_open(db: IDB, mcp_lock: McpLock, output: &Path, remove_artifacts: bool) {
+fn cleanup_failed_open(db: IDB, mcp_lock: McpLock, artifacts: Option<&[ArtifactSnapshot]>) {
     drop(db);
-    cleanup_open_artifacts_before_unlock(mcp_lock, output, remove_artifacts);
+    cleanup_open_artifacts_before_unlock(mcp_lock, artifacts);
 }
 
 fn configure_raw_bitness(db: &mut IDB, bitness: idalib::segment::Bitness) -> Result<(), ToolError> {
@@ -670,6 +712,13 @@ pub fn handle_open(
     // a later call treat an incomplete database as reusable. Reopening a
     // verified existing database does not take ownership of its artifacts.
     let created_raw_database = !is_idb && existing_raw_idb.is_none();
+    // Snapshot before IDA can write: cleanup removes only what this call
+    // creates or rewrites, so a rebuild that fails before touching the
+    // output leaves the existing database intact.
+    let owned_artifacts = raw_out_path
+        .as_deref()
+        .filter(|_| created_raw_database)
+        .map(snapshot_database_artifacts);
 
     // Open database
     let path_display = expanded.display().to_string();
@@ -760,7 +809,7 @@ pub fn handle_open(
     let mut db = match db {
         Ok(db) => db,
         Err(e) => {
-            cleanup_open_artifacts_before_unlock(mcp_lock, &opened_path, created_raw_database);
+            cleanup_open_artifacts_before_unlock(mcp_lock, owned_artifacts.as_deref());
             if let Some(lock_msg) =
                 detect_db_lock(&opened_path, &e).or_else(|| detect_db_lock(&expanded, &e))
             {
@@ -776,26 +825,26 @@ pub fn handle_open(
     if let Some(bitness) = raw_target.bitness
         && let Err(error) = configure_raw_bitness(&mut db, bitness)
     {
-        cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+        cleanup_failed_open(db, mcp_lock, owned_artifacts.as_deref());
         return Err(error);
     }
     if let Some(entry_point) = raw_target.entry_point
         && let Err(error) = configure_raw_entry_point(&mut db, entry_point)
     {
-        cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+        cleanup_failed_open(db, mcp_lock, owned_artifacts.as_deref());
         return Err(error);
     }
     if auto_analyse
         && (raw_target.bitness.is_some() || raw_target.entry_point.is_some())
         && !db.auto_wait()
     {
-        cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+        cleanup_failed_open(db, mcp_lock, owned_artifacts.as_deref());
         return Err(ToolError::OpenFailed(
             "IDA auto-analysis did not complete after raw target configuration".to_string(),
         ));
     }
     if let Err(error) = ensure_not_cancelled(cancel.as_ref()) {
-        cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+        cleanup_failed_open(db, mcp_lock, owned_artifacts.as_deref());
         return Err(error);
     }
     if !is_idb && auto_analyse {
@@ -818,7 +867,7 @@ pub fn handle_open(
             "Loading requested debug information",
         );
         if let Err(error) = ensure_not_cancelled(cancel.as_ref()) {
-            cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+            cleanup_failed_open(db, mcp_lock, owned_artifacts.as_deref());
             return Err(error);
         }
         let mut resolved = None;
@@ -884,7 +933,7 @@ pub fn handle_open(
             "Loading sibling dSYM debug information",
         );
         if let Err(error) = ensure_not_cancelled(cancel.as_ref()) {
-            cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+            cleanup_failed_open(db, mcp_lock, owned_artifacts.as_deref());
             return Err(error);
         }
         info!(path = %path.display(), "Loading dSYM debug info");
@@ -895,7 +944,7 @@ pub fn handle_open(
         }
     }
     if let Err(error) = ensure_not_cancelled(cancel.as_ref()) {
-        cleanup_failed_open(db, mcp_lock, &opened_path, created_raw_database);
+        cleanup_failed_open(db, mcp_lock, owned_artifacts.as_deref());
         return Err(error);
     }
 
@@ -959,8 +1008,9 @@ mod tests {
         base_input_path_for_database, database_paths_match, existing_idb_for_raw_binary,
         existing_idb_for_raw_open, existing_raw_idb_action, has_ida_database_extension,
         idb_path_for_raw_binary, init_database_args, non_empty_trimmed,
-        open_database_matches_explicit_output, recorded_input_path_matches, sha256_file,
-        sha256_reader, validate_raw_idb_output, ExistingRawIdbAction,
+        open_database_matches_explicit_output, recorded_input_path_matches,
+        remove_new_database_artifacts, sha256_file, sha256_reader, snapshot_database_artifacts,
+        validate_raw_idb_output, ExistingRawIdbAction,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -1217,6 +1267,43 @@ mod tests {
 
         assert!(recorded_input_path_matches(&spaced, &recorded));
         assert!(!recorded_input_path_matches(&trimmed, &recorded));
+
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    /// A rebuild that fails before IDA writes anything must leave the
+    /// existing database intact: cleanup removes only artifacts this call
+    /// created or rewrote.
+    #[test]
+    fn failed_open_cleanup_preserves_an_untouched_existing_database() {
+        let dir = temp_dir("cleanup-preserves-existing");
+        fs::create_dir(&dir).expect("create temp dir");
+        let output = dir.join("firmware.i64");
+        fs::write(&output, b"existing analyzed database").expect("write existing database");
+        let sidecar = dir.join("firmware.id1");
+        fs::write(&sidecar, b"existing sidecar").expect("write sidecar");
+
+        // Snapshot, then fail without touching anything.
+        let artifacts = snapshot_database_artifacts(&output);
+        remove_new_database_artifacts(&artifacts);
+        assert!(
+            output.exists(),
+            "an untouched database must survive cleanup"
+        );
+        assert!(
+            sidecar.exists(),
+            "an untouched sidecar must survive cleanup"
+        );
+
+        // Snapshot, then partially write: the rewritten artifacts go away.
+        let artifacts = snapshot_database_artifacts(&output);
+        fs::write(&output, b"partial rebuild output").expect("rewrite output");
+        let fresh = dir.join("firmware.id0");
+        fs::write(&fresh, b"new artifact").expect("write new artifact");
+        remove_new_database_artifacts(&artifacts);
+        assert!(!output.exists(), "a rewritten output must be removed");
+        assert!(!fresh.exists(), "a newly created artifact must be removed");
+        assert!(sidecar.exists(), "an untouched sidecar must still survive");
 
         fs::remove_dir_all(dir).expect("remove temp dir");
     }

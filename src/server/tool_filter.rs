@@ -160,6 +160,13 @@ impl ToolFilter {
             })
     }
 
+    /// Whether the debugger capability gate is open. Callers use this to
+    /// avoid blaming a missing `--enable-debugger` for a tool that the gate
+    /// already allows and some other filter rejected.
+    pub fn debugger_enabled(&self) -> bool {
+        self.debugger_enabled
+    }
+
     pub fn is_active(&self) -> bool {
         self.is_active
     }
