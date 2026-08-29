@@ -2301,6 +2301,13 @@ fn checked_runtime_slide(runtime_base: u64, preferred_base: u64) -> Value {
     }
 }
 
+fn runtime_module_preferred_base(
+    selected_dsc_image_address: Option<u64>,
+    segment_bases: impl Iterator<Item = u64>,
+) -> Option<u64> {
+    selected_dsc_image_address.or_else(|| segment_bases.min())
+}
+
 /// Short-circuit on a `Result<_, ToolError>` from within a `#[tool]` async fn,
 /// surfacing the error to the client as an `is_error: true` CallToolResult
 /// (matching the existing `Err(e) => Ok(e.to_tool_result())` pattern used by
@@ -3275,10 +3282,12 @@ impl IdaMcpServer {
                 return Ok(error.to_tool_result());
             }
         };
-        let preferred_base = segments
-            .iter()
-            .filter_map(|segment| Self::parse_address(&segment.start).ok())
-            .min();
+        let preferred_base = runtime_module_preferred_base(
+            dsc_image.as_ref().map(|image| image.address_value),
+            segments
+                .iter()
+                .filter_map(|segment| Self::parse_address(&segment.start).ok()),
+        );
         let runtime_base = module.get("base_value").and_then(Value::as_u64);
         let runtime_slide = runtime_base
             .zip(preferred_base)
@@ -7136,12 +7145,12 @@ mod tests {
         normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
-        run_script_truncate_chars, select_runtime_module, supported_protocol_versions,
-        target_dyld_cache_names, task, task_payload_result_value, task_state_to_detailed_task,
-        task_state_to_mcp_task, timeout_with_child_grace, tool_annotations_for, tool_params_schema,
-        workspace_close_should_remove_entry, DscOpenPlan, IdaMcpServer, OpenIdbBackgroundDecision,
-        RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest, ToolHelpRequest,
-        XrefsRequest,
+        run_script_truncate_chars, runtime_module_preferred_base, select_runtime_module,
+        supported_protocol_versions, target_dyld_cache_names, task, task_payload_result_value,
+        task_state_to_detailed_task, task_state_to_mcp_task, timeout_with_child_grace,
+        tool_annotations_for, tool_params_schema, workspace_close_should_remove_entry, DscOpenPlan,
+        IdaMcpServer, OpenIdbBackgroundDecision, RecentOperationsRequest, ServerRuntimeState,
+        ToolCatalogRequest, ToolHelpRequest, XrefsRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::{CallToolResponse, CallToolResult, InputResponses, ProtocolVersion};
@@ -7838,6 +7847,20 @@ mod tests {
         assert_eq!(
             checked_runtime_slide(u64::MAX, 0)["magnitude_value"],
             json!(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn runtime_module_base_uses_the_selected_dsc_image() {
+        assert_eq!(
+            runtime_module_preferred_base(Some(0x5000), [0x1000, 0x5000, 0x9000].into_iter()),
+            Some(0x5000),
+            "cache headers and other loaded images must not become the selected image base"
+        );
+        assert_eq!(
+            runtime_module_preferred_base(None, [0x3000, 0x1000, 0x2000].into_iter()),
+            Some(0x1000),
+            "standalone images still use their lowest loaded segment"
         );
     }
 

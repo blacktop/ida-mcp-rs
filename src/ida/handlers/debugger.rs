@@ -19,10 +19,10 @@ use crate::ida::types::DebugStopAction;
 
 const DEBUG_EVENT_TIMEOUT_MAX_SECS: u32 = 120;
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const MACOS_DEBUGGER_HELPER: &str = "mac_server_arm";
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-const MACOS_DEBUGGER_HELPER: &str = "mac_server";
+#[cfg(target_os = "macos")]
+const MACOS_ARM64_DEBUGGER_HELPER: &str = "mac_server_arm";
+#[cfg(target_os = "macos")]
+const MACOS_X86_DEBUGGER_HELPER: &str = "mac_server";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DebugSessionKind {
@@ -107,14 +107,26 @@ fn debugger_backend_for_target(
     }
 }
 
-fn debugger_backend(database: &IDB) -> Result<&'static str, ToolError> {
+fn debugger_backend(database: &IDB) -> Result<(&'static str, TargetArchitecture), ToolError> {
     let file_type = database.meta().filetype();
     let architecture = target_architecture(database)?;
-    debugger_backend_for_target(file_type, architecture).map_err(|reason| {
+    let backend = debugger_backend_for_target(file_type, architecture).map_err(|reason| {
         ToolError::NotSupported(format!(
             "no debugger backend for target {file_type:?}/{architecture:?}: {reason}"
         ))
-    })
+    })?;
+    Ok((backend, architecture))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_debugger_helper_for_target(
+    architecture: TargetArchitecture,
+) -> Result<&'static str, &'static str> {
+    match architecture {
+        TargetArchitecture::Aarch64 => Ok(MACOS_ARM64_DEBUGGER_HELPER),
+        TargetArchitecture::X86 | TargetArchitecture::X86_64 => Ok(MACOS_X86_DEBUGGER_HELPER),
+        TargetArchitecture::Arm => Err("32-bit ARM macOS debugging is unsupported"),
+    }
 }
 
 #[derive(Default)]
@@ -129,6 +141,7 @@ pub struct DebuggerRuntime {
 struct MacDebuggerHelper {
     child: Child,
     port: u16,
+    name: &'static str,
 }
 
 impl Drop for DebuggerRuntime {
@@ -175,10 +188,15 @@ impl DebuggerRuntime {
     }
 
     fn ensure_backend(&mut self, database: &IDB) -> Result<&'static str, ToolError> {
-        let backend = debugger_backend(database)?;
+        let (backend, architecture) = debugger_backend(database)?;
         #[cfg(target_os = "macos")]
         {
-            let port = self.ensure_macos_helper()?;
+            let helper_name = macos_debugger_helper_for_target(architecture).map_err(|reason| {
+                ToolError::NotSupported(format!(
+                    "no signed macOS debugger helper for target {architecture:?}: {reason}"
+                ))
+            })?;
+            let port = self.ensure_macos_helper(helper_name)?;
             if !self.backend_loaded {
                 database
                     .debugger_load(backend, true, Some("127.0.0.1"), Some(port))
@@ -190,6 +208,7 @@ impl DebuggerRuntime {
 
         #[cfg(target_os = "linux")]
         {
+            let _ = architecture;
             if !self.backend_loaded {
                 database
                     .debugger_load(backend, false, None, None)
@@ -201,6 +220,7 @@ impl DebuggerRuntime {
 
         #[cfg(target_os = "windows")]
         {
+            let _ = architecture;
             if !self.backend_loaded {
                 database
                     .debugger_load(backend, false, None, None)
@@ -214,6 +234,7 @@ impl DebuggerRuntime {
         {
             let _ = database;
             let _ = backend;
+            let _ = architecture;
             Err(ToolError::InvalidParams(
                 "debugger support is unavailable on this platform".to_string(),
             ))
@@ -221,7 +242,15 @@ impl DebuggerRuntime {
     }
 
     #[cfg(target_os = "macos")]
-    fn ensure_macos_helper(&mut self) -> Result<u16, ToolError> {
+    fn ensure_macos_helper(&mut self, helper_name: &'static str) -> Result<u16, ToolError> {
+        if self
+            .helper
+            .as_ref()
+            .is_some_and(|helper| helper.name != helper_name)
+        {
+            self.stop_helper();
+            self.backend_loaded = false;
+        }
         if let Some(helper) = self.helper.as_mut() {
             match helper.child.try_wait() {
                 Ok(None) => return Ok(helper.port),
@@ -238,7 +267,7 @@ impl DebuggerRuntime {
             }
         }
 
-        let path = macos_helper_path()?;
+        let path = macos_helper_path(helper_name)?;
         let listener =
             std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).map_err(|error| {
                 ToolError::IdaError(format!("failed to reserve debugger loopback port: {error}"))
@@ -262,7 +291,11 @@ impl DebuggerRuntime {
                     path.display()
                 ))
             })?;
-        self.helper = Some(MacDebuggerHelper { child, port });
+        self.helper = Some(MacDebuggerHelper {
+            child,
+            port,
+            name: helper_name,
+        });
         thread::sleep(Duration::from_millis(250));
         let Some(helper) = self.helper.as_mut() else {
             return Err(ToolError::IdaError(
@@ -333,25 +366,38 @@ impl DebuggerRuntime {
 pub fn runtime_status() -> Value {
     #[cfg(target_os = "macos")]
     {
-        match macos_helper_path() {
-            Ok(path) => json!({
+        let arm64_helper = macos_helper_path(MACOS_ARM64_DEBUGGER_HELPER).ok();
+        let x86_helper = macos_helper_path(MACOS_X86_DEBUGGER_HELPER).ok();
+        if arm64_helper.is_some() || x86_helper.is_some() {
+            let mut backends = Vec::with_capacity(2);
+            if arm64_helper.is_some() {
+                backends.push("arm_mac");
+            }
+            if x86_helper.is_some() {
+                backends.push("mac");
+            }
+            json!({
                 "status": "user_action_required",
                 "platform": "macos",
-                "backends": ["arm_mac", "mac"],
+                "backends": backends,
                 "backend_selection": "opened_database_target",
                 "transport": "signed_loopback_helper",
-                "helper_path": path,
+                "helper_paths": {
+                    "arm64": arm64_helper,
+                    "x86": x86_helper,
+                },
                 "authorization": "IDA's Take Control authorization may be required once per login before macOS permits task control",
                 "message": "Debugger tools are opt-in. ida-mcp uses IDA's signed loopback helper and never requests root, disables SIP, changes authorizationdb, or re-signs binaries."
-            }),
-            Err(error) => json!({
+            })
+        } else {
+            json!({
                 "status": "unavailable",
                 "platform": "macos",
-                "backends": ["arm_mac", "mac"],
+                "backends": [],
                 "backend_selection": "opened_database_target",
                 "transport": "signed_loopback_helper",
-                "message": error.to_string(),
-            }),
+                "message": "Cannot find IDA's signed macOS debugger helpers mac_server_arm or mac_server; set IDADIR to the IDA 9.4 installation directory",
+            })
         }
     }
 
@@ -506,7 +552,7 @@ pub fn stop(
         database.debugger_process_state(),
         DebuggerProcessState::NoProcess
     ) {
-        let backend = debugger_backend(database)?;
+        let (backend, _) = debugger_backend(database)?;
         let mut result = session_result(database, backend, "ready", 0, Some(resolved.as_str()));
         result["already_stopped"] = json!(true);
         runtime.clear_session();
@@ -618,7 +664,7 @@ fn macos_authorization_failure(message: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_helper_path() -> Result<PathBuf, ToolError> {
+fn macos_helper_path(helper_name: &str) -> Result<PathBuf, ToolError> {
     let configured_dir = std::env::var_os("IDADIR")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from);
@@ -632,19 +678,23 @@ fn macos_helper_path() -> Result<PathBuf, ToolError> {
             .as_deref()
             .into_iter()
             .chain(default_dirs),
+        helper_name,
     )
     .ok_or_else(|| {
         ToolError::InvalidParams(format!(
-            "cannot find signed macOS debugger helper {MACOS_DEBUGGER_HELPER}; set IDADIR to the IDA 9.4 installation directory"
+            "cannot find signed macOS debugger helper {helper_name}; set IDADIR to the IDA 9.4 installation directory"
         ))
     })
 }
 
 #[cfg(target_os = "macos")]
-fn find_macos_helper<'a>(ida_dirs: impl IntoIterator<Item = &'a Path>) -> Option<PathBuf> {
+fn find_macos_helper<'a>(
+    ida_dirs: impl IntoIterator<Item = &'a Path>,
+    helper_name: &str,
+) -> Option<PathBuf> {
     ida_dirs
         .into_iter()
-        .map(|ida_dir| ida_dir.join("dbgsrv").join(MACOS_DEBUGGER_HELPER))
+        .map(|ida_dir| ida_dir.join("dbgsrv").join(helper_name))
         .find(|helper| helper.is_file())
 }
 
@@ -660,7 +710,10 @@ mod tests {
     use crate::ida::types::DebugStopAction;
 
     #[cfg(target_os = "macos")]
-    use crate::ida::handlers::debugger::{find_macos_helper, MACOS_DEBUGGER_HELPER};
+    use crate::ida::handlers::debugger::{
+        find_macos_helper, macos_debugger_helper_for_target, MACOS_ARM64_DEBUGGER_HELPER,
+        MACOS_X86_DEBUGGER_HELPER,
+    };
 
     #[test]
     fn stop_action_is_explicit_and_bounded() {
@@ -767,6 +820,19 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_helper_selection_follows_the_debug_target() {
+        for (architecture, expected) in [
+            (TargetArchitecture::Aarch64, MACOS_ARM64_DEBUGGER_HELPER),
+            (TargetArchitecture::X86_64, MACOS_X86_DEBUGGER_HELPER),
+            (TargetArchitecture::X86, MACOS_X86_DEBUGGER_HELPER),
+        ] {
+            assert_eq!(macos_debugger_helper_for_target(architecture), Ok(expected));
+        }
+        assert!(macos_debugger_helper_for_target(TargetArchitecture::Arm).is_err());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn arm_linux_target_rejects_unconfigured_remote_backend() {
@@ -784,14 +850,15 @@ mod tests {
     fn macos_helper_discovery_does_not_require_idat() {
         let ida_dir =
             std::env::temp_dir().join(format!("ida-mcp-debugger-helper-{}", uuid::Uuid::new_v4()));
-        let helper = ida_dir.join("dbgsrv").join(MACOS_DEBUGGER_HELPER);
-        std::fs::create_dir_all(helper.parent().expect("helper has a parent"))
-            .expect("create debugger helper directory");
-        std::fs::write(&helper, b"").expect("create debugger helper");
-
-        let discovered = find_macos_helper([ida_dir.as_path()]);
+        std::fs::create_dir_all(ida_dir.join("dbgsrv")).expect("create debugger helper directory");
+        for helper_name in [MACOS_ARM64_DEBUGGER_HELPER, MACOS_X86_DEBUGGER_HELPER] {
+            let helper = ida_dir.join("dbgsrv").join(helper_name);
+            std::fs::write(&helper, b"").expect("create debugger helper");
+            assert_eq!(
+                find_macos_helper([ida_dir.as_path()], helper_name),
+                Some(helper)
+            );
+        }
         let _ = std::fs::remove_dir_all(&ida_dir);
-
-        assert_eq!(discovered, Some(helper));
     }
 }

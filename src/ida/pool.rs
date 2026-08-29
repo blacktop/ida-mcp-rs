@@ -886,7 +886,9 @@ pub struct WorkspaceDatabase {
 ///   independently of the workspace idle timeout. A zero timeout disables
 ///   only healthy idle eviction; it never disables dead-worker retirement or
 ///   terminal handle removal. Enforced by [`workspace_reaper`]; the strict
-///   debugger oracle kills a pooled worker under a zero-TTL registry.
+///   debugger oracle kills a pooled worker under a zero-TTL registry, and
+///   `workspace_zero_ttl_still_reaps_terminal_no_lease_handles` covers the
+///   lease-less terminal state while preserving active and pinned handles.
 #[derive(Clone)]
 pub struct WorkspaceRegistry {
     inner: Arc<WorkspaceRegistryInner>,
@@ -986,9 +988,10 @@ enum LeaseReapDecision {
     DeadWorker(Arc<ChildSlot>),
 }
 
+#[derive(Clone, Copy)]
 enum WorkspaceReapReason {
     Idle,
-    DeadWorker,
+    Terminal,
 }
 
 /// Report the loss of a worker that was hosting a live debugger session.
@@ -1239,15 +1242,17 @@ async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duratio
             candidates
         };
         // Phase 2: probe transport health outside the registry lock. Dead
-        // workers are terminal regardless of TTL or debugger pin; healthy
-        // unpinned entries are eligible only under the idle policy.
-        let mut idle_reapable = Vec::new();
-        let mut dead_reapable = Vec::new();
+        // workers and lease-less handles are terminal regardless of TTL;
+        // healthy unpinned entries are eligible only under the idle policy.
+        let mut reapable = Vec::new();
         for (database_id, entry) in candidates {
             match entry.database.lease_reap_decision().await {
-                LeaseReapDecision::NoLease | LeaseReapDecision::HealthyUnpinned => {
+                LeaseReapDecision::NoLease => {
+                    reapable.push((database_id, WorkspaceReapReason::Terminal));
+                }
+                LeaseReapDecision::HealthyUnpinned => {
                     if !inner.idle_timeout.is_zero() && entry.idle_for() >= inner.idle_timeout {
-                        idle_reapable.push(database_id);
+                        reapable.push((database_id, WorkspaceReapReason::Idle));
                     }
                 }
                 LeaseReapDecision::HealthyPinned | LeaseReapDecision::Busy => {}
@@ -1257,7 +1262,7 @@ async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duratio
                         "workspace worker exited out of band; clearing its lease"
                     );
                     inner.pool.mark_dead(&slot).await;
-                    dead_reapable.push(database_id);
+                    reapable.push((database_id, WorkspaceReapReason::Terminal));
                 }
             }
         }
@@ -1270,35 +1275,21 @@ async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duratio
                 Err(poisoned) => poisoned.into_inner(),
             };
             let mut expired = Vec::new();
-            for database_id in idle_reapable {
+            for (database_id, reason) in reapable {
                 let still_reapable = entries.get(&database_id).is_some_and(|entry| {
                     !entry.legacy
                         && entry.active_calls.load(Ordering::Relaxed) == 0
                         && entry.pins.load(Ordering::Relaxed) == 0
-                        && !inner.idle_timeout.is_zero()
-                        && entry.idle_for() >= inner.idle_timeout
+                        && match reason {
+                            WorkspaceReapReason::Idle => {
+                                !inner.idle_timeout.is_zero()
+                                    && entry.idle_for() >= inner.idle_timeout
+                            }
+                            WorkspaceReapReason::Terminal => entry.database.lease_is_absent(),
+                        }
                 });
                 if still_reapable && let Some(entry) = entries.remove(&database_id) {
-                    expired.push((
-                        database_id,
-                        entry.database.clone(),
-                        WorkspaceReapReason::Idle,
-                    ));
-                }
-            }
-            for database_id in dead_reapable {
-                let still_terminal = entries.get(&database_id).is_some_and(|entry| {
-                    !entry.legacy
-                        && entry.active_calls.load(Ordering::Relaxed) == 0
-                        && entry.pins.load(Ordering::Relaxed) == 0
-                        && entry.database.lease_is_absent()
-                });
-                if still_terminal && let Some(entry) = entries.remove(&database_id) {
-                    expired.push((
-                        database_id,
-                        entry.database.clone(),
-                        WorkspaceReapReason::DeadWorker,
-                    ));
+                    expired.push((database_id, entry.database.clone(), reason));
                 }
             }
             expired
@@ -1308,7 +1299,7 @@ async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duratio
                 WorkspaceReapReason::Idle => {
                     info!(database_id, "reaping idle workspace database");
                 }
-                WorkspaceReapReason::DeadWorker => {
+                WorkspaceReapReason::Terminal => {
                     info!(database_id, "removing terminal workspace database");
                 }
             }
@@ -3350,6 +3341,41 @@ mod tests {
         drop(pin);
         drop(debug_busy_guard);
         drop(legacy);
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn workspace_zero_ttl_still_reaps_terminal_no_lease_handles() {
+        let registry = WorkspaceRegistry::new(test_pool(3), Duration::ZERO);
+
+        let terminal = registry.allocate_database();
+        let terminal_id = terminal.database_id().to_string();
+        drop(terminal);
+
+        let active = registry.allocate_database();
+        let active_id = active.database_id().to_string();
+
+        let pinned = registry.allocate_database();
+        let pinned_id = pinned.database_id().to_string();
+        let pin = registry
+            .pin(&pinned_id)
+            .expect("allocated database can be pinned");
+        drop(pinned);
+
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        {
+            let entries = registry.entries();
+            assert!(
+                !entries.contains_key(&terminal_id),
+                "zero TTL disables healthy idle eviction, not terminal cleanup"
+            );
+            assert!(entries.contains_key(&active_id));
+            assert!(entries.contains_key(&pinned_id));
+        }
+
+        drop(active);
+        drop(pin);
         registry.shutdown().await;
     }
 

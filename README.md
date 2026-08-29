@@ -316,13 +316,14 @@ target may keep running. When an in-flight tool call detects or causes that
 retirement, ida-mcp returns a `Debugger session lost` error saying the target
 may still be alive, clears the handle's debug pin, and never claims the
 debuggee ended. A leased worker can also die while no request is in flight to
-carry an error; `list_databases` then reports `no_worker`, and an enabled
-workspace TTL eventually expires the handle. Cleaning up a stray helper or
-debuggee is currently manual.
+carry an error; `list_databases` may briefly report `no_worker` before the
+reaper removes that terminal handle, even when healthy idle eviction is
+disabled. Cleaning up a stray helper or debuggee is currently manual.
 
-The first enabled platform is macOS on Apple Silicon. ida-mcp connects through
-IDA's signed loopback `mac_server_arm` helper. macOS may require IDA's supported
-“Take Control” authorization once per login; tools report
+The first enabled platform is macOS on Apple Silicon. ida-mcp selects IDA's
+signed loopback helper from the opened database's target architecture:
+`mac_server_arm` for ARM64 and `mac_server` for x86/x86_64. macOS may require
+IDA's supported “Take Control” authorization once per login; tools report
 `user_action_required` when it is missing. ida-mcp never asks for root, disables
 SIP, edits `authorizationdb`, or re-signs binaries. Linux and Windows remain
 fail-closed rather than being advertised optimistically: IDA's ARM Linux

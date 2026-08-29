@@ -271,6 +271,7 @@ case "$launch_status" in
       and .module.path == $module
       and .module_source == "dyld_shared_cache"
       and (.dsc_image.name | type == "string")
+      and .preferred_base_value == .dsc_image.address_value
       and (.runtime_slide.signed | type == "string")
     ' >/dev/null <<<"$cache_module_text" || {
       echo "FAIL: cache-backed debug_open_module result shape mismatch" >&2
