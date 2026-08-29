@@ -943,7 +943,9 @@ pub struct CallGraphRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct XrefMatrixRequest {
-    #[schemars(description = "Addresses to include in matrix (string/number or array)")]
+    #[schemars(
+        description = "Addresses to include in matrix (string/number or array; maximum 512)"
+    )]
     #[serde(alias = "addr", alias = "address", alias = "addresses")]
     pub addrs: Value,
 }

@@ -393,12 +393,16 @@ fn remove_new_database_artifacts(output: &Path) {
     }
 }
 
-fn cleanup_failed_open(db: IDB, mcp_lock: McpLock, output: &Path, remove_artifacts: bool) {
-    drop(db);
-    release_mcp_lock_file(mcp_lock);
+fn cleanup_open_artifacts_before_unlock(mcp_lock: McpLock, output: &Path, remove_artifacts: bool) {
     if remove_artifacts {
         remove_new_database_artifacts(output);
     }
+    release_mcp_lock_file(mcp_lock);
+}
+
+fn cleanup_failed_open(db: IDB, mcp_lock: McpLock, output: &Path, remove_artifacts: bool) {
+    drop(db);
+    cleanup_open_artifacts_before_unlock(mcp_lock, output, remove_artifacts);
 }
 
 fn configure_raw_bitness(db: &mut IDB, bitness: idalib::segment::Bitness) -> Result<(), ToolError> {
@@ -756,10 +760,7 @@ pub fn handle_open(
     let mut db = match db {
         Ok(db) => db,
         Err(e) => {
-            release_mcp_lock_file(mcp_lock);
-            if created_raw_database {
-                remove_new_database_artifacts(&opened_path);
-            }
+            cleanup_open_artifacts_before_unlock(mcp_lock, &opened_path, created_raw_database);
             if let Some(lock_msg) =
                 detect_db_lock(&opened_path, &e).or_else(|| detect_db_lock(&expanded, &e))
             {

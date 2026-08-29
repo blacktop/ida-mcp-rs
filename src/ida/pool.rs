@@ -980,15 +980,28 @@ enum DebugPinReapDecision {
 
 /// Report the loss of a worker that was hosting a live debugger session.
 ///
-/// Any server-initiated retirement of a debug-pinned lease — a wedged
-/// `debug_modules`, a crashed child, a dropped transport — ends ida-mcp's
+/// Any server-initiated retirement of a debug-pinned lease — a timed-out
+/// lifecycle operation, a crashed child, a dropped transport — ends ida-mcp's
 /// control of that session without ending the debuggee: the worker never runs
 /// `DebuggerRuntime::drop`, so its debug-server helper is reparented rather
-/// than terminated. A bare timeout or transport error would hide that, so the
-/// error names it. Non-debugger losses keep their original error.
+/// than terminated. A start timeout can create the same orphan before the
+/// lease is pinned. A bare timeout or transport error would hide either case,
+/// so the error names it. Non-debugger losses keep their original error.
 fn debugger_worker_loss_error(tool: &str, error: ToolError, debug_pinned: bool) -> ToolError {
-    if !debug_pinned {
+    let uncertain_start = matches!(tool, "debug_launch" | "debug_attach")
+        && matches!(
+            &error,
+            ToolError::Timeout(_) | ToolError::TimeoutDetailed(_)
+        );
+    if !debug_pinned && !uncertain_start {
         return error;
+    }
+    if uncertain_start && !debug_pinned {
+        return ToolError::DebuggerSessionLost(format!(
+            "{tool} timed out and its worker was retired ({error}); ida-mcp cannot determine \
+             whether the debugger started before the timeout, and the target process may still \
+             be running — check for a stray debuggee before retrying {tool}"
+        ));
     }
     ToolError::DebuggerSessionLost(format!(
         "{tool} lost the worker hosting this database's debugger session ({error}); ida-mcp no \
@@ -3096,7 +3109,10 @@ fn child_tool_error_retires_worker(tool: &str, err: &ToolError) -> bool {
         return true;
     }
 
-    tool == "debug_modules" && matches!(err, ToolError::Timeout(_) | ToolError::TimeoutDetailed(_))
+    matches!(
+        tool,
+        "debug_launch" | "debug_attach" | "debug_modules" | "debug_stop"
+    ) && matches!(err, ToolError::Timeout(_) | ToolError::TimeoutDetailed(_))
 }
 
 fn open_error_releases_lease(fresh_lease: bool, err: &ToolError) -> bool {
@@ -3401,12 +3417,11 @@ mod tests {
         registry.shutdown().await;
     }
 
-    /// Every server-initiated retirement of a debug-pinned lease must report
-    /// the lost session truthfully — never a bare timeout — and must not
-    /// claim the debuggee ended. Losses with no debugger session keep their
-    /// original error so ordinary retries are unaffected.
+    /// Every known or possible debugger-session loss must be reported
+    /// truthfully — never as a bare timeout — without claiming the debuggee
+    /// ended. Unrelated losses keep their original error.
     #[test]
-    fn retiring_a_debug_pinned_worker_reports_the_session_as_lost() {
+    fn retiring_a_debugger_worker_reports_session_loss_truthfully() {
         let wedged = debugger_worker_loss_error(
             "debug_modules",
             ToolError::Timeout(DEBUG_MODULES_TIMEOUT_SECS),
@@ -3436,6 +3451,14 @@ mod tests {
             false,
         );
         assert!(matches!(plain, ToolError::Timeout(_)));
+
+        let uncertain_launch =
+            debugger_worker_loss_error("debug_launch", ToolError::Timeout(5), false);
+        let ToolError::DebuggerSessionLost(message) = uncertain_launch else {
+            panic!("a timed-out debugger start must report possible target loss");
+        };
+        assert!(message.contains("cannot determine whether the debugger started"));
+        assert!(message.contains("may still be running"));
     }
 
     /// Ownership signals that must pin: an explicit `session_retained`
@@ -3595,13 +3618,24 @@ mod tests {
             "run_script",
             &ToolError::Cancelled("run_script cancelled".to_string())
         ));
-        assert!(child_tool_error_retires_worker(
+        for tool in [
+            "debug_launch",
+            "debug_attach",
             "debug_modules",
-            &ToolError::Timeout(DEBUG_MODULES_TIMEOUT_SECS)
-        ));
-        assert!(child_tool_error_retires_worker(
-            "debug_modules",
-            &ToolError::TimeoutDetailed("debug_modules timed out".to_string())
+            "debug_stop",
+        ] {
+            assert!(child_tool_error_retires_worker(
+                tool,
+                &ToolError::Timeout(DEBUG_MODULES_TIMEOUT_SECS)
+            ));
+            assert!(child_tool_error_retires_worker(
+                tool,
+                &ToolError::TimeoutDetailed(format!("{tool} timed out"))
+            ));
+        }
+        assert!(!child_tool_error_retires_worker(
+            "debug_status",
+            &ToolError::Timeout(5)
         ));
         assert!(child_tool_error_retires_worker(
             "run_script",

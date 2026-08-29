@@ -999,6 +999,8 @@ impl IdaMcpServer {
     const DEFAULT_XREFS_LIMIT: usize = 1000;
     /// Hard cap on a single xref page, mirroring other paginated tools.
     const MAX_XREFS_LIMIT: usize = 10000;
+    /// A matrix is quadratic in both allocation and serialized output size.
+    const MAX_XREF_MATRIX_ADDRESSES: usize = 512;
 
     /// Parse and clamp the pagination inputs shared by `xrefs_to`/`xrefs_from`.
     ///
@@ -1014,6 +1016,17 @@ impl IdaMcpServer {
         let offset = parse_optional_unsigned::<usize>(req.offset, "offset")?.unwrap_or(0);
         let timeout_secs = parse_optional_unsigned::<u64>(req.timeout_secs, "timeout_secs")?;
         Ok((offset, limit, timeout_secs))
+    }
+
+    fn validate_xref_matrix_size(addrs: &[u64]) -> Result<(), ToolError> {
+        if addrs.len() > Self::MAX_XREF_MATRIX_ADDRESSES {
+            return Err(ToolError::InvalidParams(format!(
+                "xref_matrix accepts at most {} addresses (received {})",
+                Self::MAX_XREF_MATRIX_ADDRESSES,
+                addrs.len()
+            )));
+        }
+        Ok(())
     }
 
     /// Wrap a per-address xref result for the multi-address response, injecting
@@ -4653,6 +4666,9 @@ impl IdaMcpServer {
             Ok(v) => v,
             Err(e) => return Ok(e.to_tool_result()),
         };
+        if let Err(error) = Self::validate_xref_matrix_size(&addrs) {
+            return Ok(error.to_tool_result());
+        }
         match self.worker.xref_matrix(addrs).await {
             Ok(result) => Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&result).unwrap_or_else(|_| format!("{:?}", result)),
@@ -7319,6 +7335,19 @@ mod tests {
     }
 
     #[test]
+    fn xref_matrix_rejects_quadratic_inputs_before_dispatch() {
+        let at_limit = vec![0; IdaMcpServer::MAX_XREF_MATRIX_ADDRESSES];
+        assert!(IdaMcpServer::validate_xref_matrix_size(&at_limit).is_ok());
+
+        let over_limit = vec![0; IdaMcpServer::MAX_XREF_MATRIX_ADDRESSES + 1];
+        let error = IdaMcpServer::validate_xref_matrix_size(&over_limit)
+            .expect_err("oversized xref matrix must be rejected");
+        assert!(
+            matches!(error, ToolError::InvalidParams(message) if message.contains("at most 512"))
+        );
+    }
+
+    #[test]
     fn dsc_open_plan_backgrounds_ida_94_raw_dsc() {
         assert_eq!(
             dsc_open_plan((9, 4), false),
@@ -7968,7 +7997,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             digest,
-            "18332b7d023a842bed625ccfcd09299750ce38edff2069227b1ddec2e7fbc21e"
+            "59568456bad624fc92694542ec5ba9d67f59b42b6134ef91f17af9c6a5d975b9"
         );
     }
 
