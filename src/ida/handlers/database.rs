@@ -554,11 +554,36 @@ fn configure_raw_bitness(db: &mut IDB, bitness: idalib::segment::Bitness) -> Res
     Ok(())
 }
 
-fn configure_raw_entry_point(db: &mut IDB, entry_point: u64) -> Result<(), ToolError> {
+fn normalized_raw_entry_point(raw_target: &RawBinaryTarget) -> Option<(u64, bool)> {
+    let entry_point = raw_target.entry_point?;
+    let arm = raw_target
+        .processor
+        .as_deref()
+        .and_then(|processor| processor.split(':').next())
+        .is_some_and(|family| family.eq_ignore_ascii_case("arm"));
+    let thumb = arm && entry_point & 1 == 1;
+    Some((if thumb { entry_point & !1 } else { entry_point }, thumb))
+}
+
+fn configure_raw_entry_point(db: &mut IDB, entry_point: u64, thumb: bool) -> Result<(), ToolError> {
     if db.segment_at(entry_point).is_none() {
         return Err(ToolError::OpenFailed(format!(
             "raw entry point {entry_point:#x} is outside every loaded segment"
         )));
+    }
+
+    if thumb {
+        let mut processor = db.processor();
+        if !processor.is_thumb_at(entry_point) && !processor.set_thumb_at(entry_point, true) {
+            return Err(ToolError::OpenFailed(format!(
+                "IDA refused Thumb state at raw entry point {entry_point:#x}"
+            )));
+        }
+        if !processor.is_thumb_at(entry_point) {
+            return Err(ToolError::OpenFailed(format!(
+                "IDA did not retain Thumb state at raw entry point {entry_point:#x}"
+            )));
+        }
     }
 
     if db.meta().start_address() != Some(entry_point)
@@ -573,6 +598,46 @@ fn configure_raw_entry_point(db: &mut IDB, entry_point: u64) -> Result<(), ToolE
             "IDA did not retain requested raw entry point {entry_point:#x}"
         )));
     }
+    Ok(())
+}
+
+fn materialize_raw_entry_point(
+    db: &mut IDB,
+    entry_point: u64,
+    thumb: bool,
+) -> Result<(), ToolError> {
+    if !thumb {
+        return Ok(());
+    }
+
+    let restored_thumb = {
+        let mut processor = db.processor();
+        let was_thumb = processor.is_thumb_at(entry_point);
+        if !was_thumb && !processor.set_thumb_at(entry_point, true) {
+            return Err(ToolError::OpenFailed(format!(
+                "IDA refused Thumb state at raw entry point {entry_point:#x} after analysis"
+            )));
+        }
+        if !processor.is_thumb_at(entry_point) {
+            return Err(ToolError::OpenFailed(format!(
+                "IDA did not retain Thumb state at raw entry point {entry_point:#x} after analysis"
+            )));
+        }
+        !was_thumb
+    };
+
+    if (restored_thumb || !db.flags_at(entry_point).is_code()) && !db.recreate_insn_at(entry_point)
+    {
+        return Err(ToolError::OpenFailed(format!(
+            "IDA could not create code at raw entry point {entry_point:#x}"
+        )));
+    }
+    if !db.flags_at(entry_point).is_code() {
+        return Err(ToolError::OpenFailed(format!(
+            "IDA did not retain code at raw entry point {entry_point:#x}"
+        )));
+    }
+
     Ok(())
 }
 
@@ -601,6 +666,7 @@ pub fn handle_open(
     let file_type = non_empty_trimmed(file_type);
     ensure_not_cancelled(cancel.as_ref())?;
     let is_idb = has_ida_database_extension(&expanded);
+    let raw_entry_point = normalized_raw_entry_point(raw_target);
 
     if is_idb && (idb_out.is_some() || !raw_target.is_empty()) {
         return Err(ToolError::InvalidParams(
@@ -888,7 +954,7 @@ pub fn handle_open(
             release_mcp_lock_file(mcp_lock);
             return Err(ToolError::InvalidParams(error.to_string()));
         }
-        if let Some(entry_point) = raw_target.entry_point {
+        if let Some((entry_point, _)) = raw_entry_point {
             opts.entry_point(entry_point);
         }
         for arg in &init_args {
@@ -921,8 +987,8 @@ pub fn handle_open(
         cleanup_failed_open(db, mcp_lock, owned_artifacts.as_deref());
         return Err(error);
     }
-    if let Some(entry_point) = raw_target.entry_point
-        && let Err(error) = configure_raw_entry_point(&mut db, entry_point)
+    if let Some((entry_point, thumb)) = raw_entry_point
+        && let Err(error) = configure_raw_entry_point(&mut db, entry_point, thumb)
     {
         cleanup_failed_open(db, mcp_lock, owned_artifacts.as_deref());
         return Err(error);
@@ -935,6 +1001,12 @@ pub fn handle_open(
         return Err(ToolError::OpenFailed(
             "IDA auto-analysis did not complete after raw target configuration".to_string(),
         ));
+    }
+    if let Some((entry_point, thumb)) = raw_entry_point
+        && let Err(error) = materialize_raw_entry_point(&mut db, entry_point, thumb)
+    {
+        cleanup_failed_open(db, mcp_lock, owned_artifacts.as_deref());
+        return Err(error);
     }
     if let Err(error) = ensure_not_cancelled(cancel.as_ref()) {
         cleanup_failed_open(db, mcp_lock, owned_artifacts.as_deref());
@@ -1100,13 +1172,14 @@ mod tests {
     use crate::ida::handlers::database::{
         base_input_path_for_database, database_paths_match, existing_idb_for_raw_binary,
         existing_idb_for_raw_open, existing_raw_idb_action, has_ida_database_extension,
-        idb_path_for_raw_binary, init_database_args, non_empty_trimmed,
+        idb_path_for_raw_binary, init_database_args, non_empty_trimmed, normalized_raw_entry_point,
         open_database_matches_raw_request, open_database_path_matches_raw_request,
         recorded_input_path_matches, remove_new_database_artifacts, sha256_file, sha256_reader,
         snapshot_database_artifacts, validate_raw_idb_output, ExistingRawIdbAction,
         RawOpenArtifactCleanup,
     };
     use crate::ida::lock::acquire_mcp_lock;
+    use crate::ida::types::RawBinaryTarget;
     use tokio_util::sync::CancellationToken;
 
     struct CancelAfterFirstRead {
@@ -1140,6 +1213,27 @@ mod tests {
         assert_eq!(non_empty_trimmed(Some("")), None);
         assert_eq!(non_empty_trimmed(Some("  \t  ")), None);
         assert_eq!(non_empty_trimmed(Some(" pe ")), Some("pe"));
+    }
+
+    #[test]
+    fn arm_thumb_entry_point_is_normalized_without_affecting_other_processors() {
+        let thumb = RawBinaryTarget {
+            processor: Some("arm:ARMv7-M".to_string()),
+            bitness: Some(idalib::segment::Bitness::Bits32),
+            base_address: Some(0x0800_0000),
+            entry_point: Some(0x0800_0101),
+        };
+        assert_eq!(
+            normalized_raw_entry_point(&thumb),
+            Some((0x0800_0100, true))
+        );
+
+        let non_arm = RawBinaryTarget {
+            processor: Some("metapc:80386p".to_string()),
+            entry_point: Some(0x1001),
+            ..RawBinaryTarget::default()
+        };
+        assert_eq!(normalized_raw_entry_point(&non_arm), Some((0x1001, false)));
     }
 
     #[test]

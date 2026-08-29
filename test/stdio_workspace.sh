@@ -109,6 +109,16 @@ jq -e '
 ' >/dev/null <<<"$tools"
 echo "   workspace schemas distinguish allocation from database-scoped calls"
 
+send '{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"tool_help","arguments":{"name":"disasm"}}}'
+help_response="$(wait_response 24 30)"
+assert_ok "workspace tool_help example" "$help_response"
+jq -e '
+  .result.content[0].text | fromjson
+  | (.parameters.required | index("database_id") != null)
+    and ((.example | fromjson).database_id == "00000000-0000-0000-0000-000000000000")
+' >/dev/null <<<"$help_response"
+echo "   workspace help examples include the required database handle"
+
 send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":1}}}'
 missing_id="$(wait_response 3 30)"
 jq -e '.error.code == -32602 and (.error.message | contains("requires database_id"))' \

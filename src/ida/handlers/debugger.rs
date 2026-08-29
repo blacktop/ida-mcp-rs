@@ -760,8 +760,12 @@ mod tests {
 
     #[test]
     fn second_start_is_rejected_without_changing_ownership() {
-        let mut runtime = DebuggerRuntime::default();
-        runtime.session = Some(DebugSessionKind::Attached);
+        let mut runtime = DebuggerRuntime {
+            backend_loaded: false,
+            session: Some(DebugSessionKind::Attached),
+            #[cfg(target_os = "macos")]
+            helper: None,
+        };
 
         let error = runtime
             .ensure_start_allowed()

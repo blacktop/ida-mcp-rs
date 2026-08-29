@@ -2170,24 +2170,40 @@ fn select_runtime_module(modules: &Value, query: &str) -> Result<Value, ToolErro
 
 enum RuntimeModuleSource {
     Standalone(std::path::PathBuf),
+    #[cfg(target_os = "macos")]
     DyldSharedCache(std::path::PathBuf),
 }
 
 impl RuntimeModuleSource {
     fn open_path(&self) -> &std::path::Path {
         match self {
-            Self::Standalone(path) | Self::DyldSharedCache(path) => path,
+            Self::Standalone(path) => path,
+            #[cfg(target_os = "macos")]
+            Self::DyldSharedCache(path) => path,
         }
     }
 
     fn kind(&self) -> &'static str {
         match self {
             Self::Standalone(_) => "standalone",
+            #[cfg(target_os = "macos")]
             Self::DyldSharedCache(_) => "dyld_shared_cache",
+        }
+    }
+
+    fn is_dyld_shared_cache(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            matches!(self, Self::DyldSharedCache(_))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
         }
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn target_dyld_cache_names(meta: &Value) -> Result<&'static [&'static str], ToolError> {
     const ARM64: &[&str] = &["dyld_shared_cache_arm64e", "dyld_shared_cache_arm64"];
     const X86_64: &[&str] = &["dyld_shared_cache_x86_64h", "dyld_shared_cache_x86_64"];
@@ -2224,6 +2240,7 @@ fn target_dyld_cache_names(meta: &Value) -> Result<&'static [&'static str], Tool
     )))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn find_target_dyld_cache(
     meta: &Value,
     roots: &[&std::path::Path],
@@ -3273,7 +3290,7 @@ impl IdaMcpServer {
         };
         let generation = opened.generation;
         let opened = opened.info;
-        let dsc_image = if matches!(source, RuntimeModuleSource::DyldSharedCache(_)) {
+        let dsc_image = if source.is_dyld_shared_cache() {
             match destination
                 .dsc_load_image_for_generation(&module_path, Some(timeout_secs), Some(generation))
                 .await
@@ -3563,10 +3580,12 @@ impl IdaMcpServer {
 
         if let Some(tool) = tool_registry::get_tool(&req.name) {
             let mut params = tool_params_schema(&req.name);
-            if self.workspace_enabled()
-                && let Some(Value::Object(schema)) = params.as_mut()
-            {
-                add_workspace_database_id_schema(&req.name, schema);
+            let mut example = Cow::Borrowed(tool.example);
+            if self.workspace_enabled() {
+                if let Some(Value::Object(schema)) = params.as_mut() {
+                    add_workspace_database_id_schema(&req.name, schema);
+                }
+                example = workspace_tool_example(&req.name, tool.example);
             }
             Ok(CallToolResult::success(vec![Content::text(pretty_json(
                 &json!({
@@ -3576,7 +3595,7 @@ impl IdaMcpServer {
                     "requirements": tool.requirements,
                     "description": tool.full_desc,
                     "parameters": params,
-                    "example": tool.example,
+                    "example": example,
                     "keywords": tool.keywords,
                 }),
             ))]))
@@ -6835,10 +6854,7 @@ fn apply_tool_metadata(mut tool: Tool) -> Tool {
 }
 
 fn add_workspace_database_id_schema(name: &str, schema: &mut Map<String, Value>) {
-    let Some(info) = tool_registry::get_tool(name) else {
-        return;
-    };
-    if info.scope != ToolScope::Database {
+    if !workspace_requires_database_id(name) {
         return;
     }
 
@@ -6863,6 +6879,24 @@ fn add_workspace_database_id_schema(name: &str, schema: &mut Map<String, Value>)
     {
         required.push(json!("database_id"));
     }
+}
+
+fn workspace_requires_database_id(name: &str) -> bool {
+    tool_registry::get_tool(name).is_some_and(|info| info.scope == ToolScope::Database)
+}
+
+fn workspace_tool_example<'a>(name: &str, example: &'a str) -> Cow<'a, str> {
+    if !workspace_requires_database_id(name) {
+        return Cow::Borrowed(example);
+    }
+    let Ok(Value::Object(mut arguments)) = serde_json::from_str(example) else {
+        return Cow::Borrowed(example);
+    };
+    arguments.insert(
+        "database_id".to_string(),
+        json!("00000000-0000-0000-0000-000000000000"),
+    );
+    Cow::Owned(Value::Object(arguments).to_string())
 }
 
 fn add_workspace_schema(tool: &mut Tool) {
@@ -7166,9 +7200,9 @@ mod tests {
         segment_defines_runtime_image_base, select_runtime_module, supported_protocol_versions,
         target_dyld_cache_names, task, task_payload_result_value, task_state_to_detailed_task,
         task_state_to_mcp_task, timeout_with_child_grace, tool_annotations_for, tool_params_schema,
-        workspace_close_should_remove_entry, DscOpenPlan, IdaMcpServer, OpenIdbBackgroundDecision,
-        RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest, ToolHelpRequest,
-        XrefsRequest,
+        workspace_close_should_remove_entry, workspace_tool_example, DscOpenPlan, IdaMcpServer,
+        OpenIdbBackgroundDecision, RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest,
+        ToolHelpRequest, XrefsRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::{CallToolResponse, CallToolResult, InputResponses, ProtocolVersion};
@@ -8257,6 +8291,26 @@ mod tests {
             .pointer("/required")
             .and_then(Value::as_array)
             .is_some_and(|required| required.iter().any(|field| field == "database_id")));
+
+        for tool in crate::tool_registry::all_tools()
+            .filter(|tool| tool.scope == crate::tool_registry::ToolScope::Database)
+        {
+            let workspace_example = workspace_tool_example(tool.name, tool.example);
+            let workspace_example: Value = serde_json::from_str(&workspace_example)
+                .unwrap_or_else(|error| panic!("{} workspace help example: {error}", tool.name));
+            assert_eq!(
+                workspace_example["database_id"],
+                json!("00000000-0000-0000-0000-000000000000"),
+                "{} workspace help example",
+                tool.name
+            );
+        }
+        let runtime =
+            crate::tool_registry::get_tool("tool_catalog").expect("runtime registry entry");
+        assert_eq!(
+            workspace_tool_example("tool_catalog", runtime.example).as_ref(),
+            runtime.example
+        );
     }
 
     #[test]

@@ -214,7 +214,9 @@ open_idb(
 Processor families with multiple modes require an explicit IDA processor
 variant; ambiguous bare names such as `arm` or `metapc` are rejected. These
 target fields apply only while creating a raw-input database and never alter an
-existing `.i64`/`.idb`.
+existing `.i64`/`.idb`. For 32-bit ARM targets, an odd `entry_point` is treated
+as a Thumb pointer: ida-mcp clears bit 0 for the code address and records the
+Thumb state before creating the entry instruction.
 
 #### Multi-database workspace (opt-in)
 

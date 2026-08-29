@@ -392,6 +392,57 @@ wait_response 99 30 >/dev/null
 stop_server
 echo "   ✓ processor, bitness, base, and entry point survived verified reuse"
 
+echo "── Phase 8b: Thumb-tagged ARM entry points retain code address and T-state ──"
+thumb_raw="$tmpdir/thumb.bin"
+thumb_idb="$tmpdir/thumb.i64"
+dd if=/dev/zero of="$thumb_raw" bs=1 count=256 >/dev/null 2>&1
+# Thumb NOP; BX LR at offset 0x100.
+printf '\x00\xbf\x70\x47' >>"$thumb_raw"
+
+start_server
+init
+send "$(jq -cn --arg p "$thumb_raw" --arg out "$thumb_idb" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out,processor:"arm:ARMv7-M",bitness:32,base_address:"0x08000000",entry_point:"0x08000101",auto_analyse:true,timeout_secs:120}}}')"
+assert_ok "Phase 8b Thumb raw open" "$(wait_response 2 180)"
+send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+wait_response 99 30 >/dev/null
+stop_server
+[[ -f "$thumb_idb" ]] || { echo "❌ Thumb raw IDB was not created" >&2; exit 1; }
+
+start_server
+init
+send "$(jq -cn --arg p "$thumb_raw" --arg out "$thumb_idb" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
+assert_ok "Phase 8b Thumb raw reuse" "$(wait_response 2 30)"
+assert_log_contains "Reusing SHA-256-verified IDA database for raw input"
+
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"entrypoints","arguments":{}}}'
+thumb_entrypoints="$(wait_response 3 30)"
+assert_ok "Phase 8b Thumb entry point" "$thumb_entrypoints"
+echo "$thumb_entrypoints" | jq -e '
+  .result.content[0].text | fromjson
+  | index("0x8000100") != null and index("0x8000101") == null
+' >/dev/null || {
+  echo "❌ Thumb-tagged entry point was not normalized to its code address" >&2
+  echo "$thumb_entrypoints" | jq . >&2
+  exit 1
+}
+
+send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"disasm","arguments":{"address":"0x08000100","count":2}}}'
+thumb_disasm="$(wait_response 4 30)"
+assert_ok "Phase 8b Thumb disassembly" "$thumb_disasm"
+echo "$thumb_disasm" | jq -e '
+  .result.content[0].text | test("0x8000100.*NOP"; "is")
+' >/dev/null || {
+  echo "❌ Thumb state was not active at the normalized entry point" >&2
+  echo "$thumb_disasm" | jq . >&2
+  exit 1
+}
+send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
+wait_response 99 30 >/dev/null
+stop_server
+echo "   ✓ odd Thumb pointer and Thumb decoding survived verified reuse"
+
 echo "── Phase 9: failed rebuild removes partial output and permits recovery ──"
 start_server
 init
