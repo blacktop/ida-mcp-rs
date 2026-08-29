@@ -2166,6 +2166,121 @@ fn select_runtime_module(modules: &Value, query: &str) -> Result<Value, ToolErro
     }
 }
 
+enum RuntimeModuleSource {
+    Standalone(std::path::PathBuf),
+    DyldSharedCache(std::path::PathBuf),
+}
+
+impl RuntimeModuleSource {
+    fn open_path(&self) -> &std::path::Path {
+        match self {
+            Self::Standalone(path) | Self::DyldSharedCache(path) => path,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Standalone(_) => "standalone",
+            Self::DyldSharedCache(_) => "dyld_shared_cache",
+        }
+    }
+}
+
+fn target_dyld_cache_names(meta: &Value) -> Result<&'static [&'static str], ToolError> {
+    const ARM64: &[&str] = &["dyld_shared_cache_arm64e", "dyld_shared_cache_arm64"];
+    const X86_64: &[&str] = &["dyld_shared_cache_x86_64h", "dyld_shared_cache_x86_64"];
+
+    let bits = meta.get("bits").and_then(Value::as_u64).ok_or_else(|| {
+        ToolError::RemoteProtocol("idb_meta response did not contain target bitness".to_string())
+    })?;
+    let processor = meta
+        .get("processor")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ToolError::RemoteProtocol(
+                "idb_meta response did not contain target processor".to_string(),
+            )
+        })?
+        .to_ascii_lowercase();
+    if bits != 64 {
+        return Err(ToolError::NotSupported(format!(
+            "dyld shared-cache module opening requires a 64-bit target, got {bits}-bit {processor}"
+        )));
+    }
+    if processor.contains("arm") || processor.contains("aarch64") {
+        return Ok(ARM64);
+    }
+    if processor.contains("metapc")
+        || processor.contains("80x86")
+        || processor.contains("x86")
+        || processor.contains("intel")
+    {
+        return Ok(X86_64);
+    }
+    Err(ToolError::NotSupported(format!(
+        "cannot select a dyld shared cache for target processor {processor}"
+    )))
+}
+
+fn find_target_dyld_cache(
+    meta: &Value,
+    roots: &[&std::path::Path],
+) -> Result<std::path::PathBuf, ToolError> {
+    let names = target_dyld_cache_names(meta)?;
+    for root in roots {
+        for name in names {
+            let candidate = root.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(ToolError::InvalidPath(format!(
+        "no host dyld shared cache found for target architecture (looked for {})",
+        names.join(", ")
+    )))
+}
+
+fn resolve_runtime_module_source(
+    module_path: &std::path::Path,
+    source_meta: Option<&Value>,
+) -> Result<RuntimeModuleSource, ToolError> {
+    if !module_path.is_absolute() {
+        return Err(ToolError::InvalidPath(module_path.display().to_string()));
+    }
+    if module_path.is_file() {
+        return Ok(RuntimeModuleSource::Standalone(module_path.to_path_buf()));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if idalib::SDK_VERSION < (9, 4) {
+            return Err(ToolError::NotSupported(
+                "cache-backed runtime modules require the IDA 9.4 in-process DSC APIs".to_string(),
+            ));
+        }
+        let source_meta = source_meta.ok_or_else(|| {
+            ToolError::RemoteProtocol(
+                "target metadata is required to select the host dyld shared cache".to_string(),
+            )
+        })?;
+        let roots = [
+            std::path::Path::new("/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld"),
+            std::path::Path::new("/System/Library/dyld"),
+        ];
+        find_target_dyld_cache(source_meta, &roots).map(RuntimeModuleSource::DyldSharedCache)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = source_meta;
+        Err(ToolError::InvalidPath(format!(
+            "{} is mapped at runtime but has no on-disk image",
+            module_path.display()
+        )))
+    }
+}
+
 fn checked_runtime_slide(runtime_base: u64, preferred_base: u64) -> Value {
     if runtime_base >= preferred_base {
         let magnitude = runtime_base - preferred_base;
@@ -3026,7 +3141,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Open a module returned by debug_modules in a new workspace database. idb_out is always required."
+        description = "Open a module returned by debug_modules in a new workspace database. Standalone images open directly; cache-backed macOS system modules use IDA 9.4's in-process DSC APIs. idb_out is always required."
     )]
     #[instrument(skip_all)]
     async fn debug_open_module(
@@ -3087,26 +3202,21 @@ impl IdaMcpServer {
         };
         let module_path = module_path.to_string();
         let expanded_module = crate::expand_path(&module_path);
-        if !expanded_module.is_absolute() {
-            return Ok(
-                ToolError::InvalidPath(expanded_module.display().to_string()).to_tool_result(),
-            );
-        }
-        if !expanded_module.is_file() {
-            // Most macOS system libraries have no on-disk image: they live
-            // only inside the dyld shared cache. Say so instead of returning
-            // a bare "invalid path" for a module debug_modules just listed.
-            return Ok(ToolError::InvalidPath(format!(
-                "{} is mapped at runtime but has no on-disk image; system libraries usually live \
-                 only inside the dyld shared cache — open those with open_dsc/dsc_add_dylib \
-                 instead of debug_open_module",
-                expanded_module.display()
-            ))
-            .to_tool_result());
-        }
-        if expanded_module == output {
+        let source_meta = if expanded_module.is_file() {
+            None
+        } else {
+            match self.worker.idb_meta().await {
+                Ok(meta) => Some(meta),
+                Err(error) => return Ok(error.to_tool_result()),
+            }
+        };
+        let source = match resolve_runtime_module_source(&expanded_module, source_meta.as_ref()) {
+            Ok(source) => source,
+            Err(error) => return Ok(error.to_tool_result()),
+        };
+        if source.open_path() == output {
             return Ok(ToolError::InvalidParams(
-                "idb_out must not overwrite the runtime module image".to_string(),
+                "idb_out must not overwrite the runtime module source".to_string(),
             )
             .to_tool_result());
         }
@@ -3115,8 +3225,8 @@ impl IdaMcpServer {
         let database_id = lease.database_id().to_string();
         let destination = WorkerBackend::pooled(lease.database());
         let opened = destination
-            .open_observed(
-                &expanded_module.display().to_string(),
+            .open_observed_with_generation(
+                &source.open_path().display().to_string(),
                 false,
                 None,
                 false,
@@ -3139,6 +3249,23 @@ impl IdaMcpServer {
                 let _ = registry.close_database(&database_id).await;
                 return Ok(error.to_tool_result());
             }
+        };
+        let generation = opened.generation;
+        let opened = opened.info;
+        let dsc_image = if matches!(source, RuntimeModuleSource::DyldSharedCache(_)) {
+            match destination
+                .dsc_load_image_for_generation(&module_path, Some(timeout_secs), Some(generation))
+                .await
+            {
+                Ok(image) => Some(image),
+                Err(error) => {
+                    drop(lease);
+                    let _ = registry.close_database(&database_id).await;
+                    return Ok(error.to_tool_result());
+                }
+            }
+        } else {
+            None
         };
         let segments = match destination.segments().await {
             Ok(segments) => segments,
@@ -3164,6 +3291,8 @@ impl IdaMcpServer {
             "database_id": database_id,
             "module": module,
             "database": opened,
+            "module_source": source.kind(),
+            "dsc_image": dsc_image,
             "preferred_base": preferred_base.map(|base| format!("{base:#x}")),
             "preferred_base_value": preferred_base,
             "runtime_slide": runtime_slide,
@@ -7003,12 +7132,13 @@ mod tests {
         add_workspace_database_id_schema, add_workspace_schema, apply_close_metadata,
         apply_task_update, attach_workspace_database_id, call_tool_result_to_value,
         checked_runtime_slide, close_hint_for, disabled_tool_message, dsc_open_plan,
-        is_sessionless_request_meta, materialize_task_response, normalize_schema_value,
+        find_target_dyld_cache, is_sessionless_request_meta, materialize_task_response,
+        normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
         run_script_failure_message, run_script_succeeded, run_script_timeout_message,
-        run_script_truncate_chars, select_runtime_module, supported_protocol_versions, task,
-        task_payload_result_value, task_state_to_detailed_task, task_state_to_mcp_task,
-        timeout_with_child_grace, tool_annotations_for, tool_params_schema,
+        run_script_truncate_chars, select_runtime_module, supported_protocol_versions,
+        target_dyld_cache_names, task, task_payload_result_value, task_state_to_detailed_task,
+        task_state_to_mcp_task, timeout_with_child_grace, tool_annotations_for, tool_params_schema,
         workspace_close_should_remove_entry, DscOpenPlan, IdaMcpServer, OpenIdbBackgroundDecision,
         RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest, ToolHelpRequest,
         XrefsRequest,
@@ -7709,6 +7839,44 @@ mod tests {
             checked_runtime_slide(u64::MAX, 0)["magnitude_value"],
             json!(u64::MAX)
         );
+    }
+
+    #[test]
+    fn dyld_cache_selection_uses_target_metadata_not_host_architecture() {
+        let arm = json!({"processor": "ARM little-endian", "bits": 64});
+        let x86 = json!({"processor": "Intel 80x86 processors: metapc", "bits": 64});
+        assert_eq!(
+            target_dyld_cache_names(&arm).expect("arm64 target cache names"),
+            ["dyld_shared_cache_arm64e", "dyld_shared_cache_arm64"]
+        );
+        assert_eq!(
+            target_dyld_cache_names(&x86).expect("x86-64 target cache names"),
+            ["dyld_shared_cache_x86_64h", "dyld_shared_cache_x86_64"]
+        );
+        assert!(target_dyld_cache_names(&json!({"processor": "ARM", "bits": 32})).is_err());
+    }
+
+    #[test]
+    fn dyld_cache_lookup_respects_target_specific_candidates() {
+        let dir = std::env::temp_dir().join(format!("ida-mcp-dsc-target-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create cache fixture directory");
+        let arm_cache = dir.join("dyld_shared_cache_arm64e");
+        std::fs::write(&arm_cache, b"cache").expect("write target cache fixture");
+
+        let selected =
+            find_target_dyld_cache(&json!({"processor": "ARM", "bits": 64}), &[dir.as_path()])
+                .expect("select target cache");
+        assert_eq!(selected, arm_cache);
+        assert!(
+            find_target_dyld_cache(
+                &json!({"processor": "metapc", "bits": 64}),
+                &[dir.as_path()],
+            )
+            .is_err(),
+            "an ARM cache must not satisfy an x86-64 target"
+        );
+
+        std::fs::remove_dir_all(dir).expect("remove cache fixture directory");
     }
 
     #[test]

@@ -279,13 +279,28 @@ send "$(jq -cn --arg p "$explicit_raw" --arg out "$explicit_idb" \
   '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
 assert_ok "Phase 5 hash-verified explicit reuse" "$(wait_response 2 30)"
 assert_log_contains "Reusing SHA-256-verified IDA database for raw input"
+
+# Idempotency is content identity, not merely output-path identity. Mutate the
+# raw input while its explicit output is still open, then retry the exact same
+# request. The server must refuse to return stale analysis from the open IDB.
+printf '\0' >>"$explicit_raw"
+send "$(jq -cn --arg p "$explicit_raw" --arg out "$explicit_idb" \
+  '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
+stale_open_response="$(wait_response 3 30)"
+assert_err "Phase 5 changed input against already-open output" "$stale_open_response"
+echo "$stale_open_response" | jq -e '
+  .result.content[0].text | contains("A database is already open")
+' >/dev/null || {
+  echo "❌ already-open stale input was rejected for the wrong reason" >&2
+  echo "$stale_open_response" | jq . >&2
+  exit 1
+}
 send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
 wait_response 99 30 >/dev/null
 stop_server
-echo "   ✓ matching input reused explicit output"
+echo "   ✓ matching input reused explicit output; changed bytes were refused while open"
 
-echo "── Phase 6: changed input cannot blindly adopt explicit idb_out ──"
-printf '\0' >>"$explicit_raw"
+echo "── Phase 6: changed input cannot blindly adopt explicit idb_out after close ──"
 start_server
 init
 send "$(jq -cn --arg p "$explicit_raw" --arg out "$explicit_idb" \

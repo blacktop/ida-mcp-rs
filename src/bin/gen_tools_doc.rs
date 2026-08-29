@@ -150,7 +150,7 @@ fn main() {
     );
     let _ = writeln!(
         out,
-        "- `debug_open_module` always requires `idb_out` and opens a separate workspace database"
+        "- `debug_open_module` always requires `idb_out`, opens a separate workspace database, and resolves macOS cache-backed modules through IDA 9.4's in-process DSC service"
     );
 
     let args: Vec<String> = std::env::args().collect();

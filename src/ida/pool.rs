@@ -842,11 +842,12 @@ pub struct WorkspaceDatabase {
 ///   start completion pins nothing and its success-shaped result is replaced
 ///   with [`crate::error::ToolError::DebuggerSessionLost`], never reported as
 ///   a live session. The reaper reads pins via `try_lock`
-///   (`debug_pin_reap_decision`), treating contention as busy — no
-///   cross-atomic memory-ordering contract — and clears a live worker's pin
-///   only after IDA affirmatively reports `no_process`. A pinned lease whose
-///   worker transport closed out of band is terminal loss: the reaper clears
-///   the lease and retires the slot; tests
+///   (`lease_reap_decision`), treating contention as busy — no
+///   cross-atomic memory-ordering contract. A healthy pin clears only through
+///   successful `debug_stop` or database close; a pinned lease whose worker
+///   transport closed out of band is terminal loss, so the reaper clears the
+///   lease and retires the slot. External target exit without another
+///   debugger call remains a documented limitation; tests
 ///   `debug_pin_cannot_exist_without_its_lease` and
 ///   `debug_start_pins_whenever_worker_retains_ownership`.
 /// - **I2 — pins block reaping:** an entry with active calls, task pins, or a
@@ -865,8 +866,8 @@ pub struct WorkspaceDatabase {
 ///   `workspace_close_retains_entry_while_background_open_is_running`.
 /// - **I4 — retained session pins:** every debugger start that leaves the
 ///   child owning a live process pins the entry, including error and
-///   `user_action_required` results. Enforced by `finish_debugger_start` over
-///   the explicit `session_retained` /
+///   `user_action_required` results. Enforced by `debug_start` over the
+///   explicit `session_retained` /
 ///   [`crate::error::ToolError::DebuggerStartRetained`] signals.
 /// - **I5 — stop unpins:** a debug stop that ends ownership (including the
 ///   already-exited `NoProcess` escape) clears the session and the pin.
@@ -881,6 +882,11 @@ pub struct WorkspaceDatabase {
 ///   generation can never reach a reopened database. Enforced by
 ///   [`WorkspaceDatabase::required_handle_for_generation`], atomically with
 ///   handle acquisition.
+/// - **I9 — health is not retention:** worker transport liveness is probed
+///   independently of the workspace idle timeout. A zero timeout disables
+///   only healthy idle eviction; it never disables dead-worker retirement or
+///   terminal handle removal. Enforced by [`workspace_reaper`]; the strict
+///   debugger oracle kills a pooled worker under a zero-TTL registry.
 #[derive(Clone)]
 pub struct WorkspaceRegistry {
     inner: Arc<WorkspaceRegistryInner>,
@@ -964,18 +970,25 @@ pub struct WorkspaceDatabaseSummary {
     pub debug_pinned: bool,
 }
 
-/// Outcome of the reaper's debug-pin probe for one workspace entry.
-enum DebugPinReapDecision {
-    /// No lease, or a lease with no debug pin: the pin does not block reaping.
-    Unpinned,
-    /// A pinned lease whose debugger still owns a process, or whose state
-    /// could not be proven: the entry must stay.
-    Pinned,
+/// Outcome of the reaper's lease-health probe for one workspace entry.
+enum LeaseReapDecision {
+    /// No worker lease is installed.
+    NoLease,
+    /// The worker transport is healthy and no debugger pin blocks eviction.
+    HealthyUnpinned,
+    /// The worker transport is healthy and a debugger pin blocks idle
+    /// eviction.
+    HealthyPinned,
     /// A lease or slot mutex was contended: the database is mid-operation.
     Busy,
-    /// A pinned lease whose worker transport closed out of band. The lease
-    /// has been cleared; the caller retires the returned slot.
+    /// A lease whose worker transport closed out of band. The lease has been
+    /// cleared; the caller retires the returned slot.
     DeadWorker(Arc<ChildSlot>),
+}
+
+enum WorkspaceReapReason {
+    Idle,
+    DeadWorker,
 }
 
 /// Report the loss of a worker that was hosting a live debugger session.
@@ -1181,18 +1194,19 @@ impl WorkspaceRegistry {
     }
 
     fn spawn_reaper(&self) {
-        if self.inner.idle_timeout.is_zero() {
-            return;
-        }
         let Ok(runtime) = Handle::try_current() else {
             return;
         };
         let weak = Arc::downgrade(&self.inner);
-        let interval = match self.inner.idle_timeout.checked_div(2) {
-            Some(interval) => interval,
-            None => Duration::from_secs(1),
-        }
-        .clamp(Duration::from_secs(1), Duration::from_secs(30));
+        let interval = if self.inner.idle_timeout.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            self.inner
+                .idle_timeout
+                .checked_div(2)
+                .unwrap_or(Duration::from_secs(1))
+                .clamp(Duration::from_secs(1), Duration::from_secs(30))
+        };
         runtime.spawn(async move {
             workspace_reaper(weak, interval).await;
         });
@@ -1205,8 +1219,9 @@ async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duratio
         let Some(inner) = Weak::upgrade(&inner) else {
             break;
         };
-        // Phase 1: idle candidates by the synchronous guards. The debug-pin
-        // decision probes worker slots, so it runs outside the registry lock.
+        // Phase 1: every unguarded workspace lease is a health candidate.
+        // Healthy idle eviction is a later policy decision; transport
+        // liveness must still run when idle eviction is disabled (I9).
         let candidates = {
             let entries = match inner.entries.lock() {
                 Ok(entries) => entries,
@@ -1217,29 +1232,32 @@ async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duratio
                 if !entry.legacy
                     && entry.active_calls.load(Ordering::Relaxed) == 0
                     && entry.pins.load(Ordering::Relaxed) == 0
-                    && entry.idle_for() >= inner.idle_timeout
                 {
-                    candidates.push((id.clone(), entry.database.clone()));
+                    candidates.push((id.clone(), entry.clone()));
                 }
             }
             candidates
         };
-        // Phase 2: debug-pin gate. A pinned lease whose worker exited out of
-        // band is terminal loss detected here — no dispatch will ever clear
-        // it — so the lease is dropped and the slot retired (I1/I2).
-        let mut reapable = Vec::new();
-        for (database_id, database) in candidates {
-            match database.debug_pin_reap_decision().await {
-                DebugPinReapDecision::Unpinned => reapable.push(database_id),
-                DebugPinReapDecision::Pinned => {}
-                DebugPinReapDecision::Busy => {}
-                DebugPinReapDecision::DeadWorker(slot) => {
+        // Phase 2: probe transport health outside the registry lock. Dead
+        // workers are terminal regardless of TTL or debugger pin; healthy
+        // unpinned entries are eligible only under the idle policy.
+        let mut idle_reapable = Vec::new();
+        let mut dead_reapable = Vec::new();
+        for (database_id, entry) in candidates {
+            match entry.database.lease_reap_decision().await {
+                LeaseReapDecision::NoLease | LeaseReapDecision::HealthyUnpinned => {
+                    if !inner.idle_timeout.is_zero() && entry.idle_for() >= inner.idle_timeout {
+                        idle_reapable.push(database_id);
+                    }
+                }
+                LeaseReapDecision::HealthyPinned | LeaseReapDecision::Busy => {}
+                LeaseReapDecision::DeadWorker(slot) => {
                     warn!(
                         database_id,
-                        "debug-pinned worker exited out of band; clearing its lease"
+                        "workspace worker exited out of band; clearing its lease"
                     );
                     inner.pool.mark_dead(&slot).await;
-                    reapable.push(database_id);
+                    dead_reapable.push(database_id);
                 }
             }
         }
@@ -1252,21 +1270,48 @@ async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duratio
                 Err(poisoned) => poisoned.into_inner(),
             };
             let mut expired = Vec::new();
-            for database_id in reapable {
+            for database_id in idle_reapable {
                 let still_reapable = entries.get(&database_id).is_some_and(|entry| {
                     !entry.legacy
                         && entry.active_calls.load(Ordering::Relaxed) == 0
                         && entry.pins.load(Ordering::Relaxed) == 0
+                        && !inner.idle_timeout.is_zero()
                         && entry.idle_for() >= inner.idle_timeout
                 });
                 if still_reapable && let Some(entry) = entries.remove(&database_id) {
-                    expired.push((database_id, entry.database.clone()));
+                    expired.push((
+                        database_id,
+                        entry.database.clone(),
+                        WorkspaceReapReason::Idle,
+                    ));
+                }
+            }
+            for database_id in dead_reapable {
+                let still_terminal = entries.get(&database_id).is_some_and(|entry| {
+                    !entry.legacy
+                        && entry.active_calls.load(Ordering::Relaxed) == 0
+                        && entry.pins.load(Ordering::Relaxed) == 0
+                        && entry.database.lease_is_absent()
+                });
+                if still_terminal && let Some(entry) = entries.remove(&database_id) {
+                    expired.push((
+                        database_id,
+                        entry.database.clone(),
+                        WorkspaceReapReason::DeadWorker,
+                    ));
                 }
             }
             expired
         };
-        for (database_id, database) in expired {
-            info!(database_id, "reaping idle workspace database");
+        for (database_id, database, reason) in expired {
+            match reason {
+                WorkspaceReapReason::Idle => {
+                    info!(database_id, "reaping idle workspace database");
+                }
+                WorkspaceReapReason::DeadWorker => {
+                    info!(database_id, "removing terminal workspace database");
+                }
+            }
             let _ = database.close().await;
         }
     }
@@ -1423,7 +1468,7 @@ impl WorkspaceDatabase {
         }
     }
 
-    /// Reaper-side debug-pin gate. Contended state reads as busy so the
+    /// Reaper-side lease-health and debug-pin gate. Contended state reads as busy so the
     /// reaper never blocks behind an in-flight call, and no cross-atomic
     /// ordering contract is needed. A pinned lease whose worker transport
     /// already closed is reported as terminal worker loss: without this probe
@@ -1437,18 +1482,15 @@ impl WorkspaceDatabase {
     /// the target exited. A session whose target dies externally therefore
     /// stays pinned until `debug_stop`, `close_idb`, or worker loss — a
     /// documented limitation, not silent cleanup.
-    async fn debug_pin_reap_decision(&self) -> DebugPinReapDecision {
+    async fn lease_reap_decision(&self) -> LeaseReapDecision {
         let Ok(mut guard) = self.handle.try_lock() else {
-            return DebugPinReapDecision::Busy;
+            return LeaseReapDecision::Busy;
         };
         let Some(lease) = guard.as_ref() else {
-            return DebugPinReapDecision::Unpinned;
+            return LeaseReapDecision::NoLease;
         };
-        if !lease.debug_pinned {
-            return DebugPinReapDecision::Unpinned;
-        }
         let Ok(child) = lease.handle.slot.child.try_lock() else {
-            return DebugPinReapDecision::Busy;
+            return LeaseReapDecision::Busy;
         };
         let worker_unavailable = child.state == ChildState::Dead
             || child
@@ -1457,12 +1499,22 @@ impl WorkspaceDatabase {
                 .is_none_or(|service| service.is_transport_closed());
         drop(child);
         if !worker_unavailable {
-            return DebugPinReapDecision::Pinned;
+            return if lease.debug_pinned {
+                LeaseReapDecision::HealthyPinned
+            } else {
+                LeaseReapDecision::HealthyUnpinned
+            };
         }
         let Some(lease) = guard.take() else {
-            return DebugPinReapDecision::Unpinned;
+            return LeaseReapDecision::NoLease;
         };
-        DebugPinReapDecision::DeadWorker(lease.handle.slot)
+        LeaseReapDecision::DeadWorker(lease.handle.slot)
+    }
+
+    /// Re-verify that terminal worker loss did not race a new open that
+    /// installed a replacement lease.
+    fn lease_is_absent(&self) -> bool {
+        self.handle.try_lock().is_ok_and(|lease| lease.is_none())
     }
 
     fn next_database_generation(&self) -> Result<DatabaseGeneration, ToolError> {
@@ -3188,7 +3240,7 @@ mod tests {
         debugger_worker_loss_error, extract_first_matches, find_bytes_child_args,
         lumina_apply_child_args, open_error_releases_lease, open_idb_child_args,
         release_error_retires_worker, require_lease_generation, run_script_child_args,
-        search_child_args, DebugPinReapDecision, WorkerPool, WorkerPoolConfig, WorkspaceRegistry,
+        search_child_args, LeaseReapDecision, WorkerPool, WorkerPoolConfig, WorkspaceRegistry,
     };
     use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget};
     use crate::ida::worker::DEBUG_MODULES_TIMEOUT_SECS;
@@ -3319,19 +3371,19 @@ mod tests {
                 .set_debug_pin_for_lease((7, DatabaseGeneration(1)), true)
                 .await
         );
-        let DebugPinReapDecision::Unpinned = database.debug_pin_reap_decision().await else {
+        let LeaseReapDecision::NoLease = database.lease_reap_decision().await else {
             panic!("a lease-less database must not report a blocking pin");
         };
 
         // Worker loss with no lease installed is a no-op, not a panic.
         database.clear_handle_if_worker(7).await;
-        let DebugPinReapDecision::Unpinned = database.debug_pin_reap_decision().await else {
+        let LeaseReapDecision::NoLease = database.lease_reap_decision().await else {
             panic!("worker loss without a lease must leave the entry reapable");
         };
 
         // A contended lease mutex reads as busy rather than unpinned.
         let guard = database.handle.lock().await;
-        let DebugPinReapDecision::Busy = database.debug_pin_reap_decision().await else {
+        let LeaseReapDecision::Busy = database.lease_reap_decision().await else {
             panic!("a contended lease mutex must read as busy");
         };
         drop(guard);

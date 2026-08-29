@@ -198,4 +198,4 @@ Execute Python scripts via IDAPython
 - String inputs may be comma-separated: `"0x1000, 0x2000"`
 - Addresses accept hex (`0x1000`) or decimal (`4096`)
 - Raw binaries default to `<input>.i64`; use `idb_out` for read-only input locations. Existing output is reused only after input SHA-256 verification
-- `debug_open_module` always requires `idb_out` and opens a separate workspace database
+- `debug_open_module` always requires `idb_out`, opens a separate workspace database, and resolves macOS cache-backed modules through IDA 9.4's in-process DSC service

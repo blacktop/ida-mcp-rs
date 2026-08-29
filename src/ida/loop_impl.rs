@@ -748,8 +748,13 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 arguments,
                 start_directory,
                 timeout_seconds,
+                admission,
                 resp,
             } => {
+                if let Err(error) = admission.start() {
+                    let _ = resp.send(Err(error));
+                    continue;
+                }
                 debug!(path = %path, timeout_seconds, "Launching debugger target");
                 let result = crate::crash_guard::crash_guarded("debug_launch", || {
                     debugger::launch(
@@ -767,8 +772,13 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             IdaRequest::DebugAttach {
                 pid,
                 timeout_seconds,
+                admission,
                 resp,
             } => {
+                if let Err(error) = admission.start() {
+                    let _ = resp.send(Err(error));
+                    continue;
+                }
                 debug!(pid, timeout_seconds, "Attaching debugger target");
                 let result = crate::crash_guard::crash_guarded("debug_attach", || {
                     debugger::attach(&mut debugger_runtime, &idb, pid, timeout_seconds)
@@ -791,8 +801,13 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             IdaRequest::DebugStop {
                 action,
                 timeout_seconds,
+                admission,
                 resp,
             } => {
+                if let Err(error) = admission.start() {
+                    let _ = resp.send(Err(error));
+                    continue;
+                }
                 debug!(
                     action = action.as_str(),
                     timeout_seconds, "Stopping debugger target"
@@ -829,8 +844,13 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             IdaRequest::DscLoadImage {
                 module,
                 expected_generation,
+                admission,
                 resp,
             } => {
+                if let Err(error) = admission.start() {
+                    let _ = resp.send(Err(error));
+                    continue;
+                }
                 if let Err(err) = require_generation(expected_generation, database_generation) {
                     let _ = resp.send(Err(err));
                     continue;
@@ -850,7 +870,15 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 }
                 let _ = resp.send(result);
             }
-            IdaRequest::DscLoadRegion { addr, resp } => {
+            IdaRequest::DscLoadRegion {
+                addr,
+                admission,
+                resp,
+            } => {
+                if let Err(error) = admission.start() {
+                    let _ = resp.send(Err(error));
+                    continue;
+                }
                 debug!(address = format!("{addr:#x}"), "Loading DSC region");
                 let result = crate::crash_guard::crash_guarded("handle_dsc_load_region", || {
                     dscu::handle_dsc_load_region(&idb, addr)
@@ -1703,8 +1731,13 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
             IdaRequest::AnalyzeFuncs {
                 progress_tx,
                 cancel,
+                admission,
                 resp,
             } => {
+                if let Err(error) = admission.start() {
+                    let _ = resp.send(Err(error));
+                    continue;
+                }
                 if let Err(err) = ensure_not_cancelled(cancel.as_ref()) {
                     emit_progress(
                         progress_tx.as_ref(),
@@ -1940,8 +1973,13 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 code,
                 progress_tx,
                 cancel,
+                admission,
                 resp,
             } => {
+                if let Err(error) = admission.start() {
+                    let _ = resp.send(Err(error));
+                    continue;
+                }
                 if let Err(err) = ensure_not_cancelled(cancel.as_ref()) {
                     emit_progress(
                         progress_tx.as_ref(),

@@ -224,11 +224,67 @@ case "$launch_status" in
       exit 1
     }
 
+    close_module_request="$(jq -cn --arg id "$module_id" \
+      '{jsonrpc:"2.0",id:9,method:"tools/call",params:{name:"close_idb",arguments:{database_id:$id}}}')"
+    send "$close_module_request"
+    assert_ok "close runtime module database" "$(wait_response 9 30)"
+    [[ -f "$module_output" ]] || {
+      echo "closing the runtime module database did not materialize the requested IDB output" >&2
+      exit 1
+    }
+
     modules_after_request="$(jq -cn --arg id "$source_id" \
       '{jsonrpc:"2.0",id:7,method:"tools/call",params:{name:"debug_modules",arguments:{database_id:$id}}}')"
     send "$modules_after_request"
     modules_after_response="$(wait_response 7 30)"
     assert_ok "source debugger survives module open" "$modules_after_response"
+
+    # Select a module that the debugger reports but the filesystem does not:
+    # on modern macOS this is the public shape of a dyld-cache-backed system
+    # library. debug_open_module must resolve it without an extracted dylib or
+    # an idat subprocess.
+    cache_module=""
+    while IFS= read -r candidate; do
+      if [[ "$candidate" == /* && ! -f "$candidate" ]]; then
+        cache_module="$candidate"
+        break
+      fi
+    done < <(jq -r '.modules[].path // empty' <<<"$modules_text")
+    [[ -n "$cache_module" ]] || {
+      echo "FAIL: debugger reported no cache-backed runtime module for DSC coverage" >&2
+      printf '%s\n' "$modules_text" >&2
+      exit 1
+    }
+
+    cache_module_output="$tmpdir/runtime-cache-module.i64"
+    cache_open_request="$(jq -cn \
+      --arg id "$source_id" --arg module "$cache_module" --arg output "$cache_module_output" \
+      '{jsonrpc:"2.0",id:18,method:"tools/call",params:{name:"debug_open_module",arguments:{database_id:$id,module:$module,idb_out:$output,timeout_secs:600}}}')"
+    send "$cache_open_request"
+    cache_open_response="$(wait_response 18 660)"
+    assert_ok "open cache-backed runtime module database" "$cache_open_response"
+    cache_module_text="$(result_text <<<"$cache_open_response")"
+    cache_module_id="$(jq -r '.database_id // empty' <<<"$cache_module_text")"
+    jq -e --arg source "$source_id" --arg module "$cache_module" '
+      .status == "ready"
+      and .source_database_id == $source
+      and .module.path == $module
+      and .module_source == "dyld_shared_cache"
+      and (.dsc_image.name | type == "string")
+      and (.runtime_slide.signed | type == "string")
+    ' >/dev/null <<<"$cache_module_text" || {
+      echo "FAIL: cache-backed debug_open_module result shape mismatch" >&2
+      printf '%s\n' "$cache_module_text" >&2
+      exit 1
+    }
+    cache_close_request="$(jq -cn --arg id "$cache_module_id" \
+      '{jsonrpc:"2.0",id:19,method:"tools/call",params:{name:"close_idb",arguments:{database_id:$id}}}')"
+    send "$cache_close_request"
+    assert_ok "close cache-backed runtime module database" "$(wait_response 19 60)"
+    [[ -f "$cache_module_output" ]] || {
+      echo "cache-backed runtime module did not materialize the requested IDB output" >&2
+      exit 1
+    }
 
     stop_request="$(jq -cn --arg id "$source_id" \
       '{jsonrpc:"2.0",id:8,method:"tools/call",params:{name:"debug_stop",arguments:{database_id:$id,action:"auto",timeout_secs:10}}}')"
@@ -256,15 +312,6 @@ case "$launch_status" in
       exit 1
     fi
     echo "   nonexistent attach target was not misreported as an authorization prompt"
-
-    close_module_request="$(jq -cn --arg id "$module_id" \
-      '{jsonrpc:"2.0",id:9,method:"tools/call",params:{name:"close_idb",arguments:{database_id:$id}}}')"
-    send "$close_module_request"
-    assert_ok "close runtime module database" "$(wait_response 9 30)"
-    [[ -f "$module_output" ]] || {
-      echo "closing the runtime module database did not materialize the requested IDB output" >&2
-      exit 1
-    }
 
     external_launch_request="$(jq -cn --arg id "$source_id" --arg path "$external_fixture_path" \
       '{jsonrpc:"2.0",id:12,method:"tools/call",params:{name:"debug_launch",arguments:{database_id:$id,path:$path,timeout_secs:10}}}')"
@@ -319,7 +366,8 @@ case "$launch_status" in
     debuggee_pid=""
     echo "   debugger launch, module-to-IDB open, terminal stop, and external-exit stop/close recovery passed"
 
-    # Debug-pin reaping uses a second server with a 2-second idle TTL. It
+    # Worker-loss reaping uses a second server with healthy idle eviction
+    # disabled. This proves transport maintenance is independent of TTL and
     # covers terminal worker loss only. A target killed outside ida-mcp is a
     # documented limitation, not an oracle: IDA's process state is a cached
     # getter, so nothing can observe that exit until a call drains the
@@ -332,7 +380,7 @@ case "$launch_status" in
     stderr2_log="$tmpdir/server2.err"
     mkfifo "$fifo2"
     RUST_LOG="${RUST_LOG:-ida_mcp=info}" "$BIN" --workspace --workspace-max-workers 2 \
-      --enable-debugger --workspace-idle-timeout-secs 2 \
+      --enable-debugger --workspace-idle-timeout-secs 0 \
       <"$fifo2" >"$stdout2_log" 2>"$stderr2_log" &
     server2_pid=$!
     exec 4>"$fifo2"
@@ -415,8 +463,8 @@ case "$launch_status" in
 
     reap_seen=0
     for _ in $(seq 1 200); do
-      if grep -q "debug-pinned worker exited out of band" "$stderr2_log" 2>/dev/null \
-        && grep -q "reaping idle workspace database" "$stderr2_log" 2>/dev/null; then
+      if grep -q "workspace worker exited out of band" "$stderr2_log" 2>/dev/null \
+        && grep -q "removing terminal workspace database" "$stderr2_log" 2>/dev/null; then
         reap_seen=1
         break
       fi
@@ -434,7 +482,7 @@ case "$launch_status" in
     # reported for the record. The matching server contract — that a retired
     # debug-pinned worker reports a lost session and never claims the debuggee
     # ended — is asserted deterministically by the unit test
-    # `retiring_a_debug_pinned_worker_reports_the_session_as_lost`.
+    # `retiring_a_debugger_worker_reports_session_loss_truthfully`.
     helper_alive=0
     debuggee_alive=0
     [[ -n "${helper2_pid:-}" ]] && kill -0 "$helper2_pid" >/dev/null 2>&1 && helper_alive=1
