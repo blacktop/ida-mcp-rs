@@ -1,11 +1,15 @@
 //! Multi-process worker pool for HTTP sessions.
 
 use crate::error::ToolError;
+use crate::ida::handlers::debugger::DEBUGGER_TEARDOWN_TIMEOUT_SECS;
 use crate::ida::lock::remove_mcp_lock_for_pid;
 use crate::ida::observability::ProgressSender;
 use crate::ida::remote;
 use crate::ida::types::*;
-use crate::ida::worker::{DEBUG_MODULES_TIMEOUT_SECS, MAX_TIMEOUT_SECS};
+use crate::ida::worker::{
+    debugger_response_timeout_secs, CLOSE_SEND_TIMEOUT_SECS, DEBUG_MODULES_TIMEOUT_SECS,
+    MAX_TIMEOUT_SECS,
+};
 use futures_util::future::join_all;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{CallToolResult, ClientInfo, JsonObject};
@@ -28,8 +32,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-const CHILD_CLOSE_TIMEOUT_SECS: u64 = 5;
+const CHILD_SERVICE_CLOSE_TIMEOUT_SECS: u64 = 5;
 pub(crate) const CHILD_TIMEOUT_GRACE_SECS: u64 = 10;
+// A close_idb RPC can spend its enqueue and debugger teardown budgets before
+// packing the database and sending its response. Its parent watchdog must
+// leave the same post-child grace as every other pooled operation.
+const MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS: u64 =
+    CLOSE_SEND_TIMEOUT_SECS + DEBUGGER_TEARDOWN_TIMEOUT_SECS as u64 + CHILD_TIMEOUT_GRACE_SECS;
 
 #[derive(Debug, Clone)]
 pub struct WorkerPoolConfig {
@@ -496,17 +505,15 @@ impl WorkerPool {
         };
 
         let args = remote::json_object(json!({}))?;
-        let close = tokio::time::timeout(
-            Duration::from_secs(CHILD_CLOSE_TIMEOUT_SECS),
-            remote::call_tool(&peer, "close_idb", args),
-        )
-        .await;
+        let close_timeout = self.close_rpc_timeout();
+        let close =
+            tokio::time::timeout(close_timeout, remote::call_tool(&peer, "close_idb", args)).await;
 
         let close_error = match close {
             Ok(Ok(result)) if result.is_error != Some(true) => None,
             Ok(Ok(result)) => remote::result_error(&result, "close_idb"),
             Ok(Err(err)) => Some(err),
-            Err(_) => Some(ToolError::Timeout(CHILD_CLOSE_TIMEOUT_SECS)),
+            Err(_) => Some(ToolError::Timeout(close_timeout.as_secs())),
         };
 
         let close_error = match close_error {
@@ -653,7 +660,7 @@ impl WorkerPool {
     async fn finish_dead_worker(worker_id: usize, mut dead: DeadWorker) {
         if let Some(mut service) = dead.service.take() {
             let _ = service
-                .close_with_timeout(Duration::from_secs(CHILD_CLOSE_TIMEOUT_SECS))
+                .close_with_timeout(Duration::from_secs(CHILD_SERVICE_CLOSE_TIMEOUT_SECS))
                 .await;
         }
         if let Some(idb_path) = dead.idb_path.as_ref() {
@@ -721,6 +728,8 @@ impl WorkerPool {
         count
     }
 
+    /// Add parent response/retirement grace to a child-side deadline, then
+    /// honor the operator's process-safety hard cap.
     fn worker_op_timeout(&self, requested: Option<u64>) -> Duration {
         let configured = self.config.worker_op_timeout;
         requested
@@ -732,6 +741,16 @@ impl WorkerPool {
             .map(Duration::from_secs)
             .map(|requested| requested.min(configured))
             .unwrap_or(configured)
+    }
+
+    /// Closing owns process and database cleanup, so its watchdog cannot be
+    /// configured below the child's bounded enqueue and debugger-teardown
+    /// phases. Longer configured operation timeouts remain available for
+    /// packing large databases.
+    fn close_rpc_timeout(&self) -> Duration {
+        self.config
+            .worker_op_timeout
+            .max(Duration::from_secs(MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS))
     }
 }
 
@@ -889,6 +908,12 @@ pub struct WorkspaceDatabase {
 ///   debugger oracle kills a pooled worker under a zero-TTL registry, and
 ///   `workspace_zero_ttl_still_reaps_terminal_no_lease_handles` covers the
 ///   lease-less terminal state while preserving active and pinned handles.
+/// - **I10 — watchdogs enclose child deadlines:** debugger response waits add
+///   worker-local grace after the SDK event timeout, and the pooled watchdog
+///   adds parent grace after that. `close_idb` likewise adds parent grace after
+///   its bounded enqueue and debugger teardown phases. The configured
+///   operation watchdog is an explicit operator hard cap. Enforced by
+///   `debugger_timeout_layers_are_strictly_nested`.
 #[derive(Clone)]
 pub struct WorkspaceRegistry {
     inner: Arc<WorkspaceRegistryInner>,
@@ -1935,7 +1960,7 @@ impl WorkspaceDatabase {
             .dispatch_result_for_generation(
                 tool,
                 args,
-                Some(u64::from(timeout_seconds).saturating_add(5)),
+                Some(debugger_response_timeout_secs(timeout_seconds)),
                 None,
                 None,
             )
@@ -1994,7 +2019,7 @@ impl WorkspaceDatabase {
             .dispatch_result_for_generation(
                 "debug_stop",
                 json!({ "action": action.as_str(), "timeout_secs": timeout_seconds }),
-                Some(u64::from(timeout_seconds).saturating_add(5)),
+                Some(debugger_response_timeout_secs(timeout_seconds)),
                 None,
                 None,
             )
@@ -3226,15 +3251,19 @@ fn log_stderr_line(worker_id: usize, line: &[u8]) {
 #[cfg(test)]
 mod tests {
     use crate::error::ToolError;
+    use crate::ida::handlers::debugger::DEBUGGER_TEARDOWN_TIMEOUT_SECS;
     use crate::ida::pool::{
         analyze_funcs_child_args, child_tool_error_retires_worker, debug_start_retains_session,
         debugger_worker_loss_error, extract_first_matches, find_bytes_child_args,
         lumina_apply_child_args, open_error_releases_lease, open_idb_child_args,
         release_error_retires_worker, require_lease_generation, run_script_child_args,
         search_child_args, LeaseReapDecision, WorkerPool, WorkerPoolConfig, WorkspaceRegistry,
+        CHILD_TIMEOUT_GRACE_SECS, MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS,
     };
     use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget};
-    use crate::ida::worker::DEBUG_MODULES_TIMEOUT_SECS;
+    use crate::ida::worker::{
+        debugger_response_timeout_secs, CLOSE_SEND_TIMEOUT_SECS, DEBUG_MODULES_TIMEOUT_SECS,
+    };
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3599,6 +3628,43 @@ mod tests {
             pool.worker_op_timeout(Some(9999)),
             Duration::from_secs(610),
             "child foreground timeout is capped before adding parent grace"
+        );
+    }
+
+    #[test]
+    fn debugger_timeout_layers_are_strictly_nested() {
+        let pool = test_pool(1);
+        let sdk_timeout = 120;
+        let child_timeout = debugger_response_timeout_secs(sdk_timeout);
+        let parent_timeout = pool.worker_op_timeout(Some(child_timeout)).as_secs();
+
+        assert!(u64::from(sdk_timeout) < child_timeout);
+        assert!(child_timeout < parent_timeout);
+        assert_eq!(
+            MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS,
+            CLOSE_SEND_TIMEOUT_SECS
+                + u64::from(DEBUGGER_TEARDOWN_TIMEOUT_SECS)
+                + CHILD_TIMEOUT_GRACE_SECS
+        );
+        assert!(
+            CLOSE_SEND_TIMEOUT_SECS + u64::from(DEBUGGER_TEARDOWN_TIMEOUT_SECS)
+                < MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS,
+            "close_idb must leave time to pack the IDB and return after debugger teardown"
+        );
+        assert_eq!(
+            pool.close_rpc_timeout(),
+            pool.config.worker_op_timeout,
+            "the configured operation budget should remain available for IDB packing"
+        );
+
+        let short_pool = WorkerPool::new(WorkerPoolConfig {
+            worker_op_timeout: Duration::from_secs(1),
+            ..pool.config.as_ref().clone()
+        });
+        assert_eq!(
+            short_pool.close_rpc_timeout(),
+            Duration::from_secs(MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS),
+            "configuration must not undercut the bounded child cleanup phases"
         );
     }
 

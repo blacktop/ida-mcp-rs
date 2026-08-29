@@ -18,6 +18,7 @@ use crate::error::ToolError;
 use crate::ida::types::DebugStopAction;
 
 const DEBUG_EVENT_TIMEOUT_MAX_SECS: u32 = 120;
+pub(crate) const DEBUGGER_TEARDOWN_TIMEOUT_SECS: u32 = 5;
 
 #[cfg(target_os = "macos")]
 const MACOS_ARM64_DEBUGGER_HELPER: &str = "mac_server_arm";
@@ -353,8 +354,12 @@ impl DebuggerRuntime {
         // Clearing it on an inconclusive teardown would make a later close
         // appear successful and allow the database to be reused unsafely.
         match self.session {
-            Some(DebugSessionKind::Launched) => database.debugger_terminate(5),
-            Some(DebugSessionKind::Attached) => database.debugger_detach(5),
+            Some(DebugSessionKind::Launched) => {
+                database.debugger_terminate(DEBUGGER_TEARDOWN_TIMEOUT_SECS)
+            }
+            Some(DebugSessionKind::Attached) => {
+                database.debugger_detach(DEBUGGER_TEARDOWN_TIMEOUT_SECS)
+            }
             None => Ok(0),
         }
         .map_err(|error| ToolError::DebuggerTeardown(error.to_string()))?;

@@ -19,10 +19,17 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub(crate) const DEBUG_MODULES_TIMEOUT_SECS: u64 = 120;
 /// Maximum allowed timeout (10 minutes)
 pub const MAX_TIMEOUT_SECS: u64 = 600;
+/// Time for an IDA-thread debugger result to cross the worker response path
+/// after the SDK-level event wait expires.
+const DEBUGGER_RESPONSE_GRACE_SECS: u64 = 5;
 /// Maximum time to retry enqueuing close requests when the queue is full.
-const CLOSE_SEND_TIMEOUT_SECS: u64 = 5;
+pub(crate) const CLOSE_SEND_TIMEOUT_SECS: u64 = 5;
 /// Backoff between control enqueue retries (milliseconds).
 const CONTROL_SEND_BACKOFF_MS: u64 = 25;
+
+pub(crate) fn debugger_response_timeout_secs(timeout_seconds: u32) -> u64 {
+    u64::from(timeout_seconds).saturating_add(DEBUGGER_RESPONSE_GRACE_SECS)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CloseTokenLease {
@@ -397,7 +404,7 @@ impl IdaWorker {
         Self::recv_side_effect(
             rx,
             admission,
-            Some(u64::from(timeout_seconds).saturating_add(5)),
+            Some(debugger_response_timeout_secs(timeout_seconds)),
         )
         .await
     }
@@ -414,7 +421,7 @@ impl IdaWorker {
         Self::recv_side_effect(
             rx,
             admission,
-            Some(u64::from(timeout_seconds).saturating_add(5)),
+            Some(debugger_response_timeout_secs(timeout_seconds)),
         )
         .await
     }
@@ -441,7 +448,7 @@ impl IdaWorker {
         Self::recv_side_effect(
             rx,
             admission,
-            Some(u64::from(timeout_seconds).saturating_add(5)),
+            Some(debugger_response_timeout_secs(timeout_seconds)),
         )
         .await
     }
