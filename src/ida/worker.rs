@@ -207,17 +207,22 @@ impl IdaWorker {
         }
     }
 
+    /// Caller-supplied timeout, defaulted and clamped to the worker maximum.
+    fn clamped_timeout(timeout_secs: Option<u64>) -> Duration {
+        Duration::from_secs(
+            timeout_secs
+                .unwrap_or(DEFAULT_TIMEOUT_SECS)
+                .min(MAX_TIMEOUT_SECS),
+        )
+    }
+
     /// Bound a read-only request. Mutations must use [`Self::recv_side_effect`]
     /// so a receiver timeout cannot abandon queued work that later runs.
     async fn recv_read_only_with_timeout<T>(
         rx: oneshot::Receiver<Result<T, ToolError>>,
         timeout_secs: Option<u64>,
     ) -> Result<T, ToolError> {
-        let timeout = Duration::from_secs(
-            timeout_secs
-                .unwrap_or(DEFAULT_TIMEOUT_SECS)
-                .min(MAX_TIMEOUT_SECS),
-        );
+        let timeout = Self::clamped_timeout(timeout_secs);
         match tokio::time::timeout(timeout, rx).await {
             Ok(result) => result?,
             Err(_) => Err(ToolError::Timeout(timeout.as_secs())),
@@ -232,11 +237,7 @@ impl IdaWorker {
         timeout_secs: Option<u64>,
     ) -> Result<T, ToolError> {
         let wait_guard = SideEffectWaitGuard { admission };
-        let timeout = Duration::from_secs(
-            timeout_secs
-                .unwrap_or(DEFAULT_TIMEOUT_SECS)
-                .min(MAX_TIMEOUT_SECS),
-        );
+        let timeout = Self::clamped_timeout(timeout_secs);
         match tokio::time::timeout(timeout, &mut rx).await {
             Ok(result) => result?,
             Err(_) if wait_guard.admission.cancel_if_queued() => {

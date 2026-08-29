@@ -26,6 +26,21 @@ pub fn handle_disasm_by_name(
     Err(ToolError::FunctionNameNotFound(name.to_string()))
 }
 
+/// Address of the item after `current`, or `None` when the walk cannot
+/// advance. Prefers the decoded instruction length and falls back to IDA's
+/// next head, bounded by `limit` when the caller renders a fixed range.
+/// Never returns an address at or before `current`, so no caller can loop.
+fn next_disasm_address(db: &IDB, current: Address, limit: Option<u64>) -> Option<Address> {
+    let next = match db.insn_at(current) {
+        Some(insn) => current.checked_add(insn.len() as u64)?,
+        None => match limit {
+            Some(limit) => db.next_head_with(current, limit)?,
+            None => db.next_head(current)?,
+        },
+    };
+    (next > current).then_some(next)
+}
+
 pub fn handle_disasm(idb: &Option<IDB>, addr: u64, count: usize) -> Result<String, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
 
@@ -41,20 +56,10 @@ pub fn handle_disasm(idb: &Option<IDB>, addr: u64, count: usize) -> Result<Strin
             break;
         }
 
-        // Get instruction at current address to find next
-        if let Some(insn) = db.insn_at(current_addr) {
-            current_addr += insn.len() as u64;
-        } else {
-            // Move to next head
-            if let Some(next) = db.next_head(current_addr) {
-                if next <= current_addr {
-                    break; // Prevent infinite loop
-                }
-                current_addr = next;
-            } else {
-                break;
-            }
-        }
+        let Some(next) = next_disasm_address(db, current_addr, None) else {
+            break;
+        };
+        current_addr = next;
     }
 
     if lines.is_empty() {
@@ -89,11 +94,7 @@ pub fn handle_render_range(
 
     while current < end {
         let line = generate_disasm_line(db, current);
-        let next = if let Some(insn) = db.insn_at(current) {
-            Some(current.saturating_add(insn.len() as u64))
-        } else {
-            db.next_head_with(current, end)
-        };
+        let next = next_disasm_address(db, current, Some(end));
 
         if let Some(line) = line {
             lines.push(format!("{:#x}:\t{}", current, line));

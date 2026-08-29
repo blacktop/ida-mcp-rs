@@ -182,6 +182,10 @@ test-pool-exhaustion: build
 test-pool-second-open: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-pool-second-open
 
+# Run HTTP worker-pool timed-out raw-open cleanup test (debug)
+test-pool-open-timeout: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-pool-open-timeout
+
 # Run HTTP worker-pool abandoned-client cleanup test (debug)
 test-pool-disconnect: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-pool-disconnect

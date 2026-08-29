@@ -50,7 +50,14 @@ pub(crate) fn try_parse_address(s: &str) -> Option<u64> {
 
 /// Encode bytes as hex string.
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        // Writing into one pre-sized buffer avoids a String allocation per
+        // byte; `write!` to a String cannot fail.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Resolve an address by name (function or symbol).

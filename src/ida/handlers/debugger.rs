@@ -436,27 +436,29 @@ pub fn runtime_status() -> Value {
     })
 }
 
-pub fn launch(
+/// Shared body of `launch` and `attach`: one session-ownership contract and
+/// one macOS authorization surface, so the two entry points differ only in
+/// the IDA call they make and the denial message they explain it with.
+fn start_debug_session(
     runtime: &mut DebuggerRuntime,
     idb: &Option<IDB>,
-    path: &str,
-    arguments: Option<&str>,
-    start_directory: Option<&str>,
+    session: DebugSessionKind,
     timeout_seconds: u32,
+    denial_message: &str,
+    start: impl FnOnce(&IDB) -> Result<i32, idalib::IDAError>,
 ) -> Result<Value, ToolError> {
     validate_timeout(timeout_seconds)?;
     let database = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
     runtime.ensure_start_allowed()?;
     let backend = runtime.ensure_backend(database)?;
-    match database.debugger_launch(path, arguments, start_directory, timeout_seconds) {
+    match start(database) {
         Ok(event_code) => {
-            runtime.session = Some(DebugSessionKind::Launched);
+            runtime.session = Some(session);
             Ok(start_session_result(database, backend, event_code))
         }
         Err(error) => {
             let process_state = database.debugger_process_state();
-            let retained =
-                runtime.retain_session_after_start_error(DebugSessionKind::Launched, process_state);
+            let retained = runtime.retain_session_after_start_error(session, process_state);
             if cfg!(target_os = "macos") && macos_authorization_failure(&error.to_string()) {
                 return Ok(json!({
                     "status": "user_action_required",
@@ -464,7 +466,7 @@ pub fn launch(
                     "backend": backend,
                     "process_state": process_state_name(process_state),
                     "session_retained": retained,
-                    "message": "macOS denied or cancelled task control. Complete IDA's Take Control authorization for this login, then retry. ida-mcp will not request root, disable SIP, change authorizationdb, or re-sign binaries.",
+                    "message": denial_message,
                     "error": error.to_string(),
                 }));
             }
@@ -473,39 +475,38 @@ pub fn launch(
     }
 }
 
+pub fn launch(
+    runtime: &mut DebuggerRuntime,
+    idb: &Option<IDB>,
+    path: &str,
+    arguments: Option<&str>,
+    start_directory: Option<&str>,
+    timeout_seconds: u32,
+) -> Result<Value, ToolError> {
+    start_debug_session(
+        runtime,
+        idb,
+        DebugSessionKind::Launched,
+        timeout_seconds,
+        "macOS denied or cancelled task control. Complete IDA's Take Control authorization for this login, then retry. ida-mcp will not request root, disable SIP, change authorizationdb, or re-sign binaries.",
+        |database| database.debugger_launch(path, arguments, start_directory, timeout_seconds),
+    )
+}
+
 pub fn attach(
     runtime: &mut DebuggerRuntime,
     idb: &Option<IDB>,
     pid: u32,
     timeout_seconds: u32,
 ) -> Result<Value, ToolError> {
-    validate_timeout(timeout_seconds)?;
-    let database = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
-    runtime.ensure_start_allowed()?;
-    let backend = runtime.ensure_backend(database)?;
-    match database.debugger_attach(pid, timeout_seconds) {
-        Ok(event_code) => {
-            runtime.session = Some(DebugSessionKind::Attached);
-            Ok(start_session_result(database, backend, event_code))
-        }
-        Err(error) => {
-            let process_state = database.debugger_process_state();
-            let retained =
-                runtime.retain_session_after_start_error(DebugSessionKind::Attached, process_state);
-            if cfg!(target_os = "macos") && macos_authorization_failure(&error.to_string()) {
-                return Ok(json!({
-                    "status": "user_action_required",
-                    "platform": "macos",
-                    "backend": backend,
-                    "process_state": process_state_name(process_state),
-                    "session_retained": retained,
-                    "message": "macOS denied task attachment. Complete IDA's Take Control authorization for this login, then retry.",
-                    "error": error.to_string(),
-                }));
-            }
-            Err(start_error(error, retained))
-        }
-    }
+    start_debug_session(
+        runtime,
+        idb,
+        DebugSessionKind::Attached,
+        timeout_seconds,
+        "macOS denied task attachment. Complete IDA's Take Control authorization for this login, then retry.",
+        |database| database.debugger_attach(pid, timeout_seconds),
+    )
 }
 
 pub fn modules(runtime: &mut DebuggerRuntime, idb: &Option<IDB>) -> Result<Value, ToolError> {

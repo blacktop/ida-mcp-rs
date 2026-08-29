@@ -6,6 +6,7 @@
 #   disconnect   - dropped client SSE streams release leased workers
 #   manager-disconnect - dropped standalone SSE closes pooled rmcp session without opening IDA
 #   second-open-failure - failed second open keeps the existing session lease/IDB
+#   open-timeout-cleanup - a killed raw open removes only its partial output
 set -euo pipefail
 
 CASE="${POOL_TEST_CASE:-${1:-concurrency}}"
@@ -38,6 +39,9 @@ headers_file="$tmpdir/headers.log"
 body_file="$tmpdir/body.log"
 
 cleanup() {
+  if [[ -n "${open_pid:-}" ]]; then
+    wait "$open_pid" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${slow_pid:-}" ]]; then
     kill "$slow_pid" >/dev/null 2>&1 || true
     wait "$slow_pid" >/dev/null 2>&1 || true
@@ -284,6 +288,57 @@ second-open-failure)
 
   close_session "$session_a" 90
   echo "HTTP pool second-open failure test passed"
+  ;;
+
+open-timeout-cleanup)
+  large_raw="$tmpdir/large-raw"
+  output="$tmpdir/timed-out.i64"
+  dd if=/dev/zero of="$large_raw" bs=1 count=1 seek=$((16 * 1024 * 1024)) conv=notrunc \
+    >/dev/null 2>&1
+
+  open_args="$(jq -cn --arg path "$large_raw" --arg output "$output" \
+    '{path:$path,idb_out:$output,file_type:"Binary file",processor:"metapc:80386p",bitness:64,auto_analyse:false,timeout_secs:600}')"
+  open_resp_file="$tmpdir/open-timeout-response.json"
+  tool_call "$session_a" 20 open_idb "$open_args" 30 >"$open_resp_file" &
+  open_pid=$!
+
+  # Freeze the child only after it owns the output lock. This deterministically
+  # exercises retirement of an in-progress raw open, instead of hoping a large
+  # fixture happens to exceed the watchdog on the current machine.
+  output_lock="${output%.*}.imcp"
+  lock_deadline=$((SECONDS + 15))
+  worker_pid=""
+  while ((SECONDS <= lock_deadline)); do
+    if [[ -f "$output_lock" ]]; then
+      worker_pid="$(awk -F= '$1=="pid"{print $2}' "$output_lock" | tr -d '\r')"
+      if [[ -n "$worker_pid" ]] && kill -STOP "$worker_pid" 2>/dev/null; then
+        break
+      fi
+    fi
+    sleep 0.01
+  done
+  if [[ -z "$worker_pid" ]] || ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "timed-out pooled raw open never published a live output-lock owner" >&2
+    cat "$server_log" >&2 || true
+    exit 1
+  fi
+
+  wait "$open_pid" || true
+  open_pid=""
+  open_resp="$(cat "$open_resp_file")"
+  assert_tool_error_contains "$open_resp" "exceeded worker operation timeout" \
+    "timed-out pooled raw open"
+
+  output_base="${output%.*}"
+  for artifact in "$output" "$output_base.id0" "$output_base.id1" \
+    "$output_base.id2" "$output_base.nam" "$output_base.til" "$output_base.imcp"; do
+    if [[ -e "$artifact" ]]; then
+      echo "timed-out pooled raw open left an artifact: $artifact" >&2
+      cat "$server_log" >&2 || true
+      exit 1
+    fi
+  done
+  echo "HTTP pool timed-out open cleanup test passed"
   ;;
 
 crash)

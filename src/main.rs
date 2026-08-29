@@ -79,6 +79,45 @@ struct WorkspaceArgs {
     workspace_worker_op_timeout_secs: u64,
 }
 
+impl WorkspaceArgs {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.workspace_max_workers == 0 {
+            return Err(anyhow::anyhow!(
+                "--workspace-max-workers must be at least 1"
+            ));
+        }
+        if self.workspace_worker_op_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "--workspace-worker-op-timeout-secs must be at least 1"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Worker pool and database registry for a workspace server. Shared by
+    /// the stdio and HTTP entry points so their pool wiring cannot drift.
+    fn build_pool_and_registry(
+        &self,
+        worker_args: Vec<OsString>,
+    ) -> anyhow::Result<(WorkerPool, WorkspaceRegistry)> {
+        let exe_path = std::env::current_exe()
+            .map_err(|error| anyhow::anyhow!("failed to resolve current executable: {error}"))?;
+        let pool = WorkerPool::new(WorkerPoolConfig {
+            max_workers: self.workspace_max_workers,
+            min_workers: 0,
+            worker_idle_timeout: Duration::from_secs(self.workspace_worker_idle_timeout_secs),
+            worker_op_timeout: Duration::from_secs(self.workspace_worker_op_timeout_secs),
+            exe_path,
+            worker_args,
+        });
+        let registry = WorkspaceRegistry::new(
+            pool.clone(),
+            Duration::from_secs(self.workspace_idle_timeout_secs),
+        );
+        Ok((pool, registry))
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run the MCP server (default)
@@ -409,16 +448,7 @@ fn run_server_workspace(
     worker_args: Vec<OsString>,
     workspace: WorkspaceArgs,
 ) -> anyhow::Result<()> {
-    if workspace.workspace_max_workers == 0 {
-        return Err(anyhow::anyhow!(
-            "--workspace-max-workers must be at least 1"
-        ));
-    }
-    if workspace.workspace_worker_op_timeout_secs == 0 {
-        return Err(anyhow::anyhow!(
-            "--workspace-worker-op-timeout-secs must be at least 1"
-        ));
-    }
+    workspace.validate()?;
 
     info!(
         max_workers = workspace.workspace_max_workers,
@@ -429,20 +459,7 @@ fn run_server_workspace(
         .build()
         .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
     runtime.block_on(async move {
-        let exe_path = std::env::current_exe()
-            .map_err(|error| anyhow::anyhow!("failed to resolve current executable: {error}"))?;
-        let pool = WorkerPool::new(WorkerPoolConfig {
-            max_workers: workspace.workspace_max_workers,
-            min_workers: 0,
-            worker_idle_timeout: Duration::from_secs(workspace.workspace_worker_idle_timeout_secs),
-            worker_op_timeout: Duration::from_secs(workspace.workspace_worker_op_timeout_secs),
-            exe_path,
-            worker_args,
-        });
-        let registry = WorkspaceRegistry::new(
-            pool.clone(),
-            Duration::from_secs(workspace.workspace_idle_timeout_secs),
-        );
+        let (pool, registry) = workspace.build_pool_and_registry(worker_args)?;
         let server = IdaMcpServer::with_workspace_and_state(
             registry.clone(),
             ServerMode::Stdio,
@@ -841,7 +858,7 @@ fn run_server_http_pooled(
             // Legacy sessions and explicit workspace handles share this one
             // database-to-worker registry. Legacy entries are pinned to their
             // session binding and therefore ignore the workspace TTL.
-            let workspace_registry = WorkspaceRegistry::new(pool.clone(), Duration::ZERO);
+            let workspace_registry = WorkspaceRegistry::new_legacy(pool.clone());
 
             let session_manager = build_pooled_session_manager(
                 session_keep_alive_secs,
@@ -943,16 +960,7 @@ fn run_server_http_workspace(
     worker_args: Vec<OsString>,
     workspace: WorkspaceArgs,
 ) -> anyhow::Result<()> {
-    if workspace.workspace_max_workers == 0 {
-        return Err(anyhow::anyhow!(
-            "--workspace-max-workers must be at least 1"
-        ));
-    }
-    if workspace.workspace_worker_op_timeout_secs == 0 {
-        return Err(anyhow::anyhow!(
-            "--workspace-worker-op-timeout-secs must be at least 1"
-        ));
-    }
+    workspace.validate()?;
     if args.max_workers != 1 || args.min_workers != 0 {
         info!(
             "Workspace mode uses --workspace-max-workers; legacy --max-workers/--min-workers are ignored"
@@ -984,23 +992,7 @@ fn run_server_http_workspace(
                 &args.allow_origin,
                 args.allow_host.as_deref(),
             );
-            let exe_path = std::env::current_exe().map_err(|error| {
-                anyhow::anyhow!("failed to resolve current executable: {error}")
-            })?;
-            let pool = WorkerPool::new(WorkerPoolConfig {
-                max_workers: workspace.workspace_max_workers,
-                min_workers: 0,
-                worker_idle_timeout: Duration::from_secs(
-                    workspace.workspace_worker_idle_timeout_secs,
-                ),
-                worker_op_timeout: Duration::from_secs(workspace.workspace_worker_op_timeout_secs),
-                exe_path,
-                worker_args,
-            });
-            let registry = WorkspaceRegistry::new(
-                pool.clone(),
-                Duration::from_secs(workspace.workspace_idle_timeout_secs),
-            );
+            let (pool, registry) = workspace.build_pool_and_registry(worker_args)?;
             let runtime_state = if args.stateless {
                 ServerRuntimeState::new_stateless_http()
             } else {

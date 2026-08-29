@@ -32,6 +32,18 @@ unsafe extern "C" {
 }
 
 /// Log result with debug on success and warn on error.
+/// Claim the side-effect slot for a mutating request, or answer the caller
+/// with the rejection and move on. Every side-effecting arm opens with this,
+/// so a new one cannot silently skip admission.
+macro_rules! admit_or_reject {
+    ($admission:expr, $resp:expr) => {
+        if let Err(error) = $admission.start() {
+            let _ = $resp.send(Err(error));
+            continue;
+        }
+    };
+}
+
 macro_rules! log_result {
     ($result:expr, $ok_msg:literal, $err_msg:literal) => {
         match &$result {
@@ -505,6 +517,7 @@ fn init_ida_library_with_isolated_idausr(
 /// This function blocks until Shutdown is received.
 pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
     let mut idb: Option<IDB> = None;
+    let mut effective_database_path: Option<PathBuf> = None;
     let mut database_generation: Option<DatabaseGeneration> = None;
     let mut next_database_generation = 0_u64;
     let mut lock_file: Option<File> = None;
@@ -612,6 +625,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 let had_open_database = idb.is_some();
                 let result = database::handle_open(
                     &mut idb,
+                    effective_database_path.as_deref(),
                     &mut lock_file,
                     &mut lock_path,
                     &path,
@@ -634,6 +648,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                         _ => {
                             let Some(next) = next_database_generation.checked_add(1) else {
                                 drop(idb.take());
+                                effective_database_path = None;
                                 release_mcp_lock(&mut lock_file, &mut lock_path);
                                 return Err(ToolError::IdaError(
                                     "database generation counter exhausted".to_string(),
@@ -645,6 +660,9 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                             generation
                         }
                     };
+                    if !had_open_database {
+                        effective_database_path = Some(PathBuf::from(&info.path));
+                    }
                     Ok(OpenedDatabase { info, generation })
                 });
                 match &result {
@@ -695,10 +713,11 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                     let _ = resp.send(Err(error));
                     continue;
                 }
-                if let Some(ref db) = idb {
-                    info!(path = %db.path().display(), "Dropping IDB (will call close_database_with(save))");
+                if let Some(path) = effective_database_path.as_ref() {
+                    info!(path = %path.display(), "Dropping IDB (will call close_database_with(save))");
                 }
                 drop(idb.take());
+                effective_database_path = None;
                 database_generation = None;
                 info!("IDB dropped, database should be packed");
                 release_mcp_lock(&mut lock_file, &mut lock_path);
@@ -716,6 +735,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                         continue;
                     }
                     drop(idb.take());
+                    effective_database_path = None;
                     database_generation = None;
                     release_mcp_lock(&mut lock_file, &mut lock_path);
                     let _ = resp.send(Ok(ConditionalCloseResult::Closed));
@@ -751,10 +771,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 admission,
                 resp,
             } => {
-                if let Err(error) = admission.start() {
-                    let _ = resp.send(Err(error));
-                    continue;
-                }
+                admit_or_reject!(admission, resp);
                 debug!(path = %path, timeout_seconds, "Launching debugger target");
                 let result = crate::crash_guard::crash_guarded("debug_launch", || {
                     debugger::launch(
@@ -775,10 +792,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 admission,
                 resp,
             } => {
-                if let Err(error) = admission.start() {
-                    let _ = resp.send(Err(error));
-                    continue;
-                }
+                admit_or_reject!(admission, resp);
                 debug!(pid, timeout_seconds, "Attaching debugger target");
                 let result = crate::crash_guard::crash_guarded("debug_attach", || {
                     debugger::attach(&mut debugger_runtime, &idb, pid, timeout_seconds)
@@ -804,10 +818,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 admission,
                 resp,
             } => {
-                if let Err(error) = admission.start() {
-                    let _ = resp.send(Err(error));
-                    continue;
-                }
+                admit_or_reject!(admission, resp);
                 debug!(
                     action = action.as_str(),
                     timeout_seconds, "Stopping debugger target"
@@ -847,10 +858,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 admission,
                 resp,
             } => {
-                if let Err(error) = admission.start() {
-                    let _ = resp.send(Err(error));
-                    continue;
-                }
+                admit_or_reject!(admission, resp);
                 if let Err(err) = require_generation(expected_generation, database_generation) {
                     let _ = resp.send(Err(err));
                     continue;
@@ -875,10 +883,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 admission,
                 resp,
             } => {
-                if let Err(error) = admission.start() {
-                    let _ = resp.send(Err(error));
-                    continue;
-                }
+                admit_or_reject!(admission, resp);
                 debug!(address = format!("{addr:#x}"), "Loading DSC region");
                 let result = crate::crash_guard::crash_guarded("handle_dsc_load_region", || {
                     dscu::handle_dsc_load_region(&idb, addr)
@@ -1734,10 +1739,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 admission,
                 resp,
             } => {
-                if let Err(error) = admission.start() {
-                    let _ = resp.send(Err(error));
-                    continue;
-                }
+                admit_or_reject!(admission, resp);
                 if let Err(err) = ensure_not_cancelled(cancel.as_ref()) {
                     emit_progress(
                         progress_tx.as_ref(),
@@ -1976,10 +1978,7 @@ pub fn run_ida_loop(rx: mpsc::Receiver<IdaRequest>, init_state: IdaInitState) {
                 admission,
                 resp,
             } => {
-                if let Err(error) = admission.start() {
-                    let _ = resp.send(Err(error));
-                    continue;
-                }
+                admit_or_reject!(admission, resp);
                 if let Err(err) = ensure_not_cancelled(cancel.as_ref()) {
                     emit_progress(
                         progress_tx.as_ref(),

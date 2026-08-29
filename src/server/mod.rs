@@ -14,7 +14,7 @@ use crate::ida::observability::{ProgressReceiver, ProgressSender};
 use crate::ida::pool::{WorkspacePin, WorkspaceRegistry, CHILD_TIMEOUT_GRACE_SECS};
 use crate::ida::types::{
     CallGraphDirection, ConditionalCloseResult, DatabaseGeneration, DebugStopAction,
-    RawBinaryTarget,
+    RawBinaryTarget, SegmentInfo,
 };
 use crate::ida::worker::{
     CloseAuthorization, CloseTokenGrant, IdaWorker, WorkerBackend, MAX_TIMEOUT_SECS,
@@ -135,7 +135,9 @@ pub struct IdaMcpServer {
     worker: WorkerBackend,
     workspace_registry: Option<WorkspaceRegistry>,
     workspace_database_id: Option<String>,
-    tool_mux: ToolMux<IdaMcpServer>,
+    /// Shared: `IdaMcpServer` is cloned per call to rebind the worker for
+    /// workspace routing, and the route map holds every tool's schema.
+    tool_mux: Arc<ToolMux<IdaMcpServer>>,
     mode: ServerMode,
     task_registry: task::TaskRegistry,
     operation_registry: OperationRegistry,
@@ -269,7 +271,7 @@ impl ToolMux<IdaMcpServer> {
             let tool = tool_registry::get_tool(&tool_name).ok_or_else(|| {
                 McpError::invalid_params(format!("unknown tool: {tool_name}"), None)
             })?;
-            let opens_database = matches!(tool_name.as_str(), "open_idb" | "open_dsc");
+            let opens_database = tool_registry::allocates_database(&tool_name);
             if opens_database {
                 if supplied_database_id.is_some() {
                     return Err(McpError::invalid_params(
@@ -515,11 +517,7 @@ fn dsc_content_identity(path: &std::path::Path) -> Result<String, ToolError> {
             u32::from_le_bytes([header[0x10], header[0x11], header[0x12], header[0x13]]);
         let uuid = &header[0x58..0x68];
         if mapping_offset as usize >= header.len() && uuid.iter().any(|byte| *byte != 0) {
-            let mut identity = String::with_capacity(32);
-            for byte in uuid {
-                identity.push_str(&format!("{byte:02x}"));
-            }
-            return Ok(identity);
+            return Ok(crate::ida::handlers::hex_encode(uuid));
         }
     }
 
@@ -591,6 +589,10 @@ fn raw_blob_idb_path(input: &str, idb_out: Option<&str>) -> std::path::PathBuf {
     let mut output = std::ffi::OsString::from(input.as_os_str());
     output.push(".i64");
     std::path::PathBuf::from(output)
+}
+
+fn raw_blob_database_exists(input: &str, idb_out: Option<&str>) -> bool {
+    crate::ida::handlers::database::ida_database_output_exists(&raw_blob_idb_path(input, idb_out))
 }
 
 impl TemporaryFileCleanup {
@@ -712,7 +714,7 @@ impl IdaMcpServer {
             worker,
             workspace_registry: None,
             workspace_database_id: None,
-            tool_mux: ToolMux::new(call_router),
+            tool_mux: Arc::new(ToolMux::new(call_router)),
             mode,
             task_registry: state.task_registry,
             operation_registry: state.operation_registry,
@@ -2303,9 +2305,21 @@ fn checked_runtime_slide(runtime_base: u64, preferred_base: u64) -> Value {
 
 fn runtime_module_preferred_base(
     selected_dsc_image_address: Option<u64>,
-    segment_bases: impl Iterator<Item = u64>,
+    segment_bases: impl Iterator<Item = (u64, bool)>,
 ) -> Option<u64> {
-    selected_dsc_image_address.or_else(|| segment_bases.min())
+    selected_dsc_image_address.or_else(|| {
+        segment_bases
+            .filter_map(|(base, loaded)| loaded.then_some(base))
+            .min()
+    })
+}
+
+fn segment_defines_runtime_image_base(segment: &SegmentInfo) -> bool {
+    !segment.name.eq_ignore_ascii_case("__PAGEZERO")
+        && segment
+            .permissions
+            .bytes()
+            .any(|permission| permission != b'-')
 }
 
 /// Short-circuit on a `Result<_, ToolError>` from within a `#[tool]` async fn,
@@ -2559,7 +2573,7 @@ impl IdaMcpServer {
         }
         if !raw_target.is_empty()
             && !req.rebuild.unwrap_or(false)
-            && raw_blob_idb_path(&path, idb_out.as_deref()).exists()
+            && raw_blob_database_exists(&path, idb_out.as_deref())
         {
             return Ok(ToolError::InvalidParams(
                 "raw target options only affect a newly-created database; the output already exists. Set rebuild=true to recreate it, or omit processor/bitness/base_address/entry_point to reuse the verified database."
@@ -3284,9 +3298,11 @@ impl IdaMcpServer {
         };
         let preferred_base = runtime_module_preferred_base(
             dsc_image.as_ref().map(|image| image.address_value),
-            segments
-                .iter()
-                .filter_map(|segment| Self::parse_address(&segment.start).ok()),
+            segments.iter().filter_map(|segment| {
+                Self::parse_address(&segment.start)
+                    .ok()
+                    .map(|base| (base, segment_defines_runtime_image_base(segment)))
+            }),
         );
         let runtime_base = module.get("base_value").and_then(Value::as_u64);
         let runtime_slide = runtime_base
@@ -6850,7 +6866,7 @@ fn add_workspace_database_id_schema(name: &str, schema: &mut Map<String, Value>)
 }
 
 fn add_workspace_schema(tool: &mut Tool) {
-    if matches!(tool.name.as_ref(), "open_idb" | "open_dsc") {
+    if tool_registry::allocates_database(tool.name.as_ref()) {
         let description = tool.description.as_deref().unwrap_or_default();
         tool.description = Some(Cow::Owned(format!(
             "{description} Workspace mode allocates and returns a new database_id."
@@ -7136,6 +7152,7 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
 #[cfg(test)]
 mod tests {
     use crate::error::ToolError;
+    use crate::ida::types::SegmentInfo;
     use crate::ida::worker::{CloseTokenGrant, WorkerBackend};
     use crate::server::{
         add_workspace_database_id_schema, add_workspace_schema, apply_close_metadata,
@@ -7144,13 +7161,14 @@ mod tests {
         find_target_dyld_cache, is_sessionless_request_meta, materialize_task_response,
         normalize_schema_value,
         operation::{OperationSnapshot, OperationStatus},
-        run_script_failure_message, run_script_succeeded, run_script_timeout_message,
-        run_script_truncate_chars, runtime_module_preferred_base, select_runtime_module,
-        supported_protocol_versions, target_dyld_cache_names, task, task_payload_result_value,
-        task_state_to_detailed_task, task_state_to_mcp_task, timeout_with_child_grace,
-        tool_annotations_for, tool_params_schema, workspace_close_should_remove_entry, DscOpenPlan,
-        IdaMcpServer, OpenIdbBackgroundDecision, RecentOperationsRequest, ServerRuntimeState,
-        ToolCatalogRequest, ToolHelpRequest, XrefsRequest,
+        raw_blob_database_exists, run_script_failure_message, run_script_succeeded,
+        run_script_timeout_message, run_script_truncate_chars, runtime_module_preferred_base,
+        segment_defines_runtime_image_base, select_runtime_module, supported_protocol_versions,
+        target_dyld_cache_names, task, task_payload_result_value, task_state_to_detailed_task,
+        task_state_to_mcp_task, timeout_with_child_grace, tool_annotations_for, tool_params_schema,
+        workspace_close_should_remove_entry, DscOpenPlan, IdaMcpServer, OpenIdbBackgroundDecision,
+        RecentOperationsRequest, ServerRuntimeState, ToolCatalogRequest, ToolHelpRequest,
+        XrefsRequest,
     };
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::model::{CallToolResponse, CallToolResult, InputResponses, ProtocolVersion};
@@ -7851,17 +7869,54 @@ mod tests {
     }
 
     #[test]
-    fn runtime_module_base_uses_the_selected_dsc_image() {
+    fn runtime_module_base_uses_the_selected_image_or_loaded_segments() {
+        let pagezero = SegmentInfo {
+            name: "__PAGEZERO".to_string(),
+            start: "0x0".to_string(),
+            end: "0x100000000".to_string(),
+            size: 0x1_0000_0000,
+            permissions: "---".to_string(),
+            r#type: "Loader".to_string(),
+            bitness: 64,
+        };
+        assert!(!segment_defines_runtime_image_base(&pagezero));
         assert_eq!(
-            runtime_module_preferred_base(Some(0x5000), [0x1000, 0x5000, 0x9000].into_iter()),
+            runtime_module_preferred_base(
+                Some(0x5000),
+                [(0x1000, true), (0x5000, true), (0x9000, true)].into_iter()
+            ),
             Some(0x5000),
             "cache headers and other loaded images must not become the selected image base"
         );
         assert_eq!(
-            runtime_module_preferred_base(None, [0x3000, 0x1000, 0x2000].into_iter()),
+            runtime_module_preferred_base(
+                None,
+                [(0x3000, true), (0, false), (0x1000, true), (0x2000, true)].into_iter()
+            ),
             Some(0x1000),
-            "standalone images still use their lowest loaded segment"
+            "standalone images must ignore an unmapped Mach-O __PAGEZERO segment"
         );
+    }
+
+    #[test]
+    fn raw_target_precheck_detects_an_unpacked_output() {
+        let dir = std::env::temp_dir().join(format!(
+            "ida-mcp-raw-target-unpacked-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create raw target fixture directory");
+        let input = dir.join("firmware.bin");
+        let output = dir.join("custom.i64");
+        let unpacked = dir.join("custom.id0");
+        std::fs::write(&input, b"raw").expect("write raw input");
+        std::fs::write(&unpacked, b"unpacked database").expect("write unpacked output");
+
+        assert!(raw_blob_database_exists(
+            &input.display().to_string(),
+            Some(&output.display().to_string())
+        ));
+
+        std::fs::remove_dir_all(dir).expect("remove raw target fixture directory");
     }
 
     #[test]

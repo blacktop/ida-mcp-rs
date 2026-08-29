@@ -90,6 +90,43 @@ pub(crate) fn acquire_mcp_lock(db_path: &Path) -> Result<McpLock, ToolError> {
     })
 }
 
+/// Reclaim the unlocked MCP lock file left by a worker the pool killed.
+///
+/// Cleanup callers must hold this lock while removing partial database
+/// artifacts. Requiring the recorded worker PID prevents a delayed cleanup
+/// from deleting files after another process has claimed the output.
+pub(crate) fn reclaim_killed_worker_mcp_lock(
+    db_path: &Path,
+    worker_pid: Option<u32>,
+) -> Option<McpLock> {
+    let worker_pid = worker_pid?;
+    let mut lock_path = db_path.to_path_buf();
+    lock_path.set_extension("imcp");
+
+    reclaim_mcp_lock_path(&lock_path, Some(worker_pid))
+}
+
+fn reclaim_mcp_lock_path(lock_path: &Path, expected_pid: Option<u32>) -> Option<McpLock> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .ok()?;
+    if try_lock_file(&file).is_err() {
+        return None;
+    }
+    let recorded_pid = read_lock_file_pid_from_file(&file);
+    if recorded_pid != expected_pid || read_lock_file_pid(lock_path) != recorded_pid {
+        return None;
+    }
+
+    Some(McpLock {
+        file,
+        path: lock_path.to_path_buf(),
+        transferred: false,
+    })
+}
+
 /// Release an MCP lock using mutable references to the file and path options.
 pub(crate) fn release_mcp_lock(lock_file: &mut Option<File>, lock_path: &mut Option<PathBuf>) {
     if let Some(path) = lock_path.take() {
@@ -100,8 +137,15 @@ pub(crate) fn release_mcp_lock(lock_file: &mut Option<File>, lock_path: &mut Opt
 
 /// Release an MCP lock file directly.
 pub(crate) fn release_mcp_lock_file(lock: McpLock) {
+    let _ = remove_mcp_lock_file(lock);
+}
+
+fn remove_mcp_lock_file(lock: McpLock) -> Result<PathBuf, (PathBuf, std::io::Error)> {
     let (_file, path) = lock.into_parts();
-    let _ = std::fs::remove_file(path);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(path),
+        Err(error) => Err((path, error)),
+    }
 }
 
 /// Remove a lock file that still belongs to a worker process the pool killed.
@@ -110,25 +154,23 @@ pub(crate) fn remove_mcp_lock_for_pid(db_path: &Path, pid: Option<u32>) {
         return;
     };
 
-    let mut lock_path = db_path.to_path_buf();
-    lock_path.set_extension("imcp");
-    if read_lock_file_pid(&lock_path) != Some(pid) {
+    let Some(lock) = reclaim_killed_worker_mcp_lock(db_path, Some(pid)) else {
         return;
-    }
+    };
+    let lock_path = lock.path.clone();
 
-    if let Err(err) = std::fs::remove_file(&lock_path) {
-        warn!(
-            path = %lock_path.display(),
-            pid,
-            error = %err,
-            "failed to remove killed worker MCP lock file"
-        );
-    } else {
-        info!(
+    match remove_mcp_lock_file(lock) {
+        Ok(_) => info!(
             path = %lock_path.display(),
             pid,
             "removed killed worker MCP lock file"
-        );
+        ),
+        Err((_, error)) => warn!(
+            path = %lock_path.display(),
+            pid,
+            %error,
+            "failed to remove killed worker MCP lock file"
+        ),
     }
 }
 
@@ -155,19 +197,21 @@ pub(crate) fn clean_stale_mcp_lock(db_path: &Path) -> Option<StaleLockInfo> {
         Some(pid) => pid,
         None => {
             // Can't read PID, but file exists - try to acquire lock to check if stale
-            if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path)
-                && try_lock_file(&file).is_ok()
-            {
-                // We got the lock - file was stale (no process holding fcntl lock)
-                drop(file);
-                if std::fs::remove_file(&lock_path).is_ok() {
-                    info!(path = %lock_path.display(), "Removed stale lock file (no valid PID, no fcntl lock)");
-                    return Some(StaleLockInfo {
-                        path: lock_path,
-                        pid: 0,
-                        reason: "no valid PID and no fcntl lock held".to_string(),
-                    });
-                }
+            if let Some(lock) = reclaim_mcp_lock_path(&lock_path, None) {
+                return match remove_mcp_lock_file(lock) {
+                    Ok(_) => {
+                        info!(path = %lock_path.display(), "Removed stale lock file (no valid PID, no fcntl lock)");
+                        Some(StaleLockInfo {
+                            path: lock_path,
+                            pid: 0,
+                            reason: "no valid PID and no fcntl lock held".to_string(),
+                        })
+                    }
+                    Err((_, error)) => {
+                        warn!(path = %lock_path.display(), %error, "Failed to remove stale lock file");
+                        None
+                    }
+                };
             }
             return None;
         }
@@ -186,13 +230,12 @@ pub(crate) fn clean_stale_mcp_lock(db_path: &Path) -> Option<StaleLockInfo> {
         "Found stale lock file from dead process"
     );
 
-    // Remove the stale lock file
-    if let Err(e) = std::fs::remove_file(&lock_path) {
-        warn!(
-            path = %lock_path.display(),
-            error = %e,
-            "Failed to remove stale lock file"
-        );
+    // Re-check the recorded owner while holding the advisory lock, then keep
+    // that lock held through unlink so another worker cannot claim this path
+    // between ownership validation and removal.
+    let lock = reclaim_mcp_lock_path(&lock_path, Some(pid))?;
+    if let Err((_, error)) = remove_mcp_lock_file(lock) {
+        warn!(path = %lock_path.display(), %error, "Failed to remove stale lock file");
         return None;
     }
 
@@ -207,6 +250,12 @@ pub(crate) fn clean_stale_mcp_lock(db_path: &Path) -> Option<StaleLockInfo> {
 /// Read the PID from a lock file.
 fn read_lock_file_pid(lock_path: &Path) -> Option<u32> {
     let file = File::open(lock_path).ok()?;
+    read_lock_file_pid_from_file(&file)
+}
+
+fn read_lock_file_pid_from_file(file: &File) -> Option<u32> {
+    let mut file = file.try_clone().ok()?;
+    file.seek(std::io::SeekFrom::Start(0)).ok()?;
     let reader = BufReader::new(file);
 
     for line in reader.lines().map_while(Result::ok) {

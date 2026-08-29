@@ -182,6 +182,18 @@ pub struct ToolInfo {
     pub keywords: &'static [&'static str],
 }
 
+/// Whether a tool allocates a new workspace database rather than addressing
+/// an existing one.
+///
+/// Workspace routing (which leases a fresh `database_id`) and schema
+/// augmentation (which advertises that allocation instead of requiring a
+/// `database_id` argument) must agree exactly. Keeping the answer here, beside
+/// the rest of each tool's contract, stops those two call sites from drifting
+/// apart as tools are added.
+pub fn allocates_database(name: &str) -> bool {
+    matches!(name, "open_idb" | "open_dsc")
+}
+
 /// Static registry of all tools
 pub static TOOL_REGISTRY: &[ToolInfo] = &[
     // === CORE (always available) ===

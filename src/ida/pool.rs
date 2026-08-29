@@ -1,6 +1,7 @@
 //! Multi-process worker pool for HTTP sessions.
 
 use crate::error::ToolError;
+use crate::ida::handlers::database::{database_path_for_open_request, RawOpenArtifactCleanup};
 use crate::ida::handlers::debugger::DEBUGGER_TEARDOWN_TIMEOUT_SECS;
 use crate::ida::lock::remove_mcp_lock_for_pid;
 use crate::ida::observability::ProgressSender;
@@ -89,6 +90,17 @@ struct PooledChild {
     spawned_at: Instant,
     last_used: Instant,
     idb_path: Option<PathBuf>,
+    pending_open_artifacts: Option<RawOpenArtifactCleanup>,
+}
+
+impl PooledChild {
+    /// Whether this child's MCP transport is gone. A missing service is
+    /// treated as closed: the child can no longer serve any call.
+    fn transport_closed(&self) -> bool {
+        self.service
+            .as_ref()
+            .is_none_or(|service| service.is_transport_closed())
+    }
 }
 
 struct DeadWorker {
@@ -96,6 +108,21 @@ struct DeadWorker {
     pid: Option<u32>,
     age_secs: u64,
     idb_path: Option<PathBuf>,
+    pending_open_artifacts: Option<RawOpenArtifactCleanup>,
+}
+
+struct OpenDispatch {
+    database_path: PathBuf,
+    artifacts: Option<RawOpenArtifactCleanup>,
+}
+
+impl OpenDispatch {
+    fn for_request(path: &str, idb_out: Option<&str>, rebuild: bool) -> Self {
+        Self {
+            database_path: database_path_for_open_request(path, idb_out),
+            artifacts: RawOpenArtifactCleanup::for_request(path, idb_out, rebuild),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,6 +499,7 @@ impl WorkerPool {
                 spawned_at: Instant::now(),
                 last_used: Instant::now(),
                 idb_path: None,
+                pending_open_artifacts: None,
             }),
             call_lock: Mutex::new(()),
         }))
@@ -542,6 +570,7 @@ impl WorkerPool {
         child.state = ChildState::Idle;
         child.last_used = Instant::now();
         child.idb_path = None;
+        child.pending_open_artifacts = None;
         release_guard.disarm();
         info!(
             worker_id = handle.worker_id,
@@ -645,6 +674,7 @@ impl WorkerPool {
     fn take_dead_worker_locked(child: &mut PooledChild) -> DeadWorker {
         child.state = ChildState::Dead;
         let idb_path = child.idb_path.take();
+        let pending_open_artifacts = child.pending_open_artifacts.take();
         let pid = child.pid;
         let age_secs = child.spawned_at.elapsed().as_secs();
         let service = child.service.take();
@@ -654,6 +684,7 @@ impl WorkerPool {
             pid,
             age_secs,
             idb_path,
+            pending_open_artifacts,
         }
     }
 
@@ -662,6 +693,9 @@ impl WorkerPool {
             let _ = service
                 .close_with_timeout(Duration::from_secs(CHILD_SERVICE_CLOSE_TIMEOUT_SECS))
                 .await;
+        }
+        if let Some(artifacts) = dead.pending_open_artifacts.take() {
+            artifacts.cleanup_after_worker_loss(dead.pid).await;
         }
         if let Some(idb_path) = dead.idb_path.as_ref() {
             remove_mcp_lock_for_pid(idb_path, dead.pid);
@@ -765,12 +799,19 @@ impl PooledWorkerHandle {
         args: JsonObject,
         timeout: Duration,
         cancel: Option<CancellationToken>,
+        mut open_dispatch: Option<OpenDispatch>,
     ) -> Result<CallToolResult, ToolError> {
         let _call_guard = self.slot.call_lock.lock().await;
+        let tracks_open = open_dispatch.is_some();
+        let mut previous_idb_path = None;
         let peer = {
-            let child = self.slot.child.lock().await;
+            let mut child = self.slot.child.lock().await;
             match &child.state {
                 ChildState::Leased { session_id } if session_id == &self.session_id => {
+                    if let Some(open_dispatch) = open_dispatch.take() {
+                        previous_idb_path = child.idb_path.replace(open_dispatch.database_path);
+                        child.pending_open_artifacts = open_dispatch.artifacts;
+                    }
                     child.peer.clone()
                 }
                 ChildState::Dead => {
@@ -811,6 +852,13 @@ impl PooledWorkerHandle {
 
         match result {
             Ok(Ok(result)) => {
+                if tracks_open {
+                    let mut child = self.slot.child.lock().await;
+                    child.pending_open_artifacts = None;
+                    if result.is_error == Some(true) {
+                        child.idb_path = previous_idb_path;
+                    }
+                }
                 retire_guard.disarm();
                 Ok(result)
             }
@@ -914,6 +962,12 @@ pub struct WorkspaceDatabase {
 ///   its bounded enqueue and debugger teardown phases. The configured
 ///   operation watchdog is an explicit operator hard cap. Enforced by
 ///   `debugger_timeout_layers_are_strictly_nested`.
+/// - **I11 — open intent is transactional:** an open publishes its effective
+///   output and owned-artifact snapshot before child dispatch. Success commits
+///   the path, an application error restores the previous path, and forced
+///   retirement cleans only artifacts protected by the killed worker's exact
+///   output lock. Enforced by `open_dispatch_tracks_the_effective_output_before_child_dispatch`,
+///   the database artifact-cleanup tests, and `test-pool-second-open`.
 #[derive(Clone)]
 pub struct WorkspaceRegistry {
     inner: Arc<WorkspaceRegistryInner>,
@@ -1066,16 +1120,28 @@ fn debug_start_retains_session(result: &Result<Value, ToolError>) -> bool {
 }
 
 impl WorkspaceRegistry {
-    pub fn new(pool: WorkerPool, idle_timeout: Duration) -> Self {
-        let registry = Self {
+    fn with_inner(pool: WorkerPool, idle_timeout: Duration) -> Self {
+        Self {
             inner: Arc::new(WorkspaceRegistryInner {
                 pool,
                 entries: StdMutex::new(HashMap::new()),
                 idle_timeout,
             }),
-        };
+        }
+    }
+
+    pub fn new(pool: WorkerPool, idle_timeout: Duration) -> Self {
+        let registry = Self::with_inner(pool, idle_timeout);
         registry.spawn_reaper();
         registry
+    }
+
+    /// Registry for legacy pooled HTTP sessions. Every entry is a legacy
+    /// binding, and the reaper considers only non-legacy leases, so spawning
+    /// one would tick every second for the life of the server and never find
+    /// a candidate.
+    pub fn new_legacy(pool: WorkerPool) -> Self {
+        Self::with_inner(pool, Duration::ZERO)
     }
 
     fn entries(&self) -> StdMutexGuard<'_, HashMap<String, Arc<WorkspaceRegistryEntry>>> {
@@ -1216,9 +1282,12 @@ impl WorkspaceRegistry {
                 .map(|(_, entry)| entry.database.clone())
                 .collect::<Vec<_>>()
         };
-        for database in databases {
+        // Each close is a child RPC with a teardown-timeout floor; closing
+        // them sequentially would make shutdown scale with database count.
+        join_all(databases.into_iter().map(|database| async move {
             let _ = database.close().await;
-        }
+        }))
+        .await;
     }
 
     fn spawn_reaper(&self) {
@@ -1241,85 +1310,100 @@ impl WorkspaceRegistry {
     }
 }
 
+/// Unguarded workspace leases, which are the reaper's health candidates.
+/// Healthy idle eviction is a later policy decision; transport liveness must
+/// still run when idle eviction is disabled (I9).
+fn collect_reap_candidates(
+    inner: &WorkspaceRegistryInner,
+) -> Vec<(String, Arc<WorkspaceRegistryEntry>)> {
+    let entries = match inner.entries.lock() {
+        Ok(entries) => entries,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut candidates = Vec::new();
+    for (id, entry) in entries.iter() {
+        if !entry.legacy
+            && entry.active_calls.load(Ordering::Relaxed) == 0
+            && entry.pins.load(Ordering::Relaxed) == 0
+        {
+            candidates.push((id.clone(), entry.clone()));
+        }
+    }
+    candidates
+}
+
+/// Probe transport health outside the registry lock. Dead workers and
+/// lease-less handles are terminal regardless of TTL; healthy unpinned
+/// entries are eligible only under the idle policy.
+async fn probe_reap_candidates(
+    inner: &WorkspaceRegistryInner,
+    candidates: Vec<(String, Arc<WorkspaceRegistryEntry>)>,
+) -> Vec<(String, WorkspaceReapReason)> {
+    let mut reapable = Vec::new();
+    for (database_id, entry) in candidates {
+        match entry.database.lease_reap_decision().await {
+            LeaseReapDecision::NoLease => {
+                reapable.push((database_id, WorkspaceReapReason::Terminal));
+            }
+            LeaseReapDecision::HealthyUnpinned => {
+                if !inner.idle_timeout.is_zero() && entry.idle_for() >= inner.idle_timeout {
+                    reapable.push((database_id, WorkspaceReapReason::Idle));
+                }
+            }
+            LeaseReapDecision::HealthyPinned | LeaseReapDecision::Busy => {}
+            LeaseReapDecision::DeadWorker(slot) => {
+                warn!(
+                    database_id,
+                    "workspace worker exited out of band; clearing its lease"
+                );
+                inner.pool.mark_dead(&slot).await;
+                reapable.push((database_id, WorkspaceReapReason::Terminal));
+            }
+        }
+    }
+    reapable
+}
+
+/// Re-verify under the registry lock before removal: a call that arrived
+/// while probing raised `active_calls` or refreshed idle time, and any
+/// freshly-set pin implies such a call.
+fn take_expired_entries(
+    inner: &WorkspaceRegistryInner,
+    reapable: Vec<(String, WorkspaceReapReason)>,
+) -> Vec<(String, Arc<WorkspaceDatabase>, WorkspaceReapReason)> {
+    let mut entries = match inner.entries.lock() {
+        Ok(entries) => entries,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut expired = Vec::new();
+    for (database_id, reason) in reapable {
+        let still_reapable = entries.get(&database_id).is_some_and(|entry| {
+            !entry.legacy
+                && entry.active_calls.load(Ordering::Relaxed) == 0
+                && entry.pins.load(Ordering::Relaxed) == 0
+                && match reason {
+                    WorkspaceReapReason::Idle => {
+                        !inner.idle_timeout.is_zero() && entry.idle_for() >= inner.idle_timeout
+                    }
+                    WorkspaceReapReason::Terminal => entry.database.lease_is_absent(),
+                }
+        });
+        if still_reapable && let Some(entry) = entries.remove(&database_id) {
+            expired.push((database_id, entry.database.clone(), reason));
+        }
+    }
+    expired
+}
+
 async fn workspace_reaper(inner: Weak<WorkspaceRegistryInner>, interval: Duration) {
     loop {
         tokio::time::sleep(interval).await;
         let Some(inner) = Weak::upgrade(&inner) else {
             break;
         };
-        // Phase 1: every unguarded workspace lease is a health candidate.
-        // Healthy idle eviction is a later policy decision; transport
-        // liveness must still run when idle eviction is disabled (I9).
-        let candidates = {
-            let entries = match inner.entries.lock() {
-                Ok(entries) => entries,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let mut candidates = Vec::new();
-            for (id, entry) in entries.iter() {
-                if !entry.legacy
-                    && entry.active_calls.load(Ordering::Relaxed) == 0
-                    && entry.pins.load(Ordering::Relaxed) == 0
-                {
-                    candidates.push((id.clone(), entry.clone()));
-                }
-            }
-            candidates
-        };
-        // Phase 2: probe transport health outside the registry lock. Dead
-        // workers and lease-less handles are terminal regardless of TTL;
-        // healthy unpinned entries are eligible only under the idle policy.
-        let mut reapable = Vec::new();
-        for (database_id, entry) in candidates {
-            match entry.database.lease_reap_decision().await {
-                LeaseReapDecision::NoLease => {
-                    reapable.push((database_id, WorkspaceReapReason::Terminal));
-                }
-                LeaseReapDecision::HealthyUnpinned => {
-                    if !inner.idle_timeout.is_zero() && entry.idle_for() >= inner.idle_timeout {
-                        reapable.push((database_id, WorkspaceReapReason::Idle));
-                    }
-                }
-                LeaseReapDecision::HealthyPinned | LeaseReapDecision::Busy => {}
-                LeaseReapDecision::DeadWorker(slot) => {
-                    warn!(
-                        database_id,
-                        "workspace worker exited out of band; clearing its lease"
-                    );
-                    inner.pool.mark_dead(&slot).await;
-                    reapable.push((database_id, WorkspaceReapReason::Terminal));
-                }
-            }
-        }
-        // Phase 3: re-verify under the registry lock before removal; a call
-        // that arrived meanwhile raised active_calls or refreshed idle time,
-        // and any freshly-set pin implies such a call.
-        let expired = {
-            let mut entries = match inner.entries.lock() {
-                Ok(entries) => entries,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let mut expired = Vec::new();
-            for (database_id, reason) in reapable {
-                let still_reapable = entries.get(&database_id).is_some_and(|entry| {
-                    !entry.legacy
-                        && entry.active_calls.load(Ordering::Relaxed) == 0
-                        && entry.pins.load(Ordering::Relaxed) == 0
-                        && match reason {
-                            WorkspaceReapReason::Idle => {
-                                !inner.idle_timeout.is_zero()
-                                    && entry.idle_for() >= inner.idle_timeout
-                            }
-                            WorkspaceReapReason::Terminal => entry.database.lease_is_absent(),
-                        }
-                });
-                if still_reapable && let Some(entry) = entries.remove(&database_id) {
-                    expired.push((database_id, entry.database.clone(), reason));
-                }
-            }
-            expired
-        };
-        for (database_id, database, reason) in expired {
+        let candidates = collect_reap_candidates(&inner);
+        let reapable = probe_reap_candidates(&inner, candidates).await;
+        for (database_id, database, reason) in take_expired_entries(&inner, reapable) {
             match reason {
                 WorkspaceReapReason::Idle => {
                     info!(database_id, "reaping idle workspace database");
@@ -1464,11 +1548,7 @@ impl WorkspaceDatabase {
         // A closed transport means the worker is gone even though the lease
         // survives until a dispatch or the reaper clears it. Reporting it as
         // `open` would advertise a handle no call can serve.
-        if child
-            .service
-            .as_ref()
-            .is_none_or(|service| service.is_transport_closed())
-        {
+        if child.transport_closed() {
             return LeaseSnapshot::NoWorker;
         }
         // The worker lease is installed before open_idb starts, while the
@@ -1508,11 +1588,7 @@ impl WorkspaceDatabase {
         let Ok(child) = lease.handle.slot.child.try_lock() else {
             return LeaseReapDecision::Busy;
         };
-        let worker_unavailable = child.state == ChildState::Dead
-            || child
-                .service
-                .as_ref()
-                .is_none_or(|service| service.is_transport_closed());
+        let worker_unavailable = child.state == ChildState::Dead || child.transport_closed();
         drop(child);
         if !worker_unavailable {
             return if lease.debug_pinned {
@@ -1660,7 +1736,7 @@ impl WorkspaceDatabase {
             }
         };
         let timeout = self.pool.worker_op_timeout(timeout_secs);
-        let result = match handle.call_tool(tool, args, timeout, cancel).await {
+        let result = match handle.call_tool(tool, args, timeout, cancel, None).await {
             Ok(result) => {
                 if let Some(err) = remote::result_error(&result, tool) {
                     if child_tool_error_retires_worker(tool, &err) {
@@ -1837,6 +1913,7 @@ impl WorkspaceDatabase {
     ) -> Result<OpenedDatabase, ToolError> {
         let (handle, generation, fresh_lease) = self.lease_for_open().await?;
         let timeout = self.pool.worker_op_timeout(timeout_secs);
+        let open_dispatch = OpenDispatch::for_request(path, idb_out.as_deref(), rebuild);
         let result = handle
             .call_tool(
                 "open_idb",
@@ -1856,6 +1933,7 @@ impl WorkspaceDatabase {
                 ))?,
                 timeout,
                 cancel,
+                Some(open_dispatch),
             )
             .await;
 
@@ -3257,8 +3335,8 @@ mod tests {
         debugger_worker_loss_error, extract_first_matches, find_bytes_child_args,
         lumina_apply_child_args, open_error_releases_lease, open_idb_child_args,
         release_error_retires_worker, require_lease_generation, run_script_child_args,
-        search_child_args, LeaseReapDecision, WorkerPool, WorkerPoolConfig, WorkspaceRegistry,
-        CHILD_TIMEOUT_GRACE_SECS, MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS,
+        search_child_args, LeaseReapDecision, OpenDispatch, WorkerPool, WorkerPoolConfig,
+        WorkspaceRegistry, CHILD_TIMEOUT_GRACE_SECS, MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS,
     };
     use crate::ida::types::{ConditionalCloseResult, DatabaseGeneration, RawBinaryTarget};
     use crate::ida::worker::{
@@ -3708,6 +3786,40 @@ mod tests {
 
         let script_args = run_script_child_args("print(1)", Some(30));
         assert_eq!(script_args["timeout_secs"], json!(30));
+    }
+
+    #[test]
+    fn open_dispatch_tracks_the_effective_output_before_child_dispatch() {
+        let dir =
+            std::env::temp_dir().join(format!("ida-mcp-open-dispatch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create open dispatch fixture directory");
+        let input = dir.join("firmware.bin");
+        let output = dir.join("custom.i64");
+        std::fs::write(&input, b"raw").expect("write raw input");
+
+        let new_output = OpenDispatch::for_request(
+            &input.display().to_string(),
+            Some(&output.display().to_string()),
+            false,
+        );
+        assert_eq!(new_output.database_path, output);
+        assert!(
+            new_output.artifacts.is_some(),
+            "a new raw output needs forced-retirement cleanup"
+        );
+
+        std::fs::write(&output, b"existing database").expect("write existing output");
+        let reuse = OpenDispatch::for_request(
+            &input.display().to_string(),
+            Some(&output.display().to_string()),
+            false,
+        );
+        assert!(
+            reuse.artifacts.is_none(),
+            "verified reuse must not claim ownership of existing artifacts"
+        );
+
+        std::fs::remove_dir_all(dir).expect("remove open dispatch fixture directory");
     }
 
     #[test]

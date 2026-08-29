@@ -211,6 +211,31 @@ case "$launch_status" in
       printf '%s\n' "$module_text" >&2
       exit 1
     }
+    module_segments_request="$(jq -cn --arg id "$module_id" \
+      '{jsonrpc:"2.0",id:20,method:"tools/call",params:{name:"segments",arguments:{database_id:$id}}}')"
+    send "$module_segments_request"
+    module_segments_response="$(wait_response 20 30)"
+    assert_ok "inspect runtime module segments" "$module_segments_response"
+    module_segments_text="$(result_text <<<"$module_segments_response")"
+    # IDA 9.4 omits this fixture's Mach-O __PAGEZERO from the IDB segment
+    # list. The exact PAGEZERO exclusion is pinned by the Rust unit test;
+    # live coverage verifies that the reported base names a loaded segment
+    # instead of an unmapped/zero address.
+    jq -e \
+      --arg preferred "$(jq -r '.preferred_base' <<<"$module_text")" \
+      --argjson preferred_value "$(jq '.preferred_base_value' <<<"$module_text")" '
+      $preferred_value > 0
+      and any(.[];
+        .start == $preferred
+        and (.name | ascii_upcase) != "__PAGEZERO"
+        and (.permissions | test("[^-]"))
+      )
+    ' >/dev/null <<<"$module_segments_text" || {
+      echo "FAIL: runtime preferred base is not a loaded Mach-O segment" >&2
+      printf '%s\n' "$module_text" >&2
+      printf '%s\n' "$module_segments_text" >&2
+      exit 1
+    }
     resolve_request="$(jq -cn --arg id "$module_id" \
       '{jsonrpc:"2.0",id:6,method:"tools/call",params:{name:"resolve_function",arguments:{database_id:$id,name:"interesting_function"}}}')"
     send "$resolve_request"

@@ -336,6 +336,27 @@ test-pool-second-open: fixture
         bash ./http_pool.sh
     echo "✅ HTTP worker-pool second-open failure test passed"
 
+# Run HTTP worker-pool timed-out raw-open cleanup test
+test-pool-open-timeout: fixture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        echo "Run 'just build' first"
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for pool open-timeout test (brew install jq)"
+        exit 1
+    fi
+    echo "🧪 Running HTTP worker-pool timed-out raw-open cleanup test..."
+    PORT=$((9575 + RANDOM % 500)) \
+        POOL_TEST_CASE=open-timeout-cleanup WORKER_OP_TIMEOUT=1 \
+        RUST_LOG="{{ rust_log }}" IDB_PATH="{{ test_bin }}" \
+        MCP_HTTP_BIN="{{ server_bin }}" \
+        bash ./http_pool.sh
+    echo "✅ HTTP worker-pool timed-out raw-open cleanup test passed"
+
 # Run HTTP worker-pool abandoned-client cleanup test
 test-pool-disconnect: fixture
     #!/usr/bin/env bash

@@ -13,6 +13,7 @@
 //! | raw input → default `<input>.i64` sibling | same hash verification, same code path |
 //! | `rebuild=true` replacement | hash or recorded-input-path match required; unrelated/corrupt outputs refused |
 //! | idempotent retry of an open raw-input database | output identity + recorded input path + freshly streamed SHA-256 (`open_database_matches_raw_request`) |
+//! | pooled raw open forcibly retired before response | pre-open artifact snapshot + exact killed-worker output-lock reclaim (`RawOpenArtifactCleanup`) |
 //! | direct `.i64`/`.idb`/`.id0` open | exemption: the database itself is the requested object; there is no separate input to verify against |
 //! | unpacked `.id0` fallback for a missing packed path | same exemption as direct opens (`open_existing_idb`) |
 //! | DSC managed temp cache | cache filename keyed by the DSC header UUID; inputs without a trustworthy UUID are rejected (`dsc_content_identity` in `server::mod`) |
@@ -23,7 +24,8 @@ use crate::error::ToolError;
 use crate::expand_path;
 use crate::ida::handlers::analysis::build_analysis_status;
 use crate::ida::lock::{
-    acquire_mcp_lock, clean_stale_mcp_lock, detect_db_lock, release_mcp_lock_file, McpLock,
+    acquire_mcp_lock, clean_stale_mcp_lock, detect_db_lock, reclaim_killed_worker_mcp_lock,
+    release_mcp_lock_file, McpLock,
 };
 use crate::ida::observability::{
     emit_progress, ensure_not_cancelled, ProgressHeartbeat, ProgressSender, OPEN_IDB_PROGRESS_TOTAL,
@@ -42,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Build `DbInfo` from an open IDB.
-fn database_bitness(db: &IDB) -> u32 {
+pub(crate) fn database_bitness(db: &IDB) -> u32 {
     let meta = db.meta();
     if meta.is_64bit() {
         64
@@ -99,6 +101,17 @@ fn idb_path_for_raw_binary(path: &Path) -> PathBuf {
     let mut raw_idb = OsString::from(path.as_os_str());
     raw_idb.push(".i64");
     PathBuf::from(raw_idb)
+}
+
+pub(crate) fn database_path_for_open_request(path: &str, idb_out: Option<&str>) -> PathBuf {
+    let input = expand_path(path);
+    if has_ida_database_extension(&input) {
+        input
+    } else {
+        idb_out
+            .map(expand_path)
+            .unwrap_or_else(|| idb_path_for_raw_binary(&input))
+    }
 }
 
 fn existing_idb_for_raw_binary(path: &Path) -> Option<PathBuf> {
@@ -288,13 +301,15 @@ fn open_database_path_matches_raw_request(
 /// database is being addressed; a freshly streamed SHA-256 establishes that
 /// the currently-open analysis still belongs to the current input bytes.
 fn open_database_matches_raw_request(
-    current_path: &Path,
+    database_input_path: &Path,
+    effective_database_path: Option<&Path>,
     requested_input: &Path,
     requested_output: Option<&Path>,
     recorded_input: &str,
     recorded_hash: &[u8; 32],
     cancel: Option<&CancellationToken>,
 ) -> Result<bool, ToolError> {
+    let current_path = effective_database_path.unwrap_or(database_input_path);
     if !open_database_path_matches_raw_request(
         current_path,
         requested_input,
@@ -419,6 +434,49 @@ struct ArtifactSnapshot {
     before: Option<(u64, Option<std::time::SystemTime>)>,
 }
 
+pub(crate) struct RawOpenArtifactCleanup {
+    output: PathBuf,
+    artifacts: Vec<ArtifactSnapshot>,
+}
+
+const WORKER_LOCK_RECLAIM_ATTEMPTS: usize = 20;
+const WORKER_LOCK_RECLAIM_BACKOFF: Duration = Duration::from_millis(25);
+
+impl RawOpenArtifactCleanup {
+    pub(crate) fn for_request(path: &str, idb_out: Option<&str>, rebuild: bool) -> Option<Self> {
+        let input = expand_path(path);
+        if has_ida_database_extension(&input) {
+            return None;
+        }
+        let output = database_path_for_open_request(path, idb_out);
+        if !rebuild && ida_database_output_exists(&output) {
+            return None;
+        }
+        Some(Self {
+            artifacts: snapshot_database_artifacts(&output),
+            output,
+        })
+    }
+
+    pub(crate) async fn cleanup_after_worker_loss(self, worker_pid: Option<u32>) {
+        for attempt in 0..WORKER_LOCK_RECLAIM_ATTEMPTS {
+            if let Some(mcp_lock) = reclaim_killed_worker_mcp_lock(&self.output, worker_pid) {
+                remove_new_database_artifacts(&self.artifacts);
+                release_mcp_lock_file(mcp_lock);
+                return;
+            }
+            if attempt + 1 < WORKER_LOCK_RECLAIM_ATTEMPTS {
+                tokio::time::sleep(WORKER_LOCK_RECLAIM_BACKOFF).await;
+            }
+        }
+        warn!(
+            path = %self.output.display(),
+            ?worker_pid,
+            "Skipped partial open cleanup because the killed worker's output lock could not be reclaimed"
+        );
+    }
+}
+
 fn artifact_identity(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
     let metadata = fs::metadata(path).ok()?;
     Some((metadata.len(), metadata.modified().ok()))
@@ -521,6 +579,7 @@ fn configure_raw_entry_point(db: &mut IDB, entry_point: u64) -> Result<(), ToolE
 #[allow(clippy::too_many_arguments)]
 pub fn handle_open(
     idb: &mut Option<IDB>,
+    effective_database_path: Option<&Path>,
     lock_file: &mut Option<File>,
     lock_path: &mut Option<PathBuf>,
     path: &str,
@@ -543,16 +602,38 @@ pub fn handle_open(
     ensure_not_cancelled(cancel.as_ref())?;
     let is_idb = has_ida_database_extension(&expanded);
 
+    if is_idb && (idb_out.is_some() || !raw_target.is_empty()) {
+        return Err(ToolError::InvalidParams(
+            "processor, bitness, base_address, entry_point, and idb_out apply only to a raw input"
+                .to_string(),
+        ));
+    }
+    if let Some(base_address) = raw_target.base_address
+        && base_address % 16 != 0
+    {
+        return Err(ToolError::InvalidParams(format!(
+            "raw base address {base_address:#x} must be 16-byte aligned"
+        )));
+    }
+    if idb.is_some() && !raw_target.is_empty() {
+        return Err(ToolError::InvalidParams(
+            "raw target options only apply while creating a database; close the open database before retrying with processor, bitness, base_address, or entry_point"
+                .to_string(),
+        ));
+    }
+
     // Check if a database is already open
     if let Some(db) = idb.as_ref() {
-        let current_path = db.path();
+        let database_input_path = db.path();
+        let current_path = effective_database_path.unwrap_or(database_input_path);
         let requested_output = idb_out.map(expand_path);
         let same_database = if is_idb {
             database_paths_match(current_path, &expanded)
         } else {
             let meta = db.meta();
             open_database_matches_raw_request(
-                current_path,
+                database_input_path,
+                effective_database_path,
                 &expanded,
                 requested_output.as_deref(),
                 &meta.input_file_path(),
@@ -580,21 +661,6 @@ pub fn handle_open(
         return Err(ToolError::InvalidPath(format!(
             "File not found: {}",
             expanded.display()
-        )));
-    }
-
-    // Determine if this is an IDA database or a raw binary
-    if is_idb && !raw_target.is_empty() {
-        return Err(ToolError::InvalidParams(
-            "processor, bitness, base_address, and entry_point apply only to a newly-created raw-input database"
-                .to_string(),
-        ));
-    }
-    if let Some(base_address) = raw_target.base_address
-        && base_address % 16 != 0
-    {
-        return Err(ToolError::InvalidParams(format!(
-            "raw base address {base_address:#x} must be 16-byte aligned"
         )));
     }
 
@@ -1038,7 +1104,9 @@ mod tests {
         open_database_matches_raw_request, open_database_path_matches_raw_request,
         recorded_input_path_matches, remove_new_database_artifacts, sha256_file, sha256_reader,
         snapshot_database_artifacts, validate_raw_idb_output, ExistingRawIdbAction,
+        RawOpenArtifactCleanup,
     };
+    use crate::ida::lock::acquire_mcp_lock;
     use tokio_util::sync::CancellationToken;
 
     struct CancelAfterFirstRead {
@@ -1335,6 +1403,73 @@ mod tests {
         fs::remove_dir_all(dir).expect("remove temp dir");
     }
 
+    #[tokio::test]
+    async fn killed_raw_open_cleanup_removes_only_artifacts_owned_by_its_lock() {
+        let dir = temp_dir("killed-open-cleanup");
+        fs::create_dir(&dir).expect("create temp dir");
+        let raw = dir.join("firmware.bin");
+        let output = dir.join("firmware.i64");
+        fs::write(&raw, b"raw").expect("write raw input");
+        let cleanup = RawOpenArtifactCleanup::for_request(
+            &raw.display().to_string(),
+            Some(&output.display().to_string()),
+            false,
+        )
+        .expect("new raw output owns its artifacts");
+
+        let lock = acquire_mcp_lock(&output).expect("acquire simulated worker lock");
+        let (lock_file, lock_path) = lock.into_parts();
+        drop(lock_file);
+        let partial = dir.join("firmware.id0");
+        fs::write(&partial, b"partial").expect("write partial artifact");
+
+        cleanup
+            .cleanup_after_worker_loss(Some(std::process::id()))
+            .await;
+
+        assert!(
+            !partial.exists(),
+            "the killed open's partial ID0 must be removed"
+        );
+        assert!(
+            !lock_path.exists(),
+            "the reclaimed worker lock must be released"
+        );
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[tokio::test]
+    async fn killed_raw_open_cleanup_refuses_a_different_lock_owner() {
+        let dir = temp_dir("killed-open-lock-owner");
+        fs::create_dir(&dir).expect("create temp dir");
+        let raw = dir.join("firmware.bin");
+        let output = dir.join("firmware.i64");
+        fs::write(&raw, b"raw").expect("write raw input");
+        let cleanup = RawOpenArtifactCleanup::for_request(
+            &raw.display().to_string(),
+            Some(&output.display().to_string()),
+            false,
+        )
+        .expect("new raw output owns its artifacts");
+
+        let lock = acquire_mcp_lock(&output).expect("acquire another owner's lock");
+        let (lock_file, lock_path) = lock.into_parts();
+        drop(lock_file);
+        let partial = dir.join("firmware.id0");
+        fs::write(&partial, b"other owner's artifact").expect("write owned artifact");
+
+        cleanup
+            .cleanup_after_worker_loss(Some(std::process::id().saturating_add(1)))
+            .await;
+
+        assert!(
+            partial.exists(),
+            "cleanup must not touch another owner's artifact"
+        );
+        fs::remove_file(lock_path).expect("remove simulated lock");
+        fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
     #[test]
     fn raw_retry_path_matches_only_same_input_and_output() {
         let dir = temp_dir("explicit-output-retry");
@@ -1415,7 +1550,8 @@ mod tests {
         let recorded_path = raw.display().to_string();
 
         assert!(open_database_matches_raw_request(
-            &default_output,
+            &raw,
+            Some(&default_output),
             &raw,
             None,
             &recorded_path,
@@ -1424,7 +1560,8 @@ mod tests {
         )
         .expect("verify default output retry"));
         assert!(open_database_matches_raw_request(
-            &explicit_output,
+            &raw,
+            Some(&explicit_output),
             &raw,
             Some(&explicit_output),
             &recorded_path,
@@ -1432,10 +1569,21 @@ mod tests {
             None,
         )
         .expect("verify explicit output retry"));
+        assert!(!open_database_matches_raw_request(
+            &raw,
+            None,
+            &raw,
+            Some(&explicit_output),
+            &recorded_path,
+            &recorded_hash,
+            None,
+        )
+        .expect("the raw IDB input path is not the effective explicit output"));
 
         fs::write(&raw, b"second firmware").expect("replace raw input");
         assert!(!open_database_matches_raw_request(
-            &default_output,
+            &raw,
+            Some(&default_output),
             &raw,
             None,
             &recorded_path,
@@ -1444,7 +1592,8 @@ mod tests {
         )
         .expect("reject stale default output"));
         assert!(!open_database_matches_raw_request(
-            &explicit_output,
+            &raw,
+            Some(&explicit_output),
             &raw,
             Some(&explicit_output),
             &recorded_path,

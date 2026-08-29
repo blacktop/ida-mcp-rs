@@ -280,13 +280,17 @@ send "$(jq -cn --arg p "$explicit_raw" --arg out "$explicit_idb" \
 assert_ok "Phase 5 hash-verified explicit reuse" "$(wait_response 2 30)"
 assert_log_contains "Reusing SHA-256-verified IDA database for raw input"
 
+send "$(jq -cn --arg p "$explicit_raw" --arg out "$explicit_idb" \
+  '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
+assert_ok "Phase 5 idempotent explicit retry while open" "$(wait_response 3 30)"
+
 # Idempotency is content identity, not merely output-path identity. Mutate the
 # raw input while its explicit output is still open, then retry the exact same
 # request. The server must refuse to return stale analysis from the open IDB.
 printf '\0' >>"$explicit_raw"
 send "$(jq -cn --arg p "$explicit_raw" --arg out "$explicit_idb" \
-  '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
-stale_open_response="$(wait_response 3 30)"
+  '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
+stale_open_response="$(wait_response 4 30)"
 assert_err "Phase 5 changed input against already-open output" "$stale_open_response"
 echo "$stale_open_response" | jq -e '
   .result.content[0].text | contains("A database is already open")
@@ -360,6 +364,10 @@ if ! echo "$entrypoints_resp" | jq -e \
   echo "$entrypoints_resp" | jq . >&2
   exit 1
 fi
+
+send "$(jq -cn --arg p "$typed_raw" --arg out "$typed_idb" \
+  '{jsonrpc:"2.0",id:5,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out,processor:"arm:ARMv8-A",bitness:64,base_address:"0x2000",entry_point:"0x2000"}}}')"
+assert_err "Phase 8 raw target retry while open" "$(wait_response 5 30)"
 
 send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
 wait_response 99 30 >/dev/null

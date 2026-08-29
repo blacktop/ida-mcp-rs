@@ -93,13 +93,7 @@ pub fn handle_idb_meta(idb: &Option<IDB>) -> Result<Value, ToolError> {
     let db = idb.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
     let meta = db.meta();
 
-    let bits = if meta.is_64bit() {
-        64
-    } else if meta.is_32bit_exactly() {
-        32
-    } else {
-        16
-    };
+    let bits = crate::ida::handlers::database::database_bitness(db);
 
     let md5 = hex_encode(&meta.input_file_md5());
     let sha256 = hex_encode(&meta.input_file_sha256());
