@@ -352,6 +352,72 @@ crash)
   assert_tool_ok "$status_resp" "analysis_status in unaffected session"
 
   open_fixture "$session_a" 40 "$fixture_c"
+
+  # Error text that only looks like an SDK crash is an ordinary script error:
+  # the worker and its Python state must survive it.
+  state_args="$(jq -cn --arg code 'pool_marker = 41' '{code:$code,timeout_secs:10}')"
+  assert_tool_ok "$(tool_call "$session_b" 50 run_script "$state_args" 15)" "define script state"
+  lookalike_args="$(jq -cn --arg code 'raise ValueError("crashed inside the IDA SDK")' \
+    '{code:$code,timeout_secs:10}')"
+  lookalike_resp="$(tool_call "$session_b" 51 run_script "$lookalike_args" 15)"
+  assert_tool_error_contains "$lookalike_resp" "ValueError" "lookalike crash text"
+  kept_args="$(jq -cn --arg code 'pool_marker + 1' '{code:$code,timeout_secs:10}')"
+  kept_resp="$(tool_call "$session_b" 52 run_script "$kept_args" 15)"
+  assert_tool_ok "$kept_resp" "script state after lookalike crash text"
+  if [[ "$(printf '%s' "$kept_resp" | tool_text | jq -r '.result')" != "42" ]]; then
+    echo "worker lost its state after an ordinary error that mentions an SDK crash" >&2
+    printf '%s\n' "$kept_resp" | jq . >&2
+    exit 1
+  fi
+
+  # A signal caught inside the child is reported on the faulting call and
+  # retires that worker; the session reopens on a fresh one.
+  signal_args="$(jq -cn --arg code 'import signal; signal.raise_signal(signal.SIGSEGV)' \
+    '{code:$code,timeout_secs:15}')"
+  signal_resp="$(tool_call "$session_b" 53 run_script "$signal_args" 25)"
+  assert_tool_error_contains "$signal_resp" "crashed inside the IDA SDK" "caught SDK crash"
+  gone_resp="$(tool_call "$session_b" 54 run_script "$kept_args" 15)"
+  if [[ "$(printf '%s' "$gone_resp" | jq -r '.result.isError // false')" != "true" ]]; then
+    echo "worker was reused after a caught SDK crash" >&2
+    printf '%s\n' "$gone_resp" | jq . >&2
+    exit 1
+  fi
+  open_fixture "$session_b" 55 "$fixture_b"
+  fresh_resp="$(tool_call "$session_b" 56 run_script "$kept_args" 15)"
+  assert_tool_error_contains "$fresh_resp" "NameError" "fresh worker after SDK crash"
+
+  # A crash inside a batch tool: search folds per-item errors into a
+  # successful result, so retirement must come from the private marker, not
+  # from the error envelope. A one-shot SIGSEGV from an IDP output hook
+  # crashes the first instruction search renders.
+  hook_code='import ida_idp, signal
+class PoolCrashHook(ida_idp.IDP_Hooks):
+    def __init__(self):
+        super().__init__()
+        self.armed = True
+    def ev_out_insn(self, ctx):
+        if self.armed:
+            self.armed = False
+            signal.raise_signal(signal.SIGSEGV)
+        return 0
+pool_marker = 123
+pool_crash_hook = PoolCrashHook()
+pool_crash_hook.hook()'
+  hook_args="$(jq -cn --arg code "$hook_code" '{code:$code,timeout_secs:15}')"
+  assert_tool_ok "$(tool_call "$session_b" 60 run_script "$hook_args" 15)" "install crash hook"
+  batch_resp="$(tool_call "$session_b" 61 search \
+    '{"targets":["ret"],"kind":"text","limit":10,"timeout_secs":15}' 25)"
+  assert_tool_error_contains "$batch_resp" "crashed inside the IDA SDK" "crash inside search"
+  gone_resp="$(tool_call "$session_b" 62 run_script "$kept_args" 15)"
+  if [[ "$(printf '%s' "$gone_resp" | jq -r '.result.isError // false')" != "true" ]]; then
+    echo "worker was reused after a crash inside a batch tool" >&2
+    printf '%s\n' "$gone_resp" | jq . >&2
+    exit 1
+  fi
+  open_fixture "$session_b" 63 "$fixture_b"
+  fresh_resp="$(tool_call "$session_b" 64 run_script "$kept_args" 15)"
+  assert_tool_error_contains "$fresh_resp" "NameError" "fresh worker after batch crash"
+
   close_session "$session_a" 90
   close_session "$session_b" 91
   echo "HTTP pool crash-containment test passed"

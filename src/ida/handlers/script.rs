@@ -80,6 +80,17 @@ pub fn handle_run_script(
         "stdout": output.stdout,
         "stderr": output.stderr,
     });
+    if let Some(encoded) = &output.result_json {
+        result["result"] = serde_json::from_str(encoded).map_err(|error| {
+            ToolError::IdaError(format!(
+                "run_script produced a result that is not valid JSON ({error}); \
+                 print the value instead"
+            ))
+        })?;
+        if output.result_is_repr {
+            result["result_is_repr"] = json!(true);
+        }
+    }
     if let Some(error) = &output.error {
         result["error"] = json!(error);
     } else if !output.success

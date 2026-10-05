@@ -4,8 +4,12 @@
 
 - Single-client, simplest setup.
 - Use with CLI agents that launch a child process.
-- Uses one implicit database by default. Add `--workspace` when an agent needs
-  several explicit database handles in one stdio connection.
+- Uses one implicit database by default, served by one supervised IDA child
+  process: a call that overruns its bound kills the child (the database is
+  no longer open; reopen it) and the next open starts a fresh one. Idle
+  reaping is off in this mode; `--workspace-worker-op-timeout-secs` sets the
+  watchdog. Add `--workspace` when an agent needs several explicit database
+  handles in one stdio connection.
 
 ```bash
 ./target/release/ida-mcp
@@ -99,7 +103,7 @@ Options (workspace flags are global):
   0 disables). In pooled mode this is the fallback reclaim for POST-only
   clients — SSE clients are reclaimed faster via `--worker-disconnect-grace-secs`.
 - `--max-workers`: maximum child worker processes for concurrent multi-IDB
-  sessions; `1` keeps the legacy in-process worker
+  sessions; `1` shares one supervised child and disables idle reaping
 - `--min-workers`: idle child workers to keep warm when pooled mode is enabled
 - `--worker-idle-timeout-secs`: seconds before an idle pooled worker process is
   reaped (default 300s; 0 disables)
@@ -156,8 +160,13 @@ Runtime tools such as `tool_catalog` do not accept a database ID.
 ## Concurrency model
 
 IDA requires main-thread access, and one IDA process can own only one active
-database at a time. The default stdio and single-worker HTTP modes therefore
-serialize calls through one worker loop.
+database at a time. Default stdio and single-worker HTTP serialize calls through
+one supervised child worker. HTTP clients share its database and close-token
+ownership; a retired child loses that binding and the next open creates a new one.
+Cancelling a shared HTTP request leaves any dispatched call running under its
+watchdog. Graceful shutdown allows up to 120 seconds for the active call to
+settle and the database to save before it cancels background tasks or retires
+the child.
 
 With `--workspace`, each open database owns a child-worker lease addressed by
 its `database_id`. Calls to different handles can run concurrently up to
@@ -183,6 +192,11 @@ bytes, or comment/rename text.
 Scope the filter when troubleshooting: `RUST_LOG=ida_mcp=debug`. A bare
 `RUST_LOG=debug` also enables the MCP SDK's own request logging, which writes
 whole JSON-RPC envelopes — including tool arguments — to stderr.
+
+Application logs use a nonblocking stderr queue capped at 256 events and
+16 KiB per event. Oversized events are truncated and excess events are dropped
+when the reader falls behind, so logging cannot stop worker deadlines or hold
+shutdown open. Child processes inherit stderr directly.
 
 ## Known limitations
 
@@ -212,5 +226,8 @@ whole JSON-RPC envelopes — including tool arguments — to stderr.
 
 ## Shutdown
 
-The server listens for SIGINT/SIGTERM/SIGQUIT and will close the open database
-before exiting when possible.
+The server listens for SIGINT/SIGTERM/SIGQUIT/SIGHUP and will close the open
+database before exiting when possible. Default stdio also handles stdin EOF.
+It allows up to 120 seconds for the active operation and database save, then
+shuts down the supervised pool and retires any remaining child. Unsaved changes
+can be lost if closing IDA exceeds that bound.

@@ -6,15 +6,17 @@
 //!
 //! # Architecture
 //!
-//! IDA **must** run on the main thread. The architecture is:
+//! IDA **must** run on the main thread of the process that hosts it. The
+//! architecture is:
 //!
-//! - **Main thread**: Runs the IDA worker loop (`ida::run_ida_loop`).
-//!   All idalib operations happen here.
+//! - **Worker process** (`ida-mcp worker`): the main
+//!   thread runs the IDA worker loop (`ida::run_ida_loop`); all idalib
+//!   operations happen there. A background thread runs the tokio runtime with
+//!   the MCP server and talks to the main thread via channels (`IdaWorker`).
 //!
-//! - **Background thread**: Runs the tokio runtime with the async MCP server.
-//!   Communicates with the main thread via channels.
-//!
-//! - **IdaWorker**: Handle for sending requests to the main thread.
+//! - **Router process** (stdio and HTTP, including `--workspace`): no IDA;
+//!   it supervises worker processes through `ida::pool` and kills one whose
+//!   call overruns its bound.
 //!
 //! - **IdaMcpServer**: The MCP server that exposes tools for IDA operations.
 //!   Uses the `rmcp` crate for MCP protocol handling.
@@ -25,6 +27,7 @@
 //! - `open_idb`: Open an IDA database (.i64/.idb) or a raw binary (Mach-O/ELF/PE)
 //! - `load_debug_info`: Load external debug info (e.g., dSYM/DWARF)
 //! - `analysis_status`: Report auto-analysis status (auto_is_ok, auto_state)
+//! - `save_idb`: Save edits without closing the database
 //! - `close_idb`: Close the currently open database
 //!
 //! ## Function Analysis

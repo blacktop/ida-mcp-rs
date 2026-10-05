@@ -91,14 +91,9 @@ single_rc="$(run_bounded "$single_log" "$WATCHDOG_SECS" \
   fail "single-worker start reported success on an occupied port" "$(cat "$single_log")"
 grep -Fq "bind failed" "$single_log" ||
   fail "single-worker log never mentions the bind failure" "$(cat "$single_log")"
-grep -Fq "IDA worker loop finished" "$single_log" ||
-  fail "single-worker did not release its IDA worker loop" "$(cat "$single_log")"
-echo "   single-worker exited $single_rc and released the IDA worker loop"
-
-# NOTE: a follow-up assertion belongs here once IdaRequest::{Shutdown,Close}
-# skip deferred IDA initialization — today a failed start still runs
-# "Initializing IDA library on main thread", taking a license only to release
-# it, and a failing init would drop the Shutdown request and re-wedge.
+! grep -Eq "spawned IDA child worker|Starting IDA worker loop|Initializing IDA library" "$single_log" ||
+  fail "single-worker initialized IDA before successfully binding" "$(cat "$single_log")"
+echo "   single-worker exited $single_rc before starting an IDA worker"
 
 # --- Phase 2: pooled must exit nonzero and must not claim a clean stop.
 pooled_log="$tmpdir/pooled.log"

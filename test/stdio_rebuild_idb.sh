@@ -276,6 +276,15 @@ init
 send "$(jq -cn --arg p "$explicit_raw" --arg out "$explicit_idb" \
   '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"open_idb",arguments:{path:$p,idb_out:$out}}}')"
 assert_ok "Phase 4 explicit idb_out open" "$(wait_response 2 120)"
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"save_idb","arguments":{}}}'
+save_resp="$(wait_response 3 60)"
+assert_ok "Phase 4 save_idb" "$save_resp"
+saved_path="$(echo "$save_resp" | jq -r '.result.content[0].text' | jq -r '.path')"
+if [[ "$(basename "$saved_path")" != "$(basename "$explicit_idb")" ]]; then
+  echo "❌ save_idb reported $saved_path, expected the database $explicit_idb" >&2
+  exit 1
+fi
+[[ -f "$explicit_idb" ]] || { echo "❌ save_idb did not write $explicit_idb" >&2; exit 1; }
 send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'
 wait_response 99 30 >/dev/null
 stop_server

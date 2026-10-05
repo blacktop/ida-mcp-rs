@@ -3,3 +3,4 @@ fixtures/*
 !fixtures/
 !fixtures/*.c
 !fixtures/*.py
+!fixtures/stable-api-v9.4.4.json

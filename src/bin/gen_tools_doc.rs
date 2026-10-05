@@ -137,7 +137,9 @@ fn main() {
     let _ = writeln!(out, "## Notes\n");
     let _ = writeln!(
         out,
-        "- Many tools accept a single value or array (e.g., `\"0x1000\"` or `[\"0x1000\", \"0x2000\"]`)"
+        "- Tools whose description says \"one or more\" accept a single value or an array \
+         (e.g., `\"0x1000\"` or `[\"0x1000\", \"0x2000\"]`) and return one result per value; \
+         tools that say \"one address\" reject arrays with more than one element"
     );
     let _ = writeln!(
         out,

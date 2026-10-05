@@ -233,9 +233,14 @@ if echo "$names" | grep -q '^lumina_apply$'; then
   exit 1
 fi
 
-# First request that reaches the IDA worker loop, so it pays the deferred
-# idalib::init_library() cost on the main thread — allow a generous timeout.
-send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lumina_lookup","arguments":{"address":"0x1000"}}}'
+# The Lumina gate is checked by the worker with a database open; the first
+# open pays IDA initialization in the child, so allow a generous timeout.
+ro_idb="$work/read-only.i64"
+cp "${IDB_PATH:-fixtures/mini.i64}" "$ro_idb"
+send "$(jq -cn --arg path "$ro_idb" \
+  '{jsonrpc:"2.0",id:30,method:"tools/call",params:{name:"open_idb",arguments:{path:$path}}}')"
+wait_response 30 120 | jq -e '.result.isError != true' >/dev/null || { echo "FAIL: read-only open_idb failed" >&2; exit 1; }
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lumina_lookup","arguments":{"address":"0x100000460"}}}'
 lumina_resp=$(wait_response 3 90)
 echo "$lumina_resp" | jq -e \
   '.result.isError == true and (.result.content[0].text | test("Lumina access is disabled"))' \

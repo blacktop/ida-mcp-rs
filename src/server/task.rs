@@ -146,6 +146,14 @@ impl TaskEntry {
         TaskSettlement::Completed
     }
 
+    fn complete_after_fatal_error(&mut self, result: Value) -> TaskSettlement {
+        if self.state.status != TaskStatus::Running {
+            return TaskSettlement::Unchanged;
+        }
+        self.cancel_requested = None;
+        self.complete(result)
+    }
+
     fn fail(&mut self, error: &str) -> TaskSettlement {
         if self.state.status != TaskStatus::Running {
             return TaskSettlement::Unchanged;
@@ -403,6 +411,21 @@ impl TaskRegistry {
                 }
             }
             Some(entry) => entry.complete(result),
+            None => TaskSettlement::Unchanged,
+        };
+        if settlement != TaskSettlement::Unchanged {
+            prune_terminal_tasks(&mut entries);
+        }
+        settlement
+    }
+
+    /// Preserve a settled tool error even when cancellation was requested.
+    /// Callers must use this only for a typed fatal error: worker loss can
+    /// discard unsaved changes and must not be presented as clean cancellation.
+    pub fn complete_after_fatal_error(&self, id: &str, result: Value) -> TaskSettlement {
+        let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let settlement = match entries.get_mut(id) {
+            Some(entry) => entry.complete_after_fatal_error(result),
             None => TaskSettlement::Unchanged,
         };
         if settlement != TaskSettlement::Unchanged {
@@ -860,6 +883,10 @@ mod tests {
         );
         assert_eq!(
             registry.fail(&id, "late failure"),
+            TaskSettlement::Unchanged
+        );
+        assert_eq!(
+            registry.complete_after_fatal_error(&id, json!({"isError": true})),
             TaskSettlement::Unchanged
         );
 

@@ -265,9 +265,11 @@ session-to-worker lease map.
 
 #### HTTP/SSE worker pool
 
-`serve-http` keeps the existing single in-process IDA worker by default. For
-stateful multi-client HTTP/SSE usage, set `--max-workers` above `1` to route
-sessions through child `ida-mcp worker` processes:
+`serve-http` shares one supervised IDA child by default. A cancelled request
+stops waiting without closing another client's database. If a native call
+exceeds its watchdog, the server retires the child; reopen the database to
+continue. For stateful multi-client HTTP/SSE usage, set `--max-workers` above
+`1` to give sessions separate child `ida-mcp worker` processes:
 
 ```bash
 ida-mcp serve-http --bind 127.0.0.1:8765 --max-workers 4 --min-workers 1
@@ -285,6 +287,10 @@ immediately, but the child process may stay alive idle for reuse until
 `open_idb`/`open_dsc` calls fail with `Worker pool exhausted` so clients can
 retry later. Pooled mode requires stateful HTTP sessions; `--max-workers > 1`
 is rejected with `--stateless`.
+
+Both default stdio and HTTP save the open database before cancelling background
+work during graceful shutdown. The shutdown has a 120-second bound. Use
+`save_idb` to checkpoint edits without closing the database.
 
 #### Headless debugger (experimental opt-in)
 
@@ -451,7 +457,7 @@ because it does not modify the database.
 
 ## Context Optimization
 
-`ida-mcp` exposes the same 75 baseline tools by default (~12k tokens of
+`ida-mcp` exposes 76 baseline tools by default (~12k tokens of
 `tools/list` payload). Six debugger tools exist behind the explicit gates above,
 so installing the new release does not enlarge existing clients' schema.
 Clients with dynamic tool discovery defer that cost; clients that preload
@@ -464,7 +470,7 @@ schemas include it in every session. Filter the surface to only what you need:
 | `--exclude-tools=t1,t2`| `IDA_MCP_EXCLUDE_TOOLS` | Subtracts from the include set; always wins |
 | `--read-only`          | `IDA_MCP_READ_ONLY`     | Strips mutating/arbitrary-code tools (`run_script`, `patch*`, `rename`, `set_comments`, `lumina_apply`, type/stack edits, `dsc_add_*`, `analyze_funcs`, and debugger process control); keeps lifecycle/discovery |
 
-No flags = all 75 baseline tools (default). Categories: `core`, `functions`,
+No flags = all 76 baseline tools (default). Categories: `core`, `functions`,
 `disassembly`, `decompile`, `xrefs`, `control_flow`, `memory`, `search`,
 `metadata`, `types`, `editing`, `scripting`; `debug` appears only when its
 startup/platform gate is active (run `tool_catalog` to enumerate). Flags

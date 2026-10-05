@@ -101,6 +101,10 @@ impl ServerRuntimeState {
         Self::default()
     }
 
+    pub fn task_registry(&self) -> &task::TaskRegistry {
+        &self.task_registry
+    }
+
     /// Runtime state for an HTTP transport started with `--stateless` (see
     /// [`Self::stateless_http`]).
     pub fn new_stateless_http() -> Self {
@@ -922,6 +926,14 @@ async fn extract_universal_slice(
     Ok(dest)
 }
 
+/// How long the parent's own foreground timer waits beyond the pool's kill
+/// point before giving up on the typed retirement error.
+const FOREGROUND_SUPERVISOR_MARGIN_SECS: u64 = 3;
+/// Largest foreground deadline: the largest request plus the pool's grace and
+/// the supervisor margin, so a maximum request still ends with the typed error.
+const FOREGROUND_MAX_SECS: u64 =
+    MAX_TIMEOUT_SECS + CHILD_TIMEOUT_GRACE_SECS + FOREGROUND_SUPERVISOR_MARGIN_SECS;
+
 fn timeout_with_child_grace(timeout_secs: Option<u64>, default_timeout_secs: u64) -> u64 {
     timeout_secs
         .unwrap_or(default_timeout_secs)
@@ -1075,15 +1087,24 @@ impl IdaMcpServer {
     }
 
     fn close_hint(&self) -> &'static str {
-        close_hint_for(self.mode, self.worker.is_pooled(), self.workspace_enabled())
+        close_hint_for(
+            self.mode,
+            self.worker.is_legacy_pooled(),
+            self.workspace_enabled(),
+        )
     }
 
-    fn http_close_grant(&self) -> Option<Result<CloseTokenGrant, String>> {
+    async fn http_close_grant(
+        &self,
+        generation: Option<DatabaseGeneration>,
+    ) -> Option<Result<CloseTokenGrant, String>> {
         if !self.workspace_enabled()
             && matches!(self.mode, ServerMode::Http)
             && self.worker.uses_close_tokens()
         {
-            self.worker.issue_close_token_for_session(&self.session_id)
+            self.worker
+                .issue_close_token_for_session(&self.session_id, generation)
+                .await
         } else {
             None
         }
@@ -1159,17 +1180,39 @@ impl IdaMcpServer {
     }
 
     fn parse_address(s: &str) -> Result<u64, ToolError> {
-        let mut s = s.trim().to_string();
-        s.retain(|c| c != '_');
-        if s.starts_with("0x") || s.starts_with("0X") {
-            u64::from_str_radix(&s[2..], 16).map_err(|_| ToolError::InvalidAddress(s))
-        } else if s.starts_with("0b") || s.starts_with("0B") {
-            u64::from_str_radix(&s[2..], 2).map_err(|_| ToolError::InvalidAddress(s))
-        } else if s.starts_with("0o") || s.starts_with("0O") {
-            u64::from_str_radix(&s[2..], 8).map_err(|_| ToolError::InvalidAddress(s))
+        let original = s.trim();
+        // Underscores are digit separators (0x1000_0000); they are removed
+        // for parsing but the error echoes what the caller sent.
+        let digits: String = original.chars().filter(|c| *c != '_').collect();
+        let parsed = if let Some(hex) = digits.strip_prefix("0x").or(digits.strip_prefix("0X")) {
+            u64::from_str_radix(hex, 16)
+        } else if let Some(bin) = digits.strip_prefix("0b").or(digits.strip_prefix("0B")) {
+            u64::from_str_radix(bin, 2)
+        } else if let Some(oct) = digits.strip_prefix("0o").or(digits.strip_prefix("0O")) {
+            u64::from_str_radix(oct, 8)
         } else {
-            s.parse()
-                .map_err(|_| ToolError::InvalidAddress(s.to_string()))
+            digits.parse()
+        };
+        parsed.map_err(|_| ToolError::InvalidAddress(Self::describe_bad_address(original)))
+    }
+
+    /// A symbol passed where an address was expected is the common mistake;
+    /// say so instead of echoing a string the model cannot act on.
+    fn describe_bad_address(original: &str) -> String {
+        let looks_like_symbol = original
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && !original.starts_with("0x")
+            && !original.starts_with("0X");
+        if looks_like_symbol {
+            format!(
+                "{original:?} is a symbol name, not an address; pass a hex address such as \
+                 0x100000660, or give the name to a tool's target_name/name parameter, or \
+                 resolve it first with resolve_function"
+            )
+        } else {
+            format!("{original:?} is not a hex (0x...), decimal, octal (0o...), or binary (0b...) address")
         }
     }
 
@@ -1239,14 +1282,6 @@ impl IdaMcpServer {
         strings.iter().map(|s| Self::parse_address(s)).collect()
     }
 
-    fn value_to_single_address(value: &Value) -> Result<u64, ToolError> {
-        let addrs = Self::value_to_addresses(value)?;
-        addrs
-            .into_iter()
-            .next()
-            .ok_or_else(|| ToolError::InvalidAddress("empty address list".to_string()))
-    }
-
     /// The address selector of a mutating tool, after checking the caller
     /// named exactly one target: one address or one non-empty name.
     fn mutation_target_address(
@@ -1269,15 +1304,23 @@ impl IdaMcpServer {
         }
     }
 
+    /// For tools that return one result: a scalar or a one-element array is
+    /// accepted, anything else is refused rather than silently truncated.
     fn value_to_exactly_one_address(value: &Value, field_name: &str) -> Result<u64, ToolError> {
         let addresses = Self::value_to_addresses(value)?;
         match addresses.as_slice() {
             [address] => Ok(*address),
-            _ => Err(ToolError::InvalidParams(format!(
-                "{field_name} must contain exactly one value"
+            many => Err(ToolError::InvalidParams(format!(
+                "{field_name} must contain exactly one address, got {}; this tool handles one \
+                 address per call",
+                many.len()
             ))),
         }
     }
+
+    /// Foreground bound used inside a child worker: effectively none, because
+    /// the supervising parent enforces the real deadline and retires the child.
+    const WORKER_UNBOUNDED_SECS: u64 = 60 * 60 * 24 * 365;
 
     /// Default page size for xref listings when the caller omits `limit`.
     const DEFAULT_XREFS_LIMIT: usize = 1000;
@@ -1381,6 +1424,7 @@ impl IdaMcpServer {
                     .await
                 {
                     Ok(result) => results.push(Self::xrefs_entry(addr, result)),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -1487,10 +1531,15 @@ impl IdaMcpServer {
         next_operation_id(self.operation_nonce.as_ref())
     }
 
+    /// Let a timed-out or cancelled operation settle briefly. If it settles
+    /// with a fatal error (the supervisor retired the worker), that error is
+    /// returned so the client learns the database is gone, instead of the
+    /// generic timeout that would hide it.
     async fn finish_cancelled_foreground<T, Fut>(
         tool_name: &'static str,
         operation_fut: Pin<&mut Fut>,
-    ) where
+    ) -> Option<ToolError>
+    where
         Fut: std::future::Future<Output = Result<T, ToolError>>,
     {
         let cleanup = tokio::time::timeout(
@@ -1498,12 +1547,17 @@ impl IdaMcpServer {
             operation_fut,
         )
         .await;
-        if cleanup.is_err() {
-            warn!(
-                tool_name,
-                timeout_secs = FOREGROUND_CANCEL_CLEANUP_TIMEOUT_SECS,
-                "foreground operation did not finish cancellation cleanup before response"
-            );
+        match cleanup {
+            Ok(Err(error)) if error.is_fatal() => Some(error),
+            Ok(_) => None,
+            Err(_) => {
+                warn!(
+                    tool_name,
+                    timeout_secs = FOREGROUND_CANCEL_CLEANUP_TIMEOUT_SECS,
+                    "foreground operation did not finish cancellation cleanup before response"
+                );
+                None
+            }
         }
     }
 
@@ -1513,7 +1567,12 @@ impl IdaMcpServer {
         default_timeout_secs: u64,
     ) -> Option<u64> {
         if self.worker.is_pooled() {
-            return Some(timeout_with_child_grace(timeout_secs, default_timeout_secs));
+            // Past the pool's kill point, so the supervisor's typed
+            // retirement error is what the client gets, not a generic timeout.
+            return Some(
+                timeout_with_child_grace(timeout_secs, default_timeout_secs)
+                    .saturating_add(FOREGROUND_SUPERVISOR_MARGIN_SECS),
+            );
         }
         timeout_secs
     }
@@ -1547,19 +1606,46 @@ impl IdaMcpServer {
         // response when fast tools coalesce into a single Node stdin `data`
         // event, dropping the Claude Code transport with "unknown progress
         // token". Phases remain observable via `recent_operations`.
+        // The drain cannot wait for every sender to drop: an IDA SDK crash
+        // unwinds with siglongjmp, which skips the destructor of a handler's
+        // heartbeat and leaves its sender alive. The finished operation ends
+        // the drain instead.
+        let operation_finished = tokio_util::sync::CancellationToken::new();
         let drain_task = tokio::spawn({
             let registry = self.operation_registry.clone();
             let op_id = op_id.clone();
+            let operation_finished = operation_finished.clone();
             async move {
-                while let Some(update) = progress_rx.recv().await {
-                    registry.record_progress(&op_id, update.phase, update.message);
+                loop {
+                    tokio::select! {
+                        biased;
+                        update = progress_rx.recv() => {
+                            let Some(update) = update else { break };
+                            registry.record_progress(&op_id, update.phase, update.message);
+                        }
+                        () = operation_finished.cancelled() => {
+                            while let Ok(update) = progress_rx.try_recv() {
+                                registry.record_progress(&op_id, update.phase, update.message);
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         });
         let worker_cancel = tokio_util::sync::CancellationToken::new();
-        let timeout = timeout_secs
-            .unwrap_or(default_timeout_secs)
-            .min(MAX_TIMEOUT_SECS);
+        // A child worker cannot interrupt a native IDA call, so its own
+        // timeout would only answer early while its IDA thread stays stuck;
+        // the parent is the watchdog and kills the child at its bound.
+        // A router's deadline includes the pool's grace and a margin above
+        // MAX_TIMEOUT_SECS (see foreground_timeout_secs); clamping it back
+        // would let this timer beat the supervisor at the maximum request.
+        let timeout = match self.mode {
+            ServerMode::Worker => Self::WORKER_UNBOUNDED_SECS,
+            ServerMode::Stdio | ServerMode::Http => timeout_secs
+                .unwrap_or(default_timeout_secs)
+                .min(FOREGROUND_MAX_SECS),
+        };
         let client_cancel = ctx.ct.clone();
 
         let operation_fut = run(progress_tx, worker_cancel.clone());
@@ -1580,6 +1666,7 @@ impl IdaMcpServer {
 
         match outcome {
             Outcome::Finished(result) => {
+                operation_finished.cancel();
                 let _ = drain_task.await;
                 match result {
                     Ok(value) => {
@@ -1616,9 +1703,16 @@ impl IdaMcpServer {
                 }
             }
             Outcome::TimedOut(timeout_secs) => {
-                Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
+                let fatal =
+                    Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
                 drain_task.abort();
                 let _ = drain_task.await;
+                if let Some(error) = fatal {
+                    let _ = self
+                        .operation_registry
+                        .finish_failed(&op_id, format!("{tool_name} failed: {error}"));
+                    return Err(ForegroundOperationError::Tool(error));
+                }
                 let snapshot = self
                     .operation_registry
                     .finish_timed_out(
@@ -1641,9 +1735,16 @@ impl IdaMcpServer {
                 })
             }
             Outcome::Cancelled => {
-                Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
+                let fatal =
+                    Self::finish_cancelled_foreground(tool_name, operation_fut.as_mut()).await;
                 drain_task.abort();
                 let _ = drain_task.await;
+                if let Some(error) = fatal {
+                    let _ = self
+                        .operation_registry
+                        .finish_failed(&op_id, format!("{tool_name} failed: {error}"));
+                    return Err(ForegroundOperationError::Tool(error));
+                }
                 let snapshot = self
                     .operation_registry
                     .finish_cancelled(&op_id, format!("{tool_name} cancelled by client"))
@@ -1858,6 +1959,7 @@ impl IdaMcpServer {
 
         let analysis_status = match self.worker.analysis_status_for_generation(generation).await {
             Ok(status) => Some(status),
+            Err(err) if err.is_fatal() => return Ok(err.to_tool_result()),
             Err(err) => {
                 warn!(module = %module, error = %err, "failed to fetch analysis_status after open_dsc");
                 None
@@ -1871,7 +1973,7 @@ impl IdaMcpServer {
         };
         let next_steps = dsc_analysis_next_steps(analysis_ready, next_step_hint);
 
-        let close_token = self.http_close_grant();
+        let close_token = self.http_close_grant(generation).await;
 
         let mut value = match serde_json::to_value(&db_info) {
             Ok(v) => v,
@@ -1919,6 +2021,12 @@ impl IdaMcpServer {
         cancel_token: &tokio_util::sync::CancellationToken,
         cancel_message: &str,
     ) -> task::TaskSettlement {
+        if error.is_fatal() {
+            return registry.complete_after_fatal_error(
+                task_id,
+                call_tool_result_to_value(&error.to_tool_result()),
+            );
+        }
         registry.complete_with_cancel_token(
             task_id,
             call_tool_result_to_value(&error.to_tool_result()),
@@ -2207,6 +2315,18 @@ impl IdaMcpServer {
             let module_result = worker
                 .dsc_load_image_for_generation(&module, Some(600), Some(database_generation))
                 .await;
+            if let Err(error) = &module_result
+                && error.is_fatal()
+            {
+                Self::complete_background_tool_error(
+                    &task_id,
+                    &registry,
+                    error,
+                    &cancel_token,
+                    "Cancelled after the worker was lost",
+                );
+                return;
+            }
             if cancel_token.is_cancelled() {
                 Self::finish_dsc_cancellation_after_open(
                     &task_id,
@@ -2248,6 +2368,18 @@ impl IdaMcpServer {
                 let framework_result = worker
                     .dsc_load_image_for_generation(framework, Some(600), Some(database_generation))
                     .await;
+                if let Err(error) = &framework_result
+                    && error.is_fatal()
+                {
+                    Self::complete_background_tool_error(
+                        &task_id,
+                        &registry,
+                        error,
+                        &cancel_token,
+                        "Cancelled after the worker was lost",
+                    );
+                    return;
+                }
                 if cancel_token.is_cancelled() {
                     Self::finish_dsc_cancellation_after_open(
                         &task_id,
@@ -2280,6 +2412,20 @@ impl IdaMcpServer {
             let analysis_status_result = worker
                 .analysis_status_for_generation(Some(database_generation))
                 .await;
+            if let Err(error) = &analysis_status_result
+                && error.is_fatal()
+            {
+                // The worker already discarded the database; there is
+                // nothing left to close, even when cancellation is pending.
+                Self::complete_background_tool_error(
+                    &task_id,
+                    &registry,
+                    error,
+                    &cancel_token,
+                    "Cancelled after the worker was lost",
+                );
+                return;
+            }
             if cancel_token.is_cancelled() {
                 Self::finish_dsc_cancellation_after_open(
                     &task_id,
@@ -2317,7 +2463,9 @@ impl IdaMcpServer {
 
         let close_token = match (mode, owner_session_id.as_deref()) {
             (ServerMode::Http, Some(owner_session_id)) => {
-                worker.issue_close_token_for_session(owner_session_id)
+                worker
+                    .issue_close_token_for_session(owner_session_id, Some(database_generation))
+                    .await
             }
             _ => None,
         };
@@ -2345,7 +2493,11 @@ impl IdaMcpServer {
             apply_close_metadata(
                 map,
                 close_token,
-                close_hint_for(mode, worker.is_pooled(), workspace_database_id.is_some()),
+                close_hint_for(
+                    mode,
+                    worker.is_legacy_pooled(),
+                    workspace_database_id.is_some(),
+                ),
             );
         }
 
@@ -2955,7 +3107,7 @@ impl IdaMcpServer {
                 foreground_timeout_secs,
                 300,
                 |progress_tx, cancel| {
-                    self.worker.open_observed(
+                    self.worker.open_observed_with_generation(
                         &path,
                         req.load_debug_info.unwrap_or(false),
                         debug_info_path.clone(),
@@ -2974,8 +3126,9 @@ impl IdaMcpServer {
             )
             .await
         {
-            Ok(info) => {
-                let close_token = self.http_close_grant();
+            Ok(opened) => {
+                let close_token = self.http_close_grant(Some(opened.generation)).await;
+                let info = opened.info;
                 let analysis_task = if route_to_background && !info.analysis_status.auto_is_ok {
                     let cancel_token = self.background_lifetime(&ctx.meta).child_token();
                     let owner = self.task_owner(&ctx.meta);
@@ -3011,6 +3164,9 @@ impl IdaMcpServer {
                     if info.analysis_status.auto_is_ok {
                         quick_tools.extend(["decompile", "xrefs_to"]);
                     }
+                    // Only recommend what this (public) server advertises; a
+                    // child worker's own filter is always unrestricted.
+                    quick_tools.retain(|name| self.filter.is_enabled(name));
                     map.insert("quick_tools".to_string(), json!(quick_tools));
                     if let Some(slice) = &universal {
                         map.insert("universal".to_string(), json!(slice));
@@ -3793,6 +3949,19 @@ impl IdaMcpServer {
         }
     }
 
+    #[tool(description = "Save the open database to disk without closing it. \
+        Use this to checkpoint renames, comments, types, and patches.")]
+    #[instrument(skip_all)]
+    async fn save_idb(&self) -> Result<CallToolResult, McpError> {
+        debug!("Tool call: save_idb");
+        match self.worker.save_database().await {
+            Ok(result) => Ok(CallToolResult::success(vec![Content::text(pretty_json(
+                &result,
+            ))])),
+            Err(e) => Ok(e.to_tool_result()),
+        }
+    }
+
     #[tool(description = "Close the currently open IDA database. \
         Call this when you're done analyzing to free resources. \
         In legacy HTTP/SSE, the owning session can close directly. Otherwise, \
@@ -3805,25 +3974,30 @@ impl IdaMcpServer {
         Parameters(req): Parameters<CloseIdbRequest>,
     ) -> Result<CallToolResult, McpError> {
         info!("Tool call: close_idb received");
-        if !self.workspace_enabled()
+        let result = if !self.workspace_enabled()
             && matches!(self.mode, ServerMode::Http)
             && self.worker.uses_close_tokens()
         {
-            match self.worker.authorize_close(
-                &self.session_id,
-                req.token.as_deref(),
-                req.force.unwrap_or(false),
-            ) {
-                CloseAuthorization::Granted => {}
-                CloseAuthorization::GrantedByOverride {
+            match self
+                .worker
+                .close_authorized(
+                    &self.session_id,
+                    req.token.as_deref(),
+                    req.force.unwrap_or(false),
+                )
+                .await
+            {
+                Ok(CloseAuthorization::Granted) => Ok(()),
+                Ok(CloseAuthorization::GrantedByOverride {
                     previous_owner_session_id,
-                } => {
+                }) => {
                     info!(
                         previous_owner_session_id = ?previous_owner_session_id,
                         "close_idb overriding previous HTTP owner session"
                     );
+                    Ok(())
                 }
-                CloseAuthorization::Denied { owner_session_id } => {
+                Ok(CloseAuthorization::Denied { owner_session_id }) => {
                     info!(owner_session_id = ?owner_session_id, "close_idb ignored: owner token required");
                     return Ok(CallToolResult::success(vec![Content::text(
                         serde_json::to_string_pretty(&json!({
@@ -3835,9 +4009,11 @@ impl IdaMcpServer {
                         .unwrap_or_else(|_| "close_idb ignored: owner token required".to_string()),
                     )]));
                 }
+                Err(error) => Err(error),
             }
-        }
-        let result = self.worker.close().await;
+        } else {
+            self.worker.close().await
+        };
         if workspace_close_should_remove_entry(
             &result,
             &self.task_registry,
@@ -3850,7 +4026,6 @@ impl IdaMcpServer {
         }
         match result {
             Ok(()) => {
-                self.worker.clear_close_token();
                 info!("Tool call: close_idb completed successfully");
                 Ok(CallToolResult::success(vec![Content::text(
                     "Database closed",
@@ -4116,13 +4291,13 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get address context (segment, function, nearest symbol)")]
+    #[tool(description = "Get address context (segment, function, nearest symbol) for one address")]
     async fn addr_info(
         &self,
         Parameters(req): Parameters<AddrInfoRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -4141,13 +4316,13 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get the function that contains an address")]
+    #[tool(description = "Get the function that contains one address (one address per call)")]
     async fn function_at(
         &self,
         Parameters(req): Parameters<FunctionAtRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -4166,7 +4341,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get disassembly at an address")]
+    #[tool(
+        description = "Get disassembly at one or more addresses (address accepts an array; one result per address)"
+    )]
     #[instrument(skip_all, fields(address = %req.address, count = req.count))]
     async fn disasm(
         &self,
@@ -4195,6 +4372,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "disasm": text
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4215,11 +4393,11 @@ impl IdaMcpServer {
         Parameters(req): Parameters<RenderRangeRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: render_range");
-        let start = match Self::value_to_single_address(&req.start) {
+        let start = match Self::value_to_exactly_one_address(&req.start, "start") {
             Ok(address) => address,
             Err(error) => return Ok(error.to_tool_result()),
         };
-        let end = match Self::value_to_single_address(&req.end) {
+        let end = match Self::value_to_exactly_one_address(&req.end, "end") {
             Ok(address) => address,
             Err(error) => return Ok(error.to_tool_result()),
         };
@@ -4252,13 +4430,13 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Disassemble the function containing an address")]
+    #[tool(description = "Disassemble the function containing one address (one address per call)")]
     async fn disasm_function_at(
         &self,
         Parameters(req): Parameters<DisasmFunctionAtRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -4278,7 +4456,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Decompile a function using Hex-Rays (if available)")]
+    #[tool(
+        description = "Decompile one or more functions with Hex-Rays (address accepts an array; one result per function)"
+    )]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn decompile(
         &self,
@@ -4303,6 +4483,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "decompile": code
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4317,7 +4498,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Get decompiled pseudocode at a specific address or address range. \
+        description = "Get decompiled pseudocode at one or more addresses or address ranges. \
         Unlike 'decompile' which returns the full function, this returns only the statements \
         that correspond to the given address(es). Useful for getting pseudocode for a basic block \
         or specific instruction. If end_address is provided, returns statements covering the range."
@@ -4358,6 +4539,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "pseudocode": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4488,7 +4670,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Get cross-references TO an address (who references this address). \
+        description = "Get cross-references TO one or more addresses (address accepts an array). \
         Paginated (default limit 1000, max 10000); when truncated=true, pass next_offset back \
         as offset to page through high-frequency targets."
     )]
@@ -4502,7 +4684,7 @@ impl IdaMcpServer {
     }
 
     #[tool(
-        description = "Get cross-references FROM an address (what this address references). \
+        description = "Get cross-references FROM one or more addresses (address accepts an array). \
         Paginated (default limit 1000, max 10000); when truncated=true, pass next_offset back \
         as offset to page through the remaining references."
     )]
@@ -4569,7 +4751,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Read raw bytes from an address as hex string")]
+    #[tool(
+        description = "Read raw bytes at one or more addresses as hex strings (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(size = req.size))]
     async fn get_bytes(
         &self,
@@ -4601,6 +4785,7 @@ impl IdaMcpServer {
                             "address": format!("{:#x}", addr),
                             "bytes": result
                         })),
+                        Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                         Err(e) => results.push(json!({
                             "address": format!("{:#x}", addr),
                             "error": e.to_string()
@@ -4638,14 +4823,14 @@ impl IdaMcpServer {
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: list_patches");
         let start = match req.start.as_ref() {
-            Some(value) => match Self::value_to_single_address(value) {
+            Some(value) => match Self::value_to_exactly_one_address(value, "address") {
                 Ok(address) => Some(address),
                 Err(error) => return Ok(error.to_tool_result()),
             },
             None => None,
         };
         let end = match req.end.as_ref() {
-            Some(value) => match Self::value_to_single_address(value) {
+            Some(value) => match Self::value_to_exactly_one_address(value, "address") {
                 Ok(address) => Some(address),
                 Err(error) => return Ok(error.to_tool_result()),
             },
@@ -4665,7 +4850,7 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get basic blocks of a function (control flow graph nodes)")]
+    #[tool(description = "Get basic blocks of one or more functions (address accepts an array)")]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn basic_blocks(
         &self,
@@ -4693,6 +4878,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "basic_blocks": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4706,7 +4892,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get functions called BY a function (callees/children in call graph)")]
+    #[tool(
+        description = "Get functions called BY one or more functions (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn callees(
         &self,
@@ -4734,6 +4922,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "callees": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4747,7 +4936,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get functions that CALL a function (callers/parents in call graph)")]
+    #[tool(
+        description = "Get functions that CALL one or more functions (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(address = %req.address))]
     async fn callers(
         &self,
@@ -4775,6 +4966,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "callers": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -4947,6 +5139,7 @@ impl IdaMcpServer {
                         "next_offset": next_offset
                     }));
                 }
+                Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                 Err(e) => results.push(json!({
                     "pattern": pattern,
                     "error": e.to_string()
@@ -5043,6 +5236,7 @@ impl IdaMcpServer {
                         "next_offset": next_offset
                     }));
                 }
+                Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                 Err(e) => results.push(json!({
                     "target": target,
                     "error": e.to_string()
@@ -5123,6 +5317,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "string": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -5164,6 +5359,7 @@ impl IdaMcpServer {
                         "query": query,
                         "value": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "query": query,
                         "error": e.to_string()
@@ -5184,11 +5380,11 @@ impl IdaMcpServer {
         Parameters(req): Parameters<FindPathsRequest>,
     ) -> Result<CallToolResult, McpError> {
         debug!("Tool call: find_paths");
-        let start = match Self::value_to_single_address(&req.start) {
+        let start = match Self::value_to_exactly_one_address(&req.start, "start") {
             Ok(v) => v,
             Err(e) => return Ok(e.to_tool_result()),
         };
-        let end = match Self::value_to_single_address(&req.end) {
+        let end = match Self::value_to_exactly_one_address(&req.end, "end") {
             Ok(v) => v,
             Err(e) => return Ok(e.to_tool_result()),
         };
@@ -5211,7 +5407,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Build a callgraph rooted at an address")]
+    #[tool(
+        description = "Build a callgraph rooted at one or more addresses (roots accepts an array)"
+    )]
     #[instrument(skip_all)]
     async fn callgraph(
         &self,
@@ -5257,6 +5455,7 @@ impl IdaMcpServer {
                         "root": format!("{:#x}", root),
                         "callgraph": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "root": format!("{:#x}", root),
                         "error": e.to_string()
@@ -5449,7 +5648,7 @@ impl IdaMcpServer {
         let addr = try_param!(req
             .address
             .as_ref()
-            .map(Self::value_to_single_address)
+            .map(|value| Self::value_to_exactly_one_address(value, "address"))
             .transpose());
         match self
             .worker
@@ -5571,12 +5770,14 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Get stack frame info")]
+    #[tool(
+        description = "Get stack frame info for the function at one address (one address per call)"
+    )]
     async fn stack_frame(
         &self,
-        Parameters(req): Parameters<AddressRequest>,
+        Parameters(req): Parameters<SingleAddressRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let addr = match Self::value_to_single_address(&req.address) {
+        let addr = match Self::value_to_exactly_one_address(&req.address, "address") {
             Ok(addr) => addr,
             Err(e) => return Ok(e.to_tool_result()),
         };
@@ -5696,7 +5897,9 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Read values of a struct instance at an address")]
+    #[tool(
+        description = "Read values of a struct instance at one or more addresses (address accepts an array)"
+    )]
     #[instrument(skip_all, fields(address = %req.address, ordinal = req.ordinal, name = ?req.name))]
     async fn read_struct(
         &self,
@@ -5729,6 +5932,7 @@ impl IdaMcpServer {
                         "address": format!("{:#x}", addr),
                         "struct": result
                     })),
+                    Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                     Err(e) => results.push(json!({
                         "address": format!("{:#x}", addr),
                         "error": e.to_string()
@@ -5868,13 +6072,13 @@ impl IdaMcpServer {
         }
     }
 
-    #[tool(description = "Infer/guess type at an address")]
+    #[tool(description = "Infer/guess type at one address (one address per call)")]
     async fn infer_types(
         &self,
         Parameters(req): Parameters<InferTypesRequest>,
     ) -> Result<CallToolResult, McpError> {
         let addr = match req.address.as_ref() {
-            Some(val) => match Self::value_to_single_address(val) {
+            Some(val) => match Self::value_to_exactly_one_address(val, "address") {
                 Ok(v) => Some(v),
                 Err(e) => return Ok(e.to_tool_result()),
             },
@@ -6048,9 +6252,10 @@ impl IdaMcpServer {
                     }
                     task::TaskSettlement::Failed | task::TaskSettlement::Unchanged => {}
                 },
-                Err(e) => match registry.complete_with_cancel_token(
+                Err(e) => match Self::complete_background_tool_error(
                     &tid,
-                    call_tool_result_to_value(&e.to_tool_result()),
+                    &registry,
+                    &e,
                     &worker_cancel_token,
                     "Cancelled after auto-analysis settled",
                 ) {
@@ -6334,6 +6539,7 @@ impl IdaMcpServer {
             Ok(image) => {
                 let analysis_status = match self.worker.analysis_status().await {
                     Ok(status) => Some(status),
+                    Err(err) if err.is_fatal() => return Ok(err.to_tool_result()),
                     Err(err) => {
                         warn!(module = %module, error = %err, "failed to fetch analysis_status after dsc_add_dylib");
                         None
@@ -6410,6 +6616,7 @@ impl IdaMcpServer {
             Ok(region) => {
                 let analysis_status = match self.worker.analysis_status().await {
                     Ok(status) => Some(status),
+                    Err(err) if err.is_fatal() => return Ok(err.to_tool_result()),
                     Err(err) => {
                         warn!(
                             address = %ea_hex,
@@ -6571,8 +6778,11 @@ impl IdaMcpServer {
 
     #[tool(
         description = "Execute IDAPython in the open database. Provide 'code' (inline) \
-        or 'file' (path to .py), not both. Returns captured stdout/stderr. \
-        Full access to ida_*, idc, idautils."
+        or 'file' (path to .py), not both. Returns captured stdout/stderr, \
+        plus a trailing expression as `result` (JSON up to 1 MiB; \
+        result_is_repr=true when it had to fall back to repr()). Imports, \
+        variables, and functions persist between calls on the same open \
+        database. Full access to ida_*, idc, idautils."
     )]
     #[instrument(skip_all, fields(code_len = req.code.as_ref().map_or(0, String::len)))]
     async fn run_script(
@@ -6826,6 +7036,7 @@ async fn get_int_values(
                     "address": format!("{:#x}", addr),
                     "value": result
                 })),
+                Err(e) if e.is_fatal() => return Ok(e.to_tool_result()),
                 Err(e) => results.push(json!({
                     "address": format!("{:#x}", addr),
                     "error": e.to_string()
@@ -6893,7 +7104,7 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "debug_attach" => Some(schema::<DebugAttachRequest>()),
         "debug_stop" => Some(schema::<DebugStopRequest>()),
         "debug_open_module" => Some(schema::<DebugOpenModuleRequest>()),
-        "analysis_status" => Some(schema::<EmptyParams>()),
+        "analysis_status" | "save_idb" => Some(schema::<EmptyParams>()),
         "list_databases" => Some(schema::<EmptyParams>()),
         "tool_catalog" => Some(schema::<ToolCatalogRequest>()),
         "tool_help" => Some(schema::<ToolHelpRequest>()),
@@ -6945,7 +7156,6 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "lumina_lookup" => Some(schema::<LuminaLookupRequest>()),
         "lumina_apply" => Some(schema::<LuminaApplyRequest>()),
         "list_globals" => Some(schema::<ListGlobalsRequest>()),
-        "int_convert" => Some(schema::<IntConvertRequest>()),
 
         // Editing
         "set_comments" => Some(schema::<SetCommentsRequest>()),
@@ -6958,9 +7168,10 @@ fn tool_params_schema(name: &str) -> Option<Value> {
         "struct_info" => Some(schema::<StructInfoRequest>()),
         "read_struct" => Some(schema::<ReadStructRequest>()),
         "search_structs" => Some(schema::<StructsRequest>()),
+        "int_convert" => Some(schema::<IntConvertRequest>()),
         "local_types" => Some(schema::<LocalTypesRequest>()),
         "xrefs_to_field" => Some(schema::<XrefsToFieldRequest>()),
-        "stack_frame" => Some(schema::<AddressRequest>()),
+        "stack_frame" => Some(schema::<SingleAddressRequest>()),
         "declare_type" => Some(schema::<DeclareTypeRequest>()),
         "apply_types" => Some(schema::<ApplyTypesRequest>()),
         "infer_types" => Some(schema::<InferTypesRequest>()),
@@ -7205,6 +7416,9 @@ pub struct SanitizedIdaServer<S> {
     inner: S,
     filter: Arc<tool_filter::ToolFilter>,
     workspace: bool,
+    /// Set in child workers: a crash caught while a call ran is reported to
+    /// the parent on that call's result.
+    sdk_crash: Option<crate::crash_guard::SdkCrashSignal>,
 }
 
 impl<S> SanitizedIdaServer<S> {
@@ -7215,6 +7429,7 @@ impl<S> SanitizedIdaServer<S> {
             inner,
             filter: Arc::new(tool_filter::ToolFilter::unrestricted()),
             workspace: false,
+            sdk_crash: None,
         }
     }
 
@@ -7224,6 +7439,7 @@ impl<S> SanitizedIdaServer<S> {
             inner,
             filter,
             workspace: false,
+            sdk_crash: None,
         }
     }
 
@@ -7232,7 +7448,15 @@ impl<S> SanitizedIdaServer<S> {
             inner,
             filter,
             workspace: true,
+            sdk_crash: None,
         }
+    }
+
+    /// Report IDA SDK crashes to a pool parent on the result of the call
+    /// that was running. Used by child workers only.
+    pub fn reporting_sdk_crashes(mut self, signal: crate::crash_guard::SdkCrashSignal) -> Self {
+        self.sdk_crash = Some(signal);
+        self
     }
 }
 
@@ -7263,7 +7487,7 @@ fn tool_annotations_for(name: &str) -> ToolAnnotations {
             .destructive(true)
             .open_world(false),
         "patch" | "patch_asm" => ToolAnnotations::new().read_only(false).destructive(true),
-        "open_idb" | "open_dsc" | "dsc_add_dylib" | "dsc_add_region" | "close_idb"
+        "open_idb" | "open_dsc" | "dsc_add_dylib" | "dsc_add_region" | "save_idb" | "close_idb"
         | "load_debug_info" | "declare_type" | "apply_types" | "declare_stack" | "delete_stack"
         | "rename" | "set_comments" | "debug_open_module" => ToolAnnotations::new()
             .read_only(false)
@@ -7568,7 +7792,23 @@ impl<S: ServerHandler + Send + Sync> ServerHandler for SanitizedIdaServer<S> {
                 None,
             ));
         }
-        self.inner.call_tool(params, ctx).await
+        let tool = params.name.to_string();
+        let response = self.inner.call_tool(params, ctx).await;
+        if !self.sdk_crash.as_ref().is_some_and(|signal| signal.take()) {
+            return response;
+        }
+        let mut result = match response {
+            Ok(CallToolResponse::Complete(result)) => result,
+            // A crash leaves no trustworthy partial state to resume or poll,
+            // so every other shape collapses to a terminal error.
+            Ok(_) | Err(_) => ToolError::SdkCrashed(format!(
+                "{tool} crashed inside the IDA SDK. The database state can no longer be \
+                 trusted; reopen it."
+            ))
+            .to_tool_result(),
+        };
+        crate::ida::remote::mark_sdk_crashed(&mut result);
+        Ok(CallToolResponse::Complete(result))
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -7641,7 +7881,6 @@ mod tests {
     use rmcp::model::{CallToolResponse, CallToolResult, InputResponses, ProtocolVersion};
     use rmcp::ServerHandler;
     use serde_json::{json, Value};
-    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
 
@@ -7714,6 +7953,352 @@ mod tests {
             Arc::new(crate::IdaWorker::new(tx)),
             crate::ServerMode::Stdio,
         )
+    }
+
+    /// One-result tools refuse several addresses instead of answering for the
+    /// first and dropping the rest; a one-element array still works.
+    #[tokio::test]
+    async fn one_result_tools_refuse_multiple_addresses() {
+        let server = test_server();
+        let two = json!(["0x1000", "0x2000"]);
+
+        let function_at = server
+            .function_at(Parameters(crate::server::FunctionAtRequest {
+                address: Some(two.clone()),
+                target_name: None,
+                offset: None,
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(function_at.is_error, Some(true));
+        let text = first_text(&function_at);
+        assert!(
+            text.contains("exactly one address") && text.contains("got 2"),
+            "{text}"
+        );
+
+        let addr_info = server
+            .addr_info(Parameters(crate::server::AddrInfoRequest {
+                address: Some(two),
+                target_name: None,
+                offset: None,
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(addr_info.is_error, Some(true));
+        assert!(first_text(&addr_info).contains("got 2"));
+
+        // A one-element array is the scalar; it reaches the worker (which this
+        // test server never answers), so the result is not a parameter error.
+        let one = json!(["0x1000"]);
+        let outcome = IdaMcpServer::value_to_exactly_one_address(&one, "address");
+        assert_eq!(outcome.ok(), Some(0x1000));
+        let empty = IdaMcpServer::value_to_exactly_one_address(&json!([]), "address");
+        assert!(empty
+            .unwrap_err()
+            .to_string()
+            .contains("no addresses provided"));
+    }
+
+    /// What the agent reads must say which address parameters take arrays.
+    #[test]
+    fn address_descriptions_state_batch_or_single() {
+        let batch = [
+            "disasm",
+            "decompile",
+            "pseudocode_at",
+            "get_bytes",
+            "basic_blocks",
+            "callees",
+            "callers",
+            "callgraph",
+            "read_struct",
+            "get_u8",
+            "get_u16",
+            "get_u32",
+            "get_u64",
+            "get_string",
+            "xrefs_to",
+            "xrefs_from",
+        ];
+        let single = [
+            "addr_info",
+            "function_at",
+            "disasm_function_at",
+            "stack_frame",
+            "infer_types",
+        ];
+        let server = crate::server::SanitizedIdaServer::new(test_server());
+        for name in batch {
+            let tool = server.get_tool(name).expect(name);
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("one or more") || description.contains("(es)"),
+                "{name} tools/list description hides its batch support: {description}"
+            );
+            let short = crate::tool_registry::get_tool(name).expect(name).short_desc;
+            assert!(
+                short.contains("one or more")
+                    || short.contains("(es)")
+                    || short.contains("addresses"),
+                "{name} catalog description hides its batch support: {short}"
+            );
+        }
+        for name in single {
+            let tool = server.get_tool(name).expect(name);
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("one address"),
+                "{name} tools/list description does not say it takes one address: {description}"
+            );
+            let schema_text = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+            assert!(
+                !schema_text.contains("Address(es)"),
+                "{name} parameter schema advertises batch input: {schema_text}"
+            );
+            assert!(
+                crate::tool_registry::get_tool(name)
+                    .expect(name)
+                    .short_desc
+                    .contains("one "),
+                "{name} catalog description does not say it takes one address"
+            );
+        }
+    }
+
+    /// Addresses parse with digit separators; a symbol in an address slot is
+    /// named as such, with the original spelling, and pointed at the fix.
+    #[test]
+    fn bad_addresses_are_explained_in_the_callers_terms() {
+        assert_eq!(
+            IdaMcpServer::parse_address("0x1000_0660").unwrap(),
+            0x1000_0660
+        );
+        assert_eq!(IdaMcpServer::parse_address(" 4096 ").unwrap(), 4096);
+        assert_eq!(IdaMcpServer::parse_address("0b101").unwrap(), 5);
+        assert_eq!(IdaMcpServer::parse_address("0o17").unwrap(), 15);
+
+        let symbol = IdaMcpServer::parse_address("helper_mix")
+            .unwrap_err()
+            .to_string();
+        assert!(symbol.contains("\"helper_mix\""), "{symbol}");
+        assert!(symbol.contains("symbol name"), "{symbol}");
+        assert!(symbol.contains("resolve_function"), "{symbol}");
+        assert!(!symbol.contains("helpermix"), "{symbol}");
+
+        let junk = IdaMcpServer::parse_address("0xZZ").unwrap_err().to_string();
+        assert!(
+            junk.contains("\"0xZZ\"") && junk.contains("not a hex"),
+            "{junk}"
+        );
+    }
+
+    /// A server whose worker answers from `respond` on a helper thread, so a
+    /// handler can be driven through a scripted sequence of worker replies.
+    fn scripted_server(
+        respond: impl Fn(crate::IdaRequest) + Send + 'static,
+    ) -> (IdaMcpServer, std::thread::JoinHandle<()>) {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let worker = std::thread::spawn(move || {
+            while let Ok(request) = rx.recv() {
+                respond(request);
+            }
+        });
+        let server = IdaMcpServer::new(
+            Arc::new(crate::IdaWorker::new(tx)),
+            crate::ServerMode::Stdio,
+        );
+        (server, worker)
+    }
+
+    /// A DSC load that succeeds, followed by a status request that reports
+    /// the worker's loss. Any other request is unexpected.
+    fn load_then_lose_worker(request: crate::IdaRequest) {
+        match request {
+            crate::IdaRequest::DscLoadImage {
+                admission, resp, ..
+            } => {
+                let _ = admission.start();
+                let _ = resp.send(Ok(crate::ida::types::DscImageInfo {
+                    index: 1,
+                    name: "/usr/lib/libSystem.B.dylib".to_string(),
+                    file_name: "libSystem.B.dylib".to_string(),
+                    address: "0x180000000".to_string(),
+                    address_value: 0x1_8000_0000,
+                    total_size: 0x1000,
+                    file_index: None,
+                    loaded: true,
+                }));
+            }
+            crate::IdaRequest::DscLoadRegion {
+                admission, resp, ..
+            } => {
+                let _ = admission.start();
+                let _ = resp.send(Ok(crate::ida::types::DscRegionInfo {
+                    start: "0x180000000".to_string(),
+                    start_value: 0x1_8000_0000,
+                    size: 0x1000,
+                    kind: "text".to_string(),
+                    image_index: 1,
+                    name: "libSystem".to_string(),
+                    loaded: true,
+                }));
+            }
+            crate::IdaRequest::AnalysisStatus { resp, .. } => {
+                let _ = resp.send(Err(ToolError::SdkCrashed(
+                    "analysis_status crashed inside the IDA SDK".to_string(),
+                )));
+            }
+            _ => panic!("unexpected worker request"),
+        }
+    }
+
+    fn first_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// The post-load status request is optional, but a fatal error there
+    /// means the database was discarded, so the load must not report success.
+    #[tokio::test]
+    async fn dsc_growth_reports_a_lost_worker_instead_of_success() {
+        let (server, _worker) = scripted_server(load_then_lose_worker);
+
+        let dylib = server
+            .dsc_add_dylib(Parameters(crate::server::DscAddDylibRequest {
+                module: "/usr/lib/libSystem.B.dylib".to_string(),
+                timeout_secs: Some(5),
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(dylib.is_error, Some(true), "{dylib:?}");
+        assert!(first_text(&dylib).contains("crashed inside the IDA SDK"));
+
+        let region = server
+            .dsc_add_region(Parameters(crate::server::DscAddRegionRequest {
+                address: json!("0x180000000"),
+                timeout_secs: Some(5),
+            }))
+            .await
+            .expect("tool result");
+        assert_eq!(region.is_error, Some(true), "{region:?}");
+        assert!(first_text(&region).contains("crashed inside the IDA SDK"));
+    }
+
+    #[tokio::test]
+    async fn background_dsc_preserves_fatal_loss_at_each_cancel_boundary() {
+        use crate::ida::types::{
+            AnalysisStatus, DatabaseGeneration, DbInfo, DscImageInfo, OpenedDatabase,
+        };
+        use crate::server::{DscBackgroundCtx, DscBackgroundOpen};
+
+        for phase in ["open", "module", "framework", "status"] {
+            let directory = std::env::temp_dir()
+                .join(format!("ida-mcp-dsc-fatal-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).expect("create test directory");
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let worker_cancel = cancel.clone();
+            let message = format!("{phase} lost the IDA worker");
+            let worker_message = message.clone();
+            let (server, worker_thread) = scripted_server(move |request| {
+                let fatal = || {
+                    worker_cancel.cancel();
+                    ToolError::SdkCrashed(worker_message.clone())
+                };
+                match request {
+                    crate::IdaRequest::Open { path, resp, .. } => {
+                        let result = if phase == "open" {
+                            Err(fatal())
+                        } else {
+                            Ok(OpenedDatabase {
+                                generation: DatabaseGeneration(1),
+                                info: DbInfo {
+                                    path,
+                                    file_type: "DSC".into(),
+                                    loader: "DSC".into(),
+                                    processor: "ARM".into(),
+                                    bits: 64,
+                                    function_count: 0,
+                                    debug_info: None,
+                                    analysis_status: AnalysisStatus {
+                                        auto_enabled: true,
+                                        auto_is_ok: false,
+                                        auto_state: "AU_NONE".into(),
+                                        auto_state_id: 0,
+                                        analysis_running: true,
+                                    },
+                                },
+                            })
+                        };
+                        resp.send(result).expect("return open result");
+                    }
+                    crate::IdaRequest::DscLoadImage {
+                        module,
+                        admission,
+                        resp,
+                        ..
+                    } => {
+                        admission.start().expect("dispatch image load");
+                        let result = if module == phase {
+                            Err(fatal())
+                        } else {
+                            Ok(DscImageInfo {
+                                index: 0,
+                                name: module.clone(),
+                                file_name: module,
+                                address: "0x1000".into(),
+                                address_value: 0x1000,
+                                total_size: 0x1000,
+                                file_index: None,
+                                loaded: true,
+                            })
+                        };
+                        resp.send(result).expect("return image result");
+                    }
+                    crate::IdaRequest::AnalysisStatus { resp, .. } => {
+                        assert_eq!(phase, "status");
+                        resp.send(Err(fatal())).expect("return status error");
+                    }
+                    _ => panic!("fatal worker loss must not dispatch cleanup"),
+                }
+            });
+            let registry = server.task_registry.clone();
+            let id = registry
+                .create_keyed(&TASK_OWNER, "dsc", "cancel-boundary", "Opening DSC")
+                .expect("create task");
+            IdaMcpServer::run_dsc_background(
+                id.clone(),
+                registry.clone(),
+                server.worker.clone(),
+                crate::ServerMode::Stdio,
+                None,
+                DscBackgroundCtx {
+                    open: DscBackgroundOpen::DirectRawDsc {
+                        open_path: directory.join("cache"),
+                        idb_out: directory.join("cache.i64"),
+                    },
+                    module: "module".into(),
+                    frameworks: vec!["framework".into()],
+                    owner_session_id: None,
+                },
+                cancel,
+            )
+            .await;
+            let value = serde_json::to_value(task_state_to_detailed_task(
+                registry.get(&id).expect("retained DSC task"),
+            ))
+            .expect("serialize MCP task");
+            assert_eq!(value["status"], "completed", "{phase}: {value}");
+            assert_eq!(value["result"]["isError"], true, "{phase}: {value}");
+            assert_eq!(value["result"]["content"][0]["text"], message);
+            drop(server);
+            worker_thread.join().expect("scripted worker exited");
+            std::fs::remove_dir_all(directory).expect("remove test directory");
+        }
     }
 
     /// Sentinels chosen so a substring hit can only come from the payload we
@@ -8657,6 +9242,15 @@ mod tests {
     }
 
     #[test]
+    fn save_annotation_agrees_with_read_only_filter() {
+        assert!(crate::server::tool_filter::READ_ONLY_DENY_LIST.contains(&"save_idb"));
+        let save = tool_annotations_for("save_idb");
+        assert_eq!(save.read_only_hint, Some(false));
+        assert_eq!(save.destructive_hint, Some(false));
+        assert_ne!(save.idempotent_hint, Some(true));
+    }
+
+    #[test]
     fn debugger_annotations_match_process_and_filesystem_effects() {
         let stop = tool_annotations_for("debug_stop");
         assert_eq!(stop.read_only_hint, Some(false));
@@ -8747,28 +9341,67 @@ mod tests {
     }
 
     #[test]
-    fn default_tool_schema_snapshot() {
-        // Default mode: no --workspace, no --enable-debugger. This digest is
-        // the locked promise that opt-in capabilities never alter the schemas
-        // an ordinary client sees.
-        let schemas = crate::tool_registry::all_tools()
-            .filter(|tool| !tool.requirements.debugger && !tool.requirements.workspace)
-            .map(|tool| {
-                json!({
-                    "name": tool.name,
-                    "schema": tool_params_schema(tool.name),
-                })
-            })
-            .collect::<Vec<_>>();
-        let encoded = serde_json::to_vec(&schemas).expect("serialize schema snapshot");
-        let digest = Sha256::digest(encoded)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+    fn stable_tool_schemas_match_v9_4_4() {
+        // Frozen from v9.4.4's real dispatch router. Keep the only permitted
+        // maintenance API changes explicit instead of re-pinning a digest.
+        let baseline: Value =
+            serde_json::from_str(include_str!("../../test/fixtures/stable-api-v9.4.4.json"))
+                .expect("v9.4.4 schema fixture");
         assert_eq!(
-            digest,
-            "e665ac0a0c5dc5eae45e24e62a651461f5d9d1322ca99a820230cba790dc89d3"
+            baseline["source"],
+            "a9649d37b81b770cfe0cd44f35d96f6de21fb1dd"
         );
+        let mut expected = baseline["tools"].as_object().expect("tools").clone();
+        assert_eq!(expected.len(), 82);
+        expected.insert("save_idb".to_string(), expected["analysis_status"].clone());
+        for (name, description) in [
+            (
+                "read_struct",
+                "Address(es) of struct instances (string/number or array)",
+            ),
+            (
+                "stack_frame",
+                "One address (string/number); a one-element array is accepted",
+            ),
+        ] {
+            for schema in ["inputSchema", "helpSchema"] {
+                expected.get_mut(name).expect(name)[schema]["properties"]["address"]
+                    ["description"] = json!(description);
+            }
+        }
+        let stack_help = &mut expected.get_mut("stack_frame").expect("stack_frame")["helpSchema"];
+        stack_help["title"] = json!("SingleAddressRequest");
+        stack_help["description"] = json!(
+            "One address for a tool that returns one result; a one-element array is\n\
+             accepted, anything longer is refused."
+        );
+
+        let actual = test_server()
+            .tool_mux
+            .list_all()
+            .into_iter()
+            .map(|mut tool| {
+                crate::server::normalize_tool_input_schema(&mut tool);
+                let info = crate::tool_registry::get_tool(&tool.name).expect("registered tool");
+                (
+                    tool.name.to_string(),
+                    json!({
+                        "scope": info.scope,
+                        "requirements": info.requirements,
+                        "inputSchema": tool.input_schema,
+                        "helpSchema": tool_params_schema(&tool.name).expect("help schema"),
+                    }),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            actual.keys().collect::<std::collections::BTreeSet<_>>(),
+            expected.keys().collect::<std::collections::BTreeSet<_>>(),
+            "the maintenance release must keep exactly the 82 stable tools plus save_idb"
+        );
+        for (name, tool) in expected {
+            assert_eq!(actual[&name], tool, "stable contract changed for {name}");
+        }
     }
 
     #[test]
@@ -8925,6 +9558,112 @@ mod tests {
         assert_eq!(value["status"], "completed");
         assert_eq!(value["result"]["content"][0]["text"], "done");
         assert_eq!(value["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn background_analysis_preserves_fatal_loss_after_cancellation() {
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let server = IdaMcpServer::new(
+            Arc::new(crate::IdaWorker::new(tx)),
+            crate::ServerMode::Stdio,
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let id = server
+            .spawn_analyze_funcs_task(&task::TaskOwner::Runtime, cancel.clone())
+            .expect("start background analysis");
+        let request = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .expect("join request receiver")
+            .expect("analysis reached the worker");
+        let crate::IdaRequest::AnalyzeFuncs {
+            admission, resp, ..
+        } = request
+        else {
+            panic!("unexpected worker request");
+        };
+        admission.start().expect("dispatch analysis");
+        assert!(server
+            .task_registry
+            .cancel_for_owner(&task::TaskOwner::Runtime, &id));
+        assert!(cancel.is_cancelled());
+        let error = ToolError::WorkerRetired(
+            "cancelled analyze_funcs; killed worker 7. The database is no longer open; call open_idb again"
+                .to_string(),
+        );
+        let expected = error.to_string();
+        resp.send(Err(error)).expect("return worker retirement");
+
+        let state = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = server.task_registry.get(&id).expect("retained task");
+                if state.status != task::TaskStatus::Running {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("analysis task settled");
+        let value =
+            serde_json::to_value(task_state_to_detailed_task(state)).expect("serialize MCP task");
+        assert_eq!(value["status"], "completed", "{value}");
+        assert_eq!(value["result"]["isError"], true, "{value}");
+        assert_eq!(value["result"]["content"][0]["text"], expected);
+    }
+
+    #[test]
+    fn background_tool_errors_preserve_only_typed_fatal_losses() {
+        for (error, fatal) in [
+            (ToolError::WorkerRetired("worker retired".into()), true),
+            (
+                ToolError::WorkerCrashed {
+                    worker_id: 7,
+                    last_op: "analyze_funcs".into(),
+                },
+                true,
+            ),
+            (ToolError::SdkCrashed("SDK crashed".into()), true),
+            (ToolError::DebuggerSessionLost("session lost".into()), true),
+            (ToolError::NeverDispatched("still queued".into()), false),
+            (ToolError::Cancelled("cancelled".into()), false),
+            (ToolError::IdaError("worker retired".into()), false),
+        ] {
+            let registry = task::TaskRegistry::new();
+            let id = registry
+                .create_keyed(&TASK_OWNER, "test", "fatal-settlement", "Working")
+                .expect("create task");
+            let cancel = tokio_util::sync::CancellationToken::new();
+            registry.set_cancel_token(&id, cancel.clone());
+            assert!(registry.cancel_for_owner(&TASK_OWNER, &id));
+            assert!(cancel.is_cancelled());
+            let expected = if fatal {
+                task::TaskSettlement::Completed
+            } else {
+                task::TaskSettlement::Cancelled
+            };
+            assert_eq!(
+                IdaMcpServer::complete_background_tool_error(
+                    &id,
+                    &registry,
+                    &error,
+                    &cancel,
+                    "Cancelled after work settled",
+                ),
+                expected,
+                "{error:?}"
+            );
+            let state = registry.get(&id).expect("retained task");
+            if fatal {
+                assert_eq!(
+                    state.result,
+                    Some(call_tool_result_to_value(&error.to_tool_result()))
+                );
+            } else {
+                assert!(state.result.is_none());
+            }
+        }
     }
 
     #[test]
@@ -9530,7 +10269,7 @@ mod tests {
         assert!(rejected(None, Some("")).contains("must not be empty"));
         for several in [json!(["0x10", "0x20"]), json!("0x10, 0x20")] {
             assert!(
-                rejected(Some(several), None).contains("exactly one value"),
+                rejected(Some(several), None).contains("exactly one address"),
                 "multi-address input must not be truncated to its first entry"
             );
         }

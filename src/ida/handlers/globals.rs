@@ -108,6 +108,11 @@ pub fn handle_idb_meta(idb: &Option<IDB>) -> Result<Value, ToolError> {
         "input_file_size": meta.input_file_size(),
         "md5": md5,
         "sha256": sha256,
+        // image_base is the loaded image's base (INF_IMAGEBASE), which rebasing
+        // updates; base_address is the paragraph base of segmented formats and
+        // is 0 for Mach-O, ELF, and PE. Both are kept so neither is mistaken
+        // for the other.
+        "image_base": format!("{:#x}", db.image_base()),
         "base_address": meta.base_address().map(|a| format!("{:#x}", a)),
         "min_address": format!("{:#x}", meta.min_address()),
         "max_address": format!("{:#x}", meta.max_address()),

@@ -25,12 +25,14 @@ release-against ida_version="9.4":
     KACHE_DISABLED=1 IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
 
 # Build and publish prerelease (macOS ARM64 only, for local testing)
-prerelease ida_version="9.4": && (update-beta-cask ida_version)
+prerelease ida_version="9.4": _release-git-deps && (update-beta-cask ida_version)
     #!/usr/bin/env bash
     set -euo pipefail
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     TARGET=$(git rev-parse HEAD)
     KACHE_DISABLED=1 IDADIR="/Applications/IDA Professional {{ ida_version }}.app/Contents/MacOS" cargo build --release
+    # Never publish a build whose decompiler cannot attach to the targeted runtime.
+    (cd test && SERVER_BIN=../target/release/ida-mcp just test-decompile)
     mkdir -p dist
     rm -f "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
     tar -czvf "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz" -C target/release ida-mcp -C "{{ justfile_directory() }}" README.md LICENSE
@@ -40,6 +42,15 @@ prerelease ida_version="9.4": && (update-beta-cask ida_version)
         --title "IDA Pro MCP Server v${VERSION}" \
         --notes "Prerelease for IDA Pro {{ ida_version }} beta. Requires IDA Pro {{ ida_version }} with valid license." \
         "dist/ida-mcp_${VERSION}_Darwin_arm64.tar.gz"
+
+# Reject local overrides before publishing a clean-checkout release.
+_release-git-deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! cargo metadata --locked --format-version 1 | python3 -c 'import json, sys; p = json.load(sys.stdin)["packages"]; required = {"idalib", "idalib-build", "idalib-sys"}; found = [v for v in p if v["name"] in required]; sys.exit({v["name"] for v in found} != required or any(not (v["source"] or "").startswith("git+") for v in found))'; then
+        echo "error: release requires published git sources for idalib, idalib-build, and idalib-sys" >&2
+        exit 1
+    fi
 
 # Update homebrew beta cask in tap
 update-beta-cask ida_version="9.4":
@@ -150,6 +161,10 @@ test: build
 test-decompile: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-decompile
 
+# Verify that the 9.4 maintenance release preserves the stable public tool API.
+test-stable-api: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp just test-stable-api
+
 # Run HTTP integration test (debug)
 test-http: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-http
@@ -246,6 +261,18 @@ test-dsc dsc_path="": build
 test-license: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=info just test-license
 
+# Verify a call stuck inside IDA times out, retires the child, and reopens on a fresh one (debug)
+test-stuck-call: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-stuck-call
+
+# Verify shared HTTP child retirement and ownership on both MCP lifecycles.
+test-http-stuck-call: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp just test-http-stuck-call
+
+# Verify a shutdown signal saves the database and exits with stdin still open (debug)
+test-shutdown-signal: build
+    cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-shutdown-signal
+
 # Run crash-guard integration test (triggers SIGSEGV, verifies server survives)
 test-crash-guard: build
     cd test && SERVER_BIN=../target/debug/ida-mcp RUST_LOG=ida_mcp=trace just test-crash-guard
@@ -293,9 +320,8 @@ bump:
         echo "Cargo.toml already at ${VERSION}"
     else
         sed -i '' "s/^version = \"${CURRENT}\"/version = \"${VERSION}\"/" Cargo.toml
-        sed -i '' "s/^version: '${CURRENT}'/version: '${VERSION}'/" snap/snapcraft.yaml
         cargo update -p ida-mcp
-        git add Cargo.toml Cargo.lock snap/snapcraft.yaml
+        git add Cargo.toml Cargo.lock
         git commit -m "chore: release ${VERSION}"
     fi
     git tag -a "$TAG" -m "Release $TAG"

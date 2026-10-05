@@ -217,7 +217,7 @@ case_local() {
   fi
   refused "both selectors" "not both" patch "$(jq -nc --arg a "$main_addr" --arg n "$main_name" \
     --arg b "$NOP" '{address:$a, target_name:$n, bytes:$b}')"
-  refused "several addresses" "exactly one value" patch "$(jq -nc --arg a "$main_addr" \
+  refused "several addresses" "exactly one address" patch "$(jq -nc --arg a "$main_addr" \
     --arg h "$helper_addr" --arg b "$NOP" '{address:[$a, $h], bytes:$b}')"
   [[ "$(bytes_at "$main_addr")" == "$main_bytes" && "$(bytes_at "$helper_addr")" == "$helper_bytes" ]] || {
     echo "❌ a refused patch changed bytes" >&2

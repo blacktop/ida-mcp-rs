@@ -156,6 +156,9 @@ pub fn handle_analyze_funcs(
         Some(SINGLE_PHASE_PROGRESS_TOTAL),
         "IDA auto-analysis finished; collecting result",
     );
+    if completed {
+        crate::ida::handlers::database::flush_analysis(db, "analyze_funcs");
+    }
     Ok(json!({
         "completed": completed,
         "function_count": db.function_count(),

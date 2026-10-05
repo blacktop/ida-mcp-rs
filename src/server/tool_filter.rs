@@ -22,6 +22,7 @@ use crate::tool_registry::{self, ToolCategory};
 /// deliberately preserved so the server stays usable.
 pub const READ_ONLY_DENY_LIST: &[&str] = &[
     "run_script",
+    "save_idb",
     "patch",
     "patch_asm",
     "rename",
@@ -39,6 +40,14 @@ pub const READ_ONLY_DENY_LIST: &[&str] = &[
     "debug_attach",
     "debug_stop",
 ];
+
+/// Environment mirrors of the public filter flags. The CLI reads them and a
+/// pool parent scrubs them from child workers, which must keep every tool.
+pub const TOOLSETS_ENV: &str = "IDA_MCP_TOOLSETS";
+pub const TOOLS_ENV: &str = "IDA_MCP_TOOLS";
+pub const EXCLUDE_TOOLS_ENV: &str = "IDA_MCP_EXCLUDE_TOOLS";
+pub const READ_ONLY_ENV: &str = "IDA_MCP_READ_ONLY";
+pub const FILTER_ENV_VARS: &[&str] = &[TOOLSETS_ENV, TOOLS_ENV, EXCLUDE_TOOLS_ENV, READ_ONLY_ENV];
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ToolFilterError {

@@ -89,6 +89,21 @@ pub enum ToolError {
     #[error("Worker {worker_id} crashed or disconnected during {last_op}")]
     WorkerCrashed { worker_id: usize, last_op: String },
 
+    /// The supervising parent killed the worker that was serving this call
+    /// because it overran its deadline; the database it held is gone.
+    #[error("{0}")]
+    WorkerRetired(String),
+
+    /// The call's wait for a busy worker ended before the worker took it, so
+    /// nothing ran: the worker, its database, and its state are untouched.
+    #[error("{0}")]
+    NeverDispatched(String),
+
+    /// A signal caught inside an IDA SDK call. The worker that reported it
+    /// discards its database; a pool parent retires the child.
+    #[error("{0}")]
+    SdkCrashed(String),
+
     #[error("Remote worker protocol error: {0}")]
     RemoteProtocol(String),
 
@@ -115,6 +130,57 @@ pub enum ToolError {
 }
 
 impl ToolError {
+    /// Whether the worker that produced this error can no longer be used, so
+    /// a handler must surface it instead of folding it into one item or an
+    /// optional field. A lost debugger session is how a pool reports the
+    /// retirement of a debug-pinned worker, whatever retired it.
+    pub fn is_fatal(&self) -> bool {
+        match self {
+            ToolError::SdkCrashed(_)
+            | ToolError::DebuggerSessionLost(_)
+            | ToolError::WorkerRetired(_)
+            | ToolError::WorkerCrashed { .. } => true,
+            ToolError::NoDatabaseOpen
+            | ToolError::DatabaseAlreadyOpen(_)
+            | ToolError::OpenFailed(_)
+            | ToolError::DatabaseLocked(_)
+            | ToolError::InvalidAddress(_)
+            | ToolError::InvalidPath(_)
+            | ToolError::InvalidParams(_)
+            | ToolError::InvalidToolCategory(_)
+            | ToolError::InvalidToolName(_)
+            | ToolError::AddressOutOfRange(_)
+            | ToolError::FunctionNotFound(_)
+            | ToolError::FunctionNameNotFound(_)
+            | ToolError::DecompilerUnavailable
+            | ToolError::Timeout(_)
+            | ToolError::TimeoutDetailed(_)
+            | ToolError::Cancelled(_)
+            | ToolError::Busy
+            | ToolError::DatabaseReplaced
+            | ToolError::BackgroundTaskHandlePrivate
+            | ToolError::BackgroundTaskRegistryFull { .. }
+            | ToolError::PoolExhausted { .. }
+            | ToolError::NeverDispatched(_)
+            | ToolError::RemoteProtocol(_)
+            | ToolError::IdaError(_)
+            | ToolError::DebuggerTeardown(_)
+            | ToolError::DebuggerStartRetained(_)
+            | ToolError::NotSupported(_)
+            | ToolError::WorkerClosed
+            | ToolError::SdkVersionMismatch(_) => false,
+        }
+    }
+
+    /// Whether the call never reached the worker (its wait was cancelled or
+    /// timed out), so no lease, handle, or worker state may be touched.
+    pub fn never_dispatched(&self) -> bool {
+        if let ToolError::NeverDispatched(_) | ToolError::Busy = self {
+            return true;
+        }
+        false
+    }
+
     /// Convert to MCP CallToolResult with is_error: true
     pub fn to_tool_result(&self) -> CallToolResult {
         CallToolResult::error(vec![Content::text(self.to_string())])

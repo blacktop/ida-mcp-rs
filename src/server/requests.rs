@@ -507,7 +507,7 @@ pub struct StructInfoRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadStructRequest {
-    #[schemars(description = "Address of struct instance (string/number)")]
+    #[schemars(description = "Address(es) of struct instances (string/number or array)")]
     #[serde(alias = "ea", alias = "addr", alias = "addresses")]
     pub address: Value,
     #[schemars(description = "Struct ordinal (numeric)")]
@@ -617,6 +617,15 @@ pub struct XrefsToFieldRequest {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AddressRequest {
     #[schemars(description = "Address(es) (string/number or array)")]
+    #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
+    pub address: Value,
+}
+
+/// One address for a tool that returns one result; a one-element array is
+/// accepted, anything longer is refused.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SingleAddressRequest {
+    #[schemars(description = "One address (string/number); a one-element array is accepted")]
     #[serde(alias = "addrs", alias = "addr", alias = "addresses")]
     pub address: Value,
 }

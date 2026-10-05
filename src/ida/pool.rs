@@ -4,12 +4,12 @@ use crate::error::ToolError;
 use crate::ida::handlers::database::{database_path_for_open_request, RawOpenArtifactCleanup};
 use crate::ida::handlers::debugger::DEBUGGER_TEARDOWN_TIMEOUT_SECS;
 use crate::ida::lock::remove_mcp_lock_for_pid;
-use crate::ida::observability::ProgressSender;
+use crate::ida::observability::{emit_progress, ProgressSender};
 use crate::ida::remote;
 use crate::ida::types::*;
 use crate::ida::worker::{
-    debugger_response_timeout_secs, CLOSE_SEND_TIMEOUT_SECS, DEBUG_MODULES_TIMEOUT_SECS,
-    MAX_TIMEOUT_SECS,
+    debugger_response_timeout_secs, CloseAuthorization, CloseTokenGrant, CloseTokenState,
+    CLOSE_SEND_TIMEOUT_SECS, DEBUG_MODULES_TIMEOUT_SECS, MAX_TIMEOUT_SECS,
 };
 use futures_util::future::join_all;
 use rmcp::handler::client::ClientHandler;
@@ -26,20 +26,27 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
 use tokio::runtime::Handle;
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::sync::{oneshot, Mutex, Notify, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::task_tracker::TaskTrackerToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
 const CHILD_SERVICE_CLOSE_TIMEOUT_SECS: u64 = 5;
+const CHILD_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const POOL_ACQUIRE_CAPACITY: usize = 64;
 pub(crate) const CHILD_TIMEOUT_GRACE_SECS: u64 = 10;
 // A close_idb RPC can spend its enqueue and debugger teardown budgets before
 // packing the database and sending its response. Its parent watchdog must
 // leave the same post-child grace as every other pooled operation.
 const MIN_CHILD_CLOSE_RPC_TIMEOUT_SECS: u64 =
     CLOSE_SEND_TIMEOUT_SECS + DEBUGGER_TEARDOWN_TIMEOUT_SECS as u64 + CHILD_TIMEOUT_GRACE_SECS;
+
+#[cfg(all(test, unix))]
+#[path = "pool_startup_tests.rs"]
+mod startup_tests;
 
 #[derive(Debug, Clone)]
 pub struct WorkerPoolConfig {
@@ -52,40 +59,54 @@ pub struct WorkerPoolConfig {
     pub worker_args: Vec<OsString>,
 }
 
-/// Public tool-filter environment variables. Filtering is enforced by the
-/// parent HTTP server; private child workers must keep lifecycle/internal
-/// tools such as `close_idb` and `analyze_funcs` available for the parent,
-/// so these are stripped from the child environment.
-const CHILD_FILTER_ENV_VARS: &[&str] = &[
-    "IDA_MCP_TOOLSETS",
-    "IDA_MCP_TOOLS",
-    "IDA_MCP_EXCLUDE_TOOLS",
-    "IDA_MCP_READ_ONLY",
-];
-
 #[derive(Clone)]
 pub struct WorkerPool {
     inner: Arc<Mutex<PoolInner>>,
     config: Arc<WorkerPoolConfig>,
+    shutdown: CancellationToken,
+    shutdown_lock: Arc<Mutex<()>>,
+    startups: TaskTracker,
+    startup_timeout: Duration,
+    changed: Arc<Notify>,
+    acquisition_slots: Arc<Semaphore>,
 }
 
 struct PoolInner {
     children: Vec<Arc<ChildSlot>>,
     spawning: HashSet<usize>,
     next_id: usize,
+    next_lease_id: u64,
+    shutting_down: bool,
+    replenishment: JoinSet<()>,
+    shared_calls: JoinSet<()>,
 }
 
 pub struct ChildSlot {
     id: usize,
     child: Mutex<PooledChild>,
     call_lock: Mutex<()>,
+    /// Calls waiting for or holding `call_lock`; bounded so a client that
+    /// pipelines requests cannot retain unbounded work behind a busy child.
+    queued: std::sync::atomic::AtomicUsize,
+}
+
+/// Most calls that may wait on one child at once, matching the in-process
+/// worker's request channel capacity.
+const CHILD_QUEUE_CAPACITY: usize = 64;
+
+/// Releases a slot's queue position when a call finishes or is dropped.
+struct QueuedCall(Arc<ChildSlot>);
+
+impl Drop for QueuedCall {
+    fn drop(&mut self) {
+        self.0.queued.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct PooledChild {
     service: Option<RunningService<RoleClient, ParentClientHandler>>,
     peer: Peer<RoleClient>,
     pid: Option<u32>,
-    stderr_task: JoinHandle<()>,
     state: ChildState,
     spawned_at: Instant,
     last_used: Instant,
@@ -128,9 +149,18 @@ impl OpenDispatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChildState {
     Idle,
-    Leased { session_id: String },
-    Closing,
+    Leased { session_id: String, lease_id: u64 },
+    Closing { lease_id: u64 },
     Dead,
+}
+
+impl ChildState {
+    fn belongs_to_lease(&self, expected: u64) -> bool {
+        match self {
+            Self::Leased { lease_id, .. } | Self::Closing { lease_id } => *lease_id == expected,
+            Self::Idle | Self::Dead => false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -139,6 +169,8 @@ pub struct PooledWorkerHandle {
     slot: Arc<ChildSlot>,
     session_id: String,
     worker_id: usize,
+    lease_id: u64,
+    preserve_on_cancel: bool,
 }
 
 #[derive(Clone)]
@@ -197,10 +229,7 @@ impl WorkerRetireReason {
 }
 
 struct WorkerRetireGuard {
-    pool: WorkerPool,
-    slot: Arc<ChildSlot>,
-    worker_id: usize,
-    session_id: String,
+    handle: PooledWorkerHandle,
     reason: WorkerRetireReason,
     runtime: Option<Handle>,
     armed: bool,
@@ -211,16 +240,14 @@ struct SpawnReservation {
     worker_id: usize,
     runtime: Option<Handle>,
     cleanup_slot: Option<Arc<ChildSlot>>,
+    tracked: Option<TaskTrackerToken>,
     armed: bool,
 }
 
 impl WorkerRetireGuard {
-    fn release(pool: WorkerPool, slot: Arc<ChildSlot>, handle: &PooledWorkerHandle) -> Self {
+    fn release(handle: &PooledWorkerHandle) -> Self {
         Self {
-            pool,
-            slot,
-            worker_id: handle.worker_id,
-            session_id: handle.session_id.clone(),
+            handle: handle.clone(),
             reason: WorkerRetireReason::Release,
             runtime: Handle::try_current().ok(),
             armed: true,
@@ -229,10 +256,7 @@ impl WorkerRetireGuard {
 
     fn call(handle: &PooledWorkerHandle, tool: &'static str) -> Self {
         Self {
-            pool: handle.pool.clone(),
-            slot: handle.slot.clone(),
-            worker_id: handle.worker_id,
-            session_id: handle.session_id.clone(),
+            handle: handle.clone(),
             reason: WorkerRetireReason::Call { tool },
             runtime: Handle::try_current().ok(),
             armed: true,
@@ -250,31 +274,33 @@ impl Drop for WorkerRetireGuard {
             return;
         }
 
-        let pool = self.pool.clone();
-        let slot = self.slot.clone();
-        let worker_id = self.worker_id;
-        let session_id = self.session_id.clone();
+        let handle = self.handle.clone();
         let reason = self.reason;
         let runtime = self.runtime.clone().or_else(|| Handle::try_current().ok());
         let Some(runtime) = runtime else {
-            reason.warn_missing_runtime(worker_id, &session_id);
+            reason.warn_missing_runtime(handle.worker_id, &handle.session_id);
             return;
         };
 
         runtime.spawn(async move {
-            reason.warn_retiring_worker(worker_id, &session_id);
-            pool.mark_dead(&slot).await;
+            reason.warn_retiring_worker(handle.worker_id, &handle.session_id);
+            handle
+                .pool
+                .mark_dead_for_lease(&handle.slot, handle.lease_id)
+                .await;
         });
     }
 }
 
 impl SpawnReservation {
     fn new(pool: WorkerPool, worker_id: usize) -> Self {
+        let tracked = Some(pool.startups.token());
         Self {
             pool,
             worker_id,
             runtime: Handle::try_current().ok(),
             cleanup_slot: None,
+            tracked,
             armed: true,
         }
     }
@@ -283,13 +309,15 @@ impl SpawnReservation {
         self.worker_id
     }
 
-    async fn finish(mut self, slot: Option<Arc<ChildSlot>>) {
+    async fn finish(mut self, slot: Option<Arc<ChildSlot>>) -> Result<(), ToolError> {
         self.cleanup_slot = slot.clone();
-        self.pool
+        let result = self
+            .pool
             .finish_spawn_reservation(self.worker_id, slot)
             .await;
         self.cleanup_slot = None;
         self.armed = false;
+        result
     }
 }
 
@@ -302,6 +330,7 @@ impl Drop for SpawnReservation {
         let pool = self.pool.clone();
         let worker_id = self.worker_id;
         let cleanup_slot = self.cleanup_slot.take();
+        let tracked = self.tracked.take();
         let runtime = self.runtime.clone().or_else(|| Handle::try_current().ok());
         let Some(runtime) = runtime else {
             warn!(
@@ -312,14 +341,16 @@ impl Drop for SpawnReservation {
         };
 
         runtime.spawn(async move {
+            // Shutdown waits until this cleanup has released the reservation.
+            let _tracked = tracked;
             warn!(
                 worker_id,
                 "spawn reservation was dropped before worker installation completed"
             );
-            pool.finish_spawn_reservation(worker_id, None).await;
             if let Some(slot) = cleanup_slot {
-                pool.mark_dead(&slot).await;
+                pool.discard_uninstalled_slot(&slot).await;
             }
+            let _ = pool.finish_spawn_reservation(worker_id, None).await;
         });
     }
 }
@@ -331,15 +362,25 @@ impl WorkerPool {
                 children: Vec::new(),
                 spawning: HashSet::new(),
                 next_id: 0,
+                next_lease_id: 0,
+                shutting_down: false,
+                replenishment: JoinSet::new(),
+                shared_calls: JoinSet::new(),
             })),
             config: Arc::new(config),
+            shutdown: CancellationToken::new(),
+            shutdown_lock: Arc::new(Mutex::new(())),
+            startups: TaskTracker::new(),
+            startup_timeout: CHILD_STARTUP_TIMEOUT,
+            changed: Arc::new(Notify::new()),
+            acquisition_slots: Arc::new(Semaphore::new(POOL_ACQUIRE_CAPACITY)),
         }
     }
 
     pub async fn warm_min(&self) -> Result<(), ToolError> {
         let min = self.config.min_workers.min(self.config.max_workers);
         for _ in 0..min {
-            let reservation = self.reserve_spawn_slot().await;
+            let reservation = self.reserve_spawn_slot().await?;
             self.spawn_reserved_slot(reservation, ChildState::Idle)
                 .await?;
         }
@@ -347,9 +388,42 @@ impl WorkerPool {
     }
 
     pub async fn lease(&self, session_id: &str) -> Result<PooledWorkerHandle, ToolError> {
+        // Acquire before either pool mutex: a flood of opens must not build
+        // an unbounded queue while a replacement is starting.
+        let _acquisition = self
+            .acquisition_slots
+            .try_acquire()
+            .map_err(|_| ToolError::Busy)?;
+        tokio::time::timeout(self.startup_timeout, self.lease_inner(session_id))
+            .await
+            .map_err(|_| {
+                ToolError::NeverDispatched(format!(
+                    "timed out after {} seconds waiting for an IDA worker to start; \
+                     no database request was dispatched, retry open_idb",
+                    self.startup_timeout.as_secs()
+                ))
+            })?
+    }
+
+    async fn lease_inner(&self, session_id: &str) -> Result<PooledWorkerHandle, ToolError> {
         let session_id = session_id.to_string();
-        let reservation = {
+        let lease_id = {
             let mut inner = self.inner.lock().await;
+            inner.next_lease_id = inner.next_lease_id.checked_add(1).ok_or_else(|| {
+                ToolError::RemoteProtocol("worker lease identifier space exhausted".to_string())
+            })?;
+            inner.next_lease_id
+        };
+        let reservation = loop {
+            // Register before observing state so a completed startup cannot
+            // notify between our capacity check and the wait below.
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let mut inner = self.inner.lock().await;
+            if inner.shutting_down {
+                return Err(ToolError::WorkerClosed);
+            }
             let mut active = inner.spawning.len();
             let mut dead_ids = Vec::new();
 
@@ -363,6 +437,7 @@ impl WorkerPool {
                 if child.state == ChildState::Idle {
                     child.state = ChildState::Leased {
                         session_id: session_id.clone(),
+                        lease_id,
                     };
                     child.last_used = Instant::now();
                     info!(
@@ -375,6 +450,8 @@ impl WorkerPool {
                         slot: slot.clone(),
                         session_id,
                         worker_id: slot.id,
+                        lease_id,
+                        preserve_on_cancel: false,
                     });
                 }
             }
@@ -384,13 +461,24 @@ impl WorkerPool {
             }
 
             if active >= self.config.max_workers {
-                return Err(ToolError::PoolExhausted {
-                    active,
-                    max: self.config.max_workers,
-                });
+                if inner.spawning.is_empty() {
+                    return Err(ToolError::PoolExhausted {
+                        active,
+                        max: self.config.max_workers,
+                    });
+                }
+                // Reserved startup capacity is not a lease. Wait for its
+                // outcome without holding the pool mutex across the wait.
+                drop(inner);
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown.cancelled() => return Err(ToolError::WorkerClosed),
+                    _ = &mut changed => {}
+                }
+                continue;
             }
 
-            self.reserve_spawn_slot_locked(&mut inner)
+            break self.reserve_spawn_slot_locked(&mut inner)?;
         };
 
         let id = reservation.worker_id();
@@ -399,6 +487,7 @@ impl WorkerPool {
                 reservation,
                 ChildState::Leased {
                     session_id: session_id.clone(),
+                    lease_id,
                 },
             )
             .await?;
@@ -412,6 +501,8 @@ impl WorkerPool {
             slot,
             session_id,
             worker_id: id,
+            lease_id,
+            preserve_on_cancel: false,
         })
     }
 
@@ -423,33 +514,64 @@ impl WorkerPool {
         let id = reservation.worker_id();
         match self.spawn_slot(id, initial_state).await {
             Ok(slot) => {
-                reservation.finish(Some(slot.clone())).await;
+                reservation.finish(Some(slot.clone())).await?;
                 Ok(slot)
             }
             Err(err) => {
-                reservation.finish(None).await;
+                let _ = reservation.finish(None).await;
                 Err(err)
             }
         }
     }
 
-    async fn reserve_spawn_slot(&self) -> SpawnReservation {
+    async fn reserve_spawn_slot(&self) -> Result<SpawnReservation, ToolError> {
         let mut inner = self.inner.lock().await;
         self.reserve_spawn_slot_locked(&mut inner)
     }
 
-    fn reserve_spawn_slot_locked(&self, inner: &mut PoolInner) -> SpawnReservation {
+    fn reserve_spawn_slot_locked(
+        &self,
+        inner: &mut PoolInner,
+    ) -> Result<SpawnReservation, ToolError> {
+        if inner.shutting_down {
+            return Err(ToolError::WorkerClosed);
+        }
         let id = inner.next_id;
-        inner.next_id += 1;
+        inner.next_id = id.checked_add(1).ok_or_else(|| {
+            ToolError::RemoteProtocol("worker identifier space exhausted".to_string())
+        })?;
         inner.spawning.insert(id);
-        SpawnReservation::new(self.clone(), id)
+        Ok(SpawnReservation::new(self.clone(), id))
     }
 
-    async fn finish_spawn_reservation(&self, worker_id: usize, slot: Option<Arc<ChildSlot>>) {
+    async fn finish_spawn_reservation(
+        &self,
+        worker_id: usize,
+        slot: Option<Arc<ChildSlot>>,
+    ) -> Result<(), ToolError> {
         let mut inner = self.inner.lock().await;
-        inner.spawning.remove(&worker_id);
+        if inner.shutting_down {
+            drop(inner);
+            if let Some(slot) = slot {
+                self.discard_uninstalled_slot(&slot).await;
+            }
+            self.inner.lock().await.spawning.remove(&worker_id);
+            self.changed.notify_waiters();
+            return Err(ToolError::WorkerClosed);
+        }
         if let Some(slot) = slot {
             inner.children.push(slot);
+        }
+        inner.spawning.remove(&worker_id);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn discard_uninstalled_slot(&self, slot: &Arc<ChildSlot>) {
+        let dead = self.take_dead_worker(slot).await;
+        self.forget_slot(slot.id).await;
+        if let Some(dead) = dead {
+            Self::finish_dead_worker(slot.id, dead).await;
         }
     }
 
@@ -457,7 +579,7 @@ impl WorkerPool {
         let mut cmd = tokio::process::Command::new(&self.config.exe_path);
         cmd.args(&self.config.worker_args);
         cmd.arg("worker");
-        for var in CHILD_FILTER_ENV_VARS {
+        for var in crate::server::tool_filter::FILTER_ENV_VARS {
             cmd.env_remove(var);
         }
         cmd.kill_on_drop(true);
@@ -469,28 +591,41 @@ impl WorkerPool {
         id: usize,
         initial_state: ChildState,
     ) -> Result<Arc<ChildSlot>, ToolError> {
+        if self.shutdown.is_cancelled() {
+            return Err(ToolError::WorkerClosed);
+        }
         let cmd = self.worker_command();
 
-        let (transport, stderr) = TokioChildProcess::builder(cmd)
-            .stderr(Stdio::piped())
+        // Let the child own stderr backpressure. Relaying it with blocking
+        // writes on the supervisor's runtime can stop its watchdog timers.
+        let (transport, _) = TokioChildProcess::builder(cmd)
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|err| {
                 ToolError::RemoteProtocol(format!("failed to spawn worker {id}: {err}"))
             })?;
         let pid = transport.id();
-        let stderr_task = spawn_stderr_relay(id, stderr);
         let handler = ParentClientHandler;
-        let service = handler.serve(transport).await.map_err(|err| {
-            ToolError::RemoteProtocol(format!("failed to initialize worker {id}: {err}"))
-        })?;
+        let service = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => return Err(ToolError::WorkerClosed),
+            result = tokio::time::timeout(self.startup_timeout, handler.serve(transport)) => {
+                result.map_err(|_| ToolError::RemoteProtocol(format!(
+                    "worker {id} startup timed out after {} seconds",
+                    self.startup_timeout.as_secs()
+                )))?.map_err(|err| ToolError::RemoteProtocol(format!(
+                    "failed to initialize worker {id}: {err}"
+                )))?
+            }
+        };
         let peer = service.peer().clone();
+        info!(worker_id = id, pid = ?pid, "spawned IDA child worker");
         Ok(Arc::new(ChildSlot {
             id,
             child: Mutex::new(PooledChild {
                 service: Some(service),
                 peer,
                 pid,
-                stderr_task,
                 state: initial_state,
                 spawned_at: Instant::now(),
                 last_used: Instant::now(),
@@ -498,6 +633,7 @@ impl WorkerPool {
                 pending_open_artifacts: None,
             }),
             call_lock: Mutex::new(()),
+            queued: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
 
@@ -515,16 +651,17 @@ impl WorkerPool {
     }
 
     async fn release_inner(&self, handle: &PooledWorkerHandle) -> Result<(), ToolError> {
-        let mut release_guard =
-            WorkerRetireGuard::release(self.clone(), handle.slot.clone(), handle);
+        let mut release_guard = WorkerRetireGuard::release(handle);
         let _call_guard = handle.slot.call_lock.lock().await;
         let peer = {
             let mut child = handle.slot.child.lock().await;
-            if child.state == ChildState::Dead {
+            if !child.state.belongs_to_lease(handle.lease_id) {
                 release_guard.disarm();
                 return Ok(());
             }
-            child.state = ChildState::Closing;
+            child.state = ChildState::Closing {
+                lease_id: handle.lease_id,
+            };
             child.peer.clone()
         };
 
@@ -548,7 +685,8 @@ impl WorkerPool {
                     error = %err,
                     "retiring IDA child worker after close_idb transport failure"
                 );
-                self.mark_dead(&handle.slot).await;
+                self.mark_dead_for_lease(&handle.slot, handle.lease_id)
+                    .await;
                 release_guard.disarm();
                 return Err(err);
             }
@@ -567,6 +705,7 @@ impl WorkerPool {
         child.last_used = Instant::now();
         child.idb_path = None;
         child.pending_open_artifacts = None;
+        self.changed.notify_waiters();
         release_guard.disarm();
         info!(
             worker_id = handle.worker_id,
@@ -603,6 +742,19 @@ impl WorkerPool {
         self.mark_dead_inner(slot, true).await;
     }
 
+    async fn mark_dead_for_lease(&self, slot: &Arc<ChildSlot>, lease_id: u64) {
+        let dead = {
+            let mut child = slot.child.lock().await;
+            if !child.state.belongs_to_lease(lease_id) {
+                return;
+            }
+            Self::take_dead_worker_locked(&mut child)
+        };
+        self.forget_slot(slot.id).await;
+        Self::finish_dead_worker(slot.id, dead).await;
+        self.schedule_replenishment().await;
+    }
+
     async fn mark_dead_without_replacement(&self, slot: &Arc<ChildSlot>) {
         self.mark_dead_inner(slot, false).await;
     }
@@ -614,7 +766,7 @@ impl WorkerPool {
             Self::finish_dead_worker(slot.id, dead).await;
         }
         if replenish {
-            self.ensure_min_workers().await;
+            self.schedule_replenishment().await;
         }
     }
 
@@ -633,6 +785,7 @@ impl WorkerPool {
     async fn forget_slot(&self, worker_id: usize) {
         let mut inner = self.inner.lock().await;
         inner.children.retain(|slot| slot.id != worker_id);
+        self.changed.notify_waiters();
     }
 
     async fn take_dead_worker(&self, slot: &Arc<ChildSlot>) -> Option<DeadWorker> {
@@ -674,7 +827,6 @@ impl WorkerPool {
         let pid = child.pid;
         let age_secs = child.spawned_at.elapsed().as_secs();
         let service = child.service.take();
-        child.stderr_task.abort();
         DeadWorker {
             service,
             pid,
@@ -704,34 +856,63 @@ impl WorkerPool {
         );
     }
 
-    async fn ensure_min_workers(&self) {
+    async fn schedule_replenishment(&self) {
         let min_workers = self.config.min_workers.min(self.config.max_workers);
-        if min_workers == 0 {
-            return;
+        let mut inner = self.inner.lock().await;
+        while let Some(result) = inner.replenishment.try_join_next() {
+            if let Err(error) = result {
+                warn!(%error, "worker replenishment task failed");
+            }
         }
-
-        loop {
-            let reservation = {
-                let mut inner = self.inner.lock().await;
-                let live_or_reserved = inner.spawning.len() + inner.children.len();
-                if live_or_reserved >= min_workers || live_or_reserved >= self.config.max_workers {
+        while !inner.shutting_down
+            && inner.spawning.len().saturating_add(inner.children.len()) < min_workers
+        {
+            let reservation = match self.reserve_spawn_slot_locked(&mut inner) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    warn!(%error, "failed to reserve a replacement worker");
                     return;
                 }
-                self.reserve_spawn_slot_locked(&mut inner)
             };
-
             let worker_id = reservation.worker_id();
-            if let Err(err) = self
-                .spawn_reserved_slot(reservation, ChildState::Idle)
-                .await
-            {
-                warn!(worker_id, error = %err, "failed to replenish minimum pooled worker");
-                return;
-            }
+            let pool = self.clone();
+            // Reserve before spawning so all scheduled work counts against
+            // capacity and shutdown can account for it immediately.
+            inner.replenishment.spawn(async move {
+                if let Err(error) = pool
+                    .spawn_reserved_slot(reservation, ChildState::Idle)
+                    .await
+                    && !pool.shutdown.is_cancelled()
+                {
+                    warn!(worker_id, %error, "failed to replenish minimum pooled worker");
+                }
+            });
         }
     }
 
+    /// Stop admission without cancelling operations that may still need saving.
+    pub async fn begin_shutdown(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.shutting_down = true;
+        self.shutdown.cancel();
+        self.startups.close();
+    }
+
     pub async fn shutdown_all(&self) {
+        let _shutdown_guard = self.shutdown_lock.lock().await;
+        self.begin_shutdown().await;
+        let mut replenishment = {
+            let mut inner = self.inner.lock().await;
+            std::mem::take(&mut inner.replenishment)
+        };
+        while let Some(result) = replenishment.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "worker replenishment task failed during shutdown");
+            }
+        }
+        // Also wait for direct lease/warm-up handshakes and their cancellation
+        // cleanup. The closed pool cannot create any new reservations.
+        self.startups.wait().await;
         let slots = {
             let inner = self.inner.lock().await;
             inner.children.clone()
@@ -743,6 +924,12 @@ impl WorkerPool {
             }
         }))
         .await;
+        let mut calls = std::mem::take(&mut self.inner.lock().await.shared_calls);
+        while let Some(result) = calls.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "shared IDA call task failed during shutdown");
+            }
+        }
     }
 
     #[cfg(test)]
@@ -795,59 +982,209 @@ impl PooledWorkerHandle {
         args: JsonObject,
         timeout: Duration,
         cancel: Option<CancellationToken>,
-        mut open_dispatch: Option<OpenDispatch>,
+        open_dispatch: Option<OpenDispatch>,
+        dispatch_progress: Option<DispatchProgress>,
     ) -> Result<CallToolResult, ToolError> {
-        let _call_guard = self.slot.call_lock.lock().await;
+        // Admission: a call waiting behind another one has started nothing,
+        // so its cancellation or deadline ends only the wait. The worker and
+        // its database are untouched; retirement applies only to a call that
+        // actually ran.
+        let admitted = Instant::now();
+        if self.slot.queued.fetch_add(1, Ordering::SeqCst) >= CHILD_QUEUE_CAPACITY {
+            self.slot.queued.fetch_sub(1, Ordering::SeqCst);
+            return Err(ToolError::Busy);
+        }
+        let queued = QueuedCall(self.slot.clone());
+        if !self.preserve_on_cancel {
+            return self
+                .call_tool_admitted(
+                    tool,
+                    args,
+                    timeout,
+                    cancel,
+                    open_dispatch,
+                    dispatch_progress,
+                    queued,
+                )
+                .await;
+        }
+
+        // HTTP request futures may be dropped without polling cancellation.
+        // Own the native call in the pool so that neither case can drop its
+        // retirement guard. The queue position bounds these supervised tasks.
+        let admission_cancel = cancel
+            .as_ref()
+            .map(CancellationToken::child_token)
+            .unwrap_or_default();
+        let _cancel_on_drop = admission_cancel.clone().drop_guard();
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut inner = tokio::select! {
+                biased;
+                _ = admission_cancel.cancelled() => return Err(ToolError::NeverDispatched(format!(
+                    "cancelled {tool} before dispatch to the IDA worker"
+                ))),
+                guard = tokio::time::timeout(timeout, self.pool.inner.lock()) => guard.map_err(|_| {
+                    ToolError::NeverDispatched(format!("{tool} timed out waiting for worker admission"))
+                })?,
+            };
+            if inner.shutting_down {
+                return Err(ToolError::NeverDispatched(format!(
+                    "{tool} was not dispatched because the server is shutting down"
+                )));
+            }
+            while let Some(result) = inner.shared_calls.try_join_next() {
+                if let Err(error) = result {
+                    warn!(%error, "shared IDA call task failed");
+                }
+            }
+            let handle = self.clone();
+            inner.shared_calls.spawn(async move {
+                let result = handle
+                    .call_tool_admitted(
+                        tool,
+                        args,
+                        timeout.saturating_sub(admitted.elapsed()),
+                        Some(admission_cancel),
+                        open_dispatch,
+                        dispatch_progress,
+                        queued,
+                    )
+                    .await;
+                let _ = tx.send(result);
+            });
+        }
+        // Background tasks retain a truthful settlement result. Foreground
+        // request handlers can stop awaiting this future at any time.
+        rx.await.map_err(|_| ToolError::WorkerCrashed {
+            worker_id: self.worker_id,
+            last_op: tool.to_string(),
+        })?
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn call_tool_admitted(
+        &self,
+        tool: &'static str,
+        args: JsonObject,
+        timeout: Duration,
+        cancel: Option<CancellationToken>,
+        open_dispatch: Option<OpenDispatch>,
+        dispatch_progress: Option<DispatchProgress>,
+        _queued: QueuedCall,
+    ) -> Result<CallToolResult, ToolError> {
+        let admitted = Instant::now();
         let tracks_open = open_dispatch.is_some();
-        let mut previous_idb_path = None;
-        let peer = {
+        let admission = async {
+            let call_guard = self.slot.call_lock.lock().await;
             let mut child = self.slot.child.lock().await;
             match &child.state {
-                ChildState::Leased { session_id } if session_id == &self.session_id => {
-                    if let Some(open_dispatch) = open_dispatch.take() {
-                        previous_idb_path = child.idb_path.replace(open_dispatch.database_path);
-                        child.pending_open_artifacts = open_dispatch.artifacts;
-                    }
-                    child.peer.clone()
-                }
+                ChildState::Leased {
+                    session_id,
+                    lease_id,
+                } if session_id == &self.session_id && *lease_id == self.lease_id => {}
                 ChildState::Dead => {
                     return Err(ToolError::WorkerCrashed {
                         worker_id: self.worker_id,
                         last_op: tool.to_string(),
                     });
                 }
-                other => {
-                    return Err(ToolError::RemoteProtocol(format!(
-                        "worker {} is not leased to session {} (state: {other:?})",
-                        self.worker_id, self.session_id
-                    )));
+                ChildState::Idle | ChildState::Closing { .. } | ChildState::Leased { .. } => {
+                    return Err(ToolError::DatabaseReplaced);
                 }
             }
+            // The child mutex, outbound queue, and call lock are all part of
+            // admission. In particular, an acquired call lock alone says
+            // nothing about whether the child can execute this request.
+            let request = remote::dispatch_tool(&child.peer, tool, args).await;
+            // No await may separate successful dispatch, artifact ownership,
+            // and arming retirement: another runtime thread may already be
+            // executing the request. A failed send means the transport is
+            // gone, so it also needs retirement.
+            let retire_guard = WorkerRetireGuard::call(self, tool);
+            let mut previous_idb_path = None;
+            if request.is_ok() {
+                if let Some(open_dispatch) = open_dispatch {
+                    previous_idb_path = child.idb_path.replace(open_dispatch.database_path);
+                    child.pending_open_artifacts = open_dispatch.artifacts;
+                }
+                if let Some(progress) = dispatch_progress {
+                    progress.dispatched();
+                }
+            }
+            Ok((call_guard, request, retire_guard, previous_idb_path))
         };
-
-        let request = remote::call_tool(&peer, tool, args);
-        tokio::pin!(request);
-        let mut retire_guard = WorkerRetireGuard::call(self, tool);
-
-        let result = if let Some(cancel) = cancel {
+        let admission = async {
+            let admission = tokio::select! {
+                biased;
+                _ = self.pool.shutdown.cancelled() => return Err(ToolError::NeverDispatched(format!(
+                    "{tool} was not dispatched because the server is shutting down"
+                ))),
+                admitted = tokio::time::timeout(timeout, admission) => admitted,
+            };
+            admission.map_err(|_| {
+                ToolError::NeverDispatched(format!(
+                    "{tool} timed out after {} seconds waiting for the IDA worker, which is \
+                         still busy; the worker and its database are \
+                         unaffected, retry once that call finishes",
+                    timeout.as_secs()
+                ))
+            })?
+        };
+        let (_call_guard, request, mut retire_guard, previous_idb_path) = match cancel.as_ref() {
+            Some(cancel) => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err(ToolError::NeverDispatched(format!(
+                        "cancelled {tool} before dispatch to the IDA worker; the \
+                         worker and its database are unaffected"
+                    )));
+                }
+                admitted = admission => admitted?,
+            },
+            None => admission.await?,
+        };
+        let timeout = timeout.saturating_sub(admitted.elapsed());
+        let response = async {
+            match request {
+                Ok(request) => remote::tool_response(request, tool).await,
+                Err(error) => Err(error),
+            }
+        };
+        tokio::pin!(response);
+        let execution_cancel = if self.preserve_on_cancel {
+            None
+        } else {
+            cancel
+        };
+        let result = if let Some(cancel) = execution_cancel {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    self.pool.mark_dead(&self.slot).await;
+                    self.pool.mark_dead_for_lease(&self.slot, self.lease_id).await;
                     retire_guard.disarm();
-                    return Err(ToolError::Cancelled(format!(
-                        "cancelled {tool}; killed worker {}",
+                    return Err(ToolError::WorkerRetired(format!(
+                        "cancelled {tool}; killed worker {}. The database it held is no \
+                         longer open and changes since the last save_idb are lost; call \
+                         open_idb again",
                         self.worker_id
                     )));
                 }
-                result = tokio::time::timeout(timeout, &mut request) => result,
+                result = tokio::time::timeout(timeout, &mut response) => result,
             }
         } else {
-            tokio::time::timeout(timeout, &mut request).await
+            tokio::time::timeout(timeout, &mut response).await
         };
 
         match result {
             Ok(Ok(result)) => {
+                if let Some(err) = remote::sdk_crash(&result, tool) {
+                    self.pool
+                        .mark_dead_for_lease(&self.slot, self.lease_id)
+                        .await;
+                    retire_guard.disarm();
+                    return Err(err);
+                }
                 if tracks_open
                     && let Some(err) = remote::result_error(&result, tool)
                     && unsettled_open_error_retires_worker(&err)
@@ -856,22 +1193,52 @@ impl PooledWorkerHandle {
                     // wait, not the native IDA open. Keep the pre-dispatch
                     // artifact snapshot attached while retirement settles
                     // the child and cleans only this generation's output.
-                    self.pool.mark_dead(&self.slot).await;
+                    self.pool
+                        .mark_dead_for_lease(&self.slot, self.lease_id)
+                        .await;
                     retire_guard.disarm();
                     return Err(err);
                 }
                 if tracks_open {
                     let mut child = self.slot.child.lock().await;
+                    if child.state == ChildState::Dead || child.transport_closed() {
+                        drop(child);
+                        self.pool
+                            .mark_dead_for_lease(&self.slot, self.lease_id)
+                            .await;
+                        retire_guard.disarm();
+                        return Err(ToolError::WorkerCrashed {
+                            worker_id: self.worker_id,
+                            last_op: tool.to_string(),
+                        });
+                    }
+                    if !child.state.belongs_to_lease(self.lease_id) {
+                        retire_guard.disarm();
+                        return Err(ToolError::DatabaseReplaced);
+                    }
                     child.pending_open_artifacts = None;
                     if result.is_error == Some(true) {
                         child.idb_path = previous_idb_path;
+                    } else if let Ok(info) = remote::parse_json::<DbInfo>(result.clone(), tool) {
+                        child.idb_path = Some(PathBuf::from(info.path));
                     }
+                }
+                if let Some(error) = remote::result_error(&result, tool)
+                    && child_tool_error_retires_worker(tool, &error)
+                {
+                    self.pool
+                        .mark_dead_for_lease(&self.slot, self.lease_id)
+                        .await;
+                    retire_guard.disarm();
+                    return Err(error);
                 }
                 retire_guard.disarm();
                 Ok(result)
             }
             Ok(Err(err)) => {
-                self.pool.mark_dead(&self.slot).await;
+                self.pool
+                    .mark_dead_for_lease(&self.slot, self.lease_id)
+                    .await;
                 retire_guard.disarm();
                 Err(ToolError::WorkerCrashed {
                     worker_id: self.worker_id,
@@ -879,10 +1246,14 @@ impl PooledWorkerHandle {
                 })
             }
             Err(_) => {
-                self.pool.mark_dead(&self.slot).await;
+                self.pool
+                    .mark_dead_for_lease(&self.slot, self.lease_id)
+                    .await;
                 retire_guard.disarm();
-                Err(ToolError::TimeoutDetailed(format!(
-                    "{tool} exceeded worker operation timeout of {} seconds; killed worker {}",
+                Err(ToolError::WorkerRetired(format!(
+                    "{tool} exceeded worker operation timeout of {} seconds; killed worker {}. \
+                     The database it held is no longer open and changes since the last \
+                     save_idb are lost; call open_idb again",
                     timeout.as_secs(),
                     self.worker_id
                 )))
@@ -894,6 +1265,7 @@ impl PooledWorkerHandle {
 pub struct WorkspaceDatabase {
     pool: WorkerPool,
     session_id: String,
+    shared_http: bool,
     handle: Arc<Mutex<Option<PooledDatabaseLease>>>,
     next_database_generation: AtomicU64,
     runtime: Option<Handle>,
@@ -1020,10 +1392,12 @@ pub enum PooledDatabaseBinding {
     Workspace(Arc<WorkspaceDatabase>),
 }
 
-#[derive(Clone)]
 struct PooledDatabaseLease {
     handle: PooledWorkerHandle,
     generation: DatabaseGeneration,
+    // Ownership expires with this exact database generation, including when
+    // its child is retired. Only the shared implicit HTTP binding uses it.
+    close_token: CloseTokenState,
     /// Invariant I1: the debug pin lives inside the lease it protects, so it
     /// structurally cannot outlive the worker or database generation that
     /// produced it — releasing or replacing the lease erases the pin with it.
@@ -1031,6 +1405,35 @@ struct PooledDatabaseLease {
     /// which re-checks the dispatching (worker, generation) pair under this
     /// same mutex.
     debug_pinned: bool,
+}
+
+/// Phases a router can report truthfully for a foreground call it relays:
+/// `queued` while the call waits for the worker, then the tool's own phase
+/// once the worker has it. The child's finer phases do not cross the transport.
+pub(crate) struct DispatchProgress {
+    tx: ProgressSender,
+    phase: &'static str,
+    message: &'static str,
+}
+
+impl DispatchProgress {
+    pub(crate) fn new(tx: ProgressSender, phase: &'static str, message: &'static str) -> Self {
+        Self { tx, phase, message }
+    }
+
+    fn queued(&self) {
+        emit_progress(
+            Some(&self.tx),
+            "queued",
+            0.0,
+            Some(1.0),
+            "Waiting for the IDA worker to take this call",
+        );
+    }
+
+    fn dispatched(&self) {
+        emit_progress(Some(&self.tx), self.phase, 0.1, Some(1.0), self.message);
+    }
 }
 
 /// A child-tool outcome plus the lease that served it, kept even for failed
@@ -1098,7 +1501,7 @@ fn debugger_worker_loss_error(tool: &str, error: ToolError, debug_pinned: bool) 
     let uncertain_start = matches!(tool, "debug_launch" | "debug_attach")
         && matches!(
             &error,
-            ToolError::Timeout(_) | ToolError::TimeoutDetailed(_)
+            ToolError::Timeout(_) | ToolError::TimeoutDetailed(_) | ToolError::WorkerRetired(_)
         );
     if !debug_pinned && !uncertain_start {
         return error;
@@ -1507,10 +1910,23 @@ impl WorkspaceDatabase {
         Self {
             pool,
             session_id,
+            shared_http: false,
             handle: Arc::new(Mutex::new(None)),
             next_database_generation: AtomicU64::new(0),
             runtime: Handle::try_current().ok(),
         }
+    }
+
+    /// One implicit database shared by HTTP clients. Ownership tokens belong
+    /// to its current lease, while the normal workspace has exclusive handles.
+    pub fn new_shared_http(pool: WorkerPool) -> Self {
+        let mut database = Self::new(pool, "http".to_string());
+        database.shared_http = true;
+        database
+    }
+
+    pub(crate) fn uses_close_tokens(&self) -> bool {
+        self.shared_http
     }
 
     /// Apply a debug-pin decision produced by a debugger call dispatched on
@@ -1641,13 +2057,28 @@ impl WorkspaceDatabase {
     ) -> Result<(PooledWorkerHandle, DatabaseGeneration, bool), ToolError> {
         let mut guard = self.handle.lock().await;
         if let Some(lease) = guard.as_ref() {
-            return Ok((lease.handle.clone(), lease.generation, false));
+            let child = lease.handle.slot.child.lock().await;
+            if child.state.belongs_to_lease(lease.handle.lease_id) && !child.transport_closed() {
+                return Ok((lease.handle.clone(), lease.generation, false));
+            }
+            drop(child);
+            // An abandoned shared call can be retiring this child. Wait for
+            // its call lock before reopening so its process and output lock
+            // are gone before another worker tries to open the same file.
+            let stale_handle = lease.handle.clone();
+            let _settled = stale_handle.slot.call_lock.lock().await;
+            let stale = guard.take().ok_or(ToolError::NoDatabaseOpen)?;
+            self.pool
+                .mark_dead_for_lease(&stale.handle.slot, stale.handle.lease_id)
+                .await;
         }
         let generation = self.next_database_generation()?;
-        let handle = self.pool.lease(&self.session_id).await?;
+        let mut handle = self.pool.lease(&self.session_id).await?;
+        handle.preserve_on_cancel = self.shared_http;
         *guard = Some(PooledDatabaseLease {
             handle: handle.clone(),
             generation,
+            close_token: CloseTokenState::default(),
             debug_pinned: false,
         });
         Ok((handle, generation, true))
@@ -1674,21 +2105,18 @@ impl WorkspaceDatabase {
         self.handle.lock().await.take()
     }
 
-    async fn release_current_handle(&self) {
-        if let Some(lease) = self.take_handle().await {
-            let _ = self.pool.release(lease.handle).await;
-        }
-    }
-
     /// Unbind a lost worker. Returns whether the cleared lease held a debug
     /// pin, so the caller can report a live debugger session ending with its
     /// worker instead of a bare transport error.
-    async fn clear_handle_if_worker(&self, worker_id: usize) -> bool {
+    async fn clear_handle_if_lease(
+        &self,
+        worker_id: usize,
+        generation: DatabaseGeneration,
+    ) -> bool {
         let mut guard = self.handle.lock().await;
-        if guard
-            .as_ref()
-            .is_some_and(|lease| lease.handle.worker_id == worker_id)
-        {
+        if guard.as_ref().is_some_and(|lease| {
+            lease.handle.worker_id == worker_id && lease.generation == generation
+        }) {
             // The debug pin lives inside the lease, so dropping the lease
             // erases it structurally (invariant I1) — no separate cleanup.
             let debug_pinned = guard.as_ref().is_some_and(|lease| lease.debug_pinned);
@@ -1725,6 +2153,19 @@ impl WorkspaceDatabase {
         cancel: Option<CancellationToken>,
         expected_generation: Option<DatabaseGeneration>,
     ) -> DispatchedCall {
+        self.dispatch_result_observed(tool, args, timeout_secs, cancel, expected_generation, None)
+            .await
+    }
+
+    async fn dispatch_result_observed(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_secs: Option<u64>,
+        cancel: Option<CancellationToken>,
+        expected_generation: Option<DatabaseGeneration>,
+        dispatch_progress: Option<DispatchProgress>,
+    ) -> DispatchedCall {
         let (handle, generation) = match self
             .required_handle_for_generation(expected_generation)
             .await
@@ -1748,13 +2189,20 @@ impl WorkspaceDatabase {
             }
         };
         let timeout = self.pool.worker_op_timeout(timeout_secs);
-        let result = match handle.call_tool(tool, args, timeout, cancel, None).await {
+        let result = match handle
+            .call_tool(tool, args, timeout, cancel, None, dispatch_progress)
+            .await
+        {
             Ok(result) => {
                 if let Some(err) = remote::result_error(&result, tool) {
                     if child_tool_error_retires_worker(tool, &err) {
                         let mut retire_guard = WorkerRetireGuard::call(&handle, tool);
-                        let debug_pinned = self.clear_handle_if_worker(handle.worker_id).await;
-                        self.pool.mark_dead(&handle.slot).await;
+                        let debug_pinned = self
+                            .clear_handle_if_lease(handle.worker_id, generation)
+                            .await;
+                        self.pool
+                            .mark_dead_for_lease(&handle.slot, handle.lease_id)
+                            .await;
                         retire_guard.disarm();
                         Err(debugger_worker_loss_error(tool, err, debug_pinned))
                     } else {
@@ -1764,8 +2212,11 @@ impl WorkspaceDatabase {
                     Ok(result)
                 }
             }
+            Err(err) if err.never_dispatched() => Err(err),
             Err(err) => {
-                let debug_pinned = self.clear_handle_if_worker(handle.worker_id).await;
+                let debug_pinned = self
+                    .clear_handle_if_lease(handle.worker_id, generation)
+                    .await;
                 Err(debugger_worker_loss_error(tool, err, debug_pinned))
             }
         };
@@ -1806,6 +2257,26 @@ impl WorkspaceDatabase {
     ) -> Result<Value, ToolError> {
         self.call_value_for_generation(tool, args, timeout_secs, cancel, None)
             .await
+    }
+
+    /// `call_value` for a foreground tool whose phases the router reports:
+    /// `queued` now, and `progress.phase` once the child has the call.
+    async fn call_value_observed(
+        &self,
+        tool: &'static str,
+        args: Value,
+        timeout_secs: Option<u64>,
+        cancel: Option<CancellationToken>,
+        progress: Option<DispatchProgress>,
+    ) -> Result<Value, ToolError> {
+        if let Some(progress) = progress.as_ref() {
+            progress.queued();
+        }
+        let result = self
+            .dispatch_result_observed(tool, args, timeout_secs, cancel, None, progress)
+            .await
+            .result?;
+        remote::parse_value(result, tool)
     }
 
     async fn call_value_for_generation(
@@ -1881,7 +2352,7 @@ impl WorkspaceDatabase {
         extra_args: Vec<String>,
         idb_out: Option<String>,
         timeout_secs: Option<u64>,
-        _progress_tx: Option<ProgressSender>,
+        progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
     ) -> Result<DbInfo, ToolError> {
         self.open_observed_with_generation(
@@ -1896,7 +2367,7 @@ impl WorkspaceDatabase {
             extra_args,
             idb_out,
             timeout_secs,
-            _progress_tx,
+            progress_tx,
             cancel,
         )
         .await
@@ -1917,9 +2388,15 @@ impl WorkspaceDatabase {
         extra_args: Vec<String>,
         idb_out: Option<String>,
         timeout_secs: Option<u64>,
-        _progress_tx: Option<ProgressSender>,
+        progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
     ) -> Result<OpenedDatabase, ToolError> {
+        let dispatch_progress = progress_tx.map(|tx| {
+            DispatchProgress::new(tx, "opening", "Opening the database in the IDA worker")
+        });
+        if let Some(progress) = dispatch_progress.as_ref() {
+            progress.queued();
+        }
         let (handle, generation, fresh_lease) = self.lease_for_open().await?;
         let timeout = self.pool.worker_op_timeout(timeout_secs);
         let open_dispatch = OpenDispatch::for_request(path, idb_out.as_deref(), rebuild);
@@ -1942,18 +2419,15 @@ impl WorkspaceDatabase {
                 timeout,
                 cancel,
                 Some(open_dispatch),
+                dispatch_progress,
             )
             .await;
 
         match result.and_then(|result| remote::parse_json::<DbInfo>(result, "open_idb")) {
-            Ok(info) => {
-                let mut child = handle.slot.child.lock().await;
-                child.idb_path = Some(PathBuf::from(&info.path));
-                Ok(OpenedDatabase { info, generation })
-            }
+            Ok(info) => Ok(OpenedDatabase { info, generation }),
             Err(err) => {
                 if open_error_releases_lease(fresh_lease, &err) {
-                    self.release_current_handle().await;
+                    let _ = self.close_if_generation(generation).await;
                 }
                 Err(err)
             }
@@ -1965,6 +2439,45 @@ impl WorkspaceDatabase {
             return Err(ToolError::NoDatabaseOpen);
         };
         self.pool.release(lease.handle).await
+    }
+
+    pub(crate) async fn issue_close_token(
+        &self,
+        session_id: &str,
+        generation: DatabaseGeneration,
+    ) -> Option<Result<CloseTokenGrant, String>> {
+        let guard = self.handle.lock().await;
+        let lease = guard.as_ref()?;
+        if lease.generation != generation {
+            return None;
+        }
+        Some(lease.close_token.issue_for_session(session_id))
+    }
+
+    /// Authorize and detach the same lease under one lock. A concurrent open
+    /// cannot redirect a previously authorized close to a replacement DB.
+    pub(crate) async fn close_authorized(
+        &self,
+        session_id: &str,
+        token: Option<&str>,
+        force: bool,
+    ) -> Result<CloseAuthorization, ToolError> {
+        let (lease, authorization) = {
+            let mut guard = self.handle.lock().await;
+            let current = guard.as_ref().ok_or(ToolError::NoDatabaseOpen)?;
+            let authorization = current
+                .close_token
+                .authorize_close(session_id, token, force);
+            if let CloseAuthorization::Denied { .. } = authorization {
+                return Ok(authorization);
+            }
+            (
+                guard.take().ok_or(ToolError::NoDatabaseOpen)?,
+                authorization,
+            )
+        };
+        self.pool.release(lease.handle).await?;
+        Ok(authorization)
     }
 
     pub(crate) async fn close_if_generation(
@@ -2827,15 +3340,23 @@ impl WorkspaceDatabase {
 
     pub async fn analyze_funcs_observed(
         &self,
-        _progress_tx: Option<ProgressSender>,
+        progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
         timeout_secs: Option<u64>,
     ) -> Result<Value, ToolError> {
-        self.call_value(
+        let progress = progress_tx.map(|tx| {
+            DispatchProgress::new(
+                tx,
+                "analyzing",
+                "Waiting for IDA auto-analysis in the IDA worker",
+            )
+        });
+        self.call_value_observed(
             "analyze_funcs",
             analyze_funcs_child_args(timeout_secs, false),
             timeout_secs,
             cancel,
+            progress,
         )
         .await
     }
@@ -2962,6 +3483,10 @@ impl WorkspaceDatabase {
         .await
     }
 
+    pub async fn save_database(&self) -> Result<Value, ToolError> {
+        self.call_value("save_idb", json!({}), None, None).await
+    }
+
     pub async fn get_string(&self, addr: u64, max_len: usize) -> Result<Value, ToolError> {
         self.call_value(
             "get_string",
@@ -3046,15 +3571,25 @@ impl WorkspaceDatabase {
     pub async fn run_script_observed(
         &self,
         code: &str,
-        _progress_tx: Option<ProgressSender>,
+        progress_tx: Option<ProgressSender>,
         cancel: Option<CancellationToken>,
         timeout_secs: Option<u64>,
     ) -> Result<Value, ToolError> {
-        self.call_value(
+        // The child's phases do not cross the transport; the router reports
+        // what it knows: queued until the worker takes the call, then executing.
+        let progress = progress_tx.map(|tx| {
+            DispatchProgress::new(
+                tx,
+                "executing",
+                "Executing IDAPython script in the IDA worker",
+            )
+        });
+        self.call_value_observed(
             "run_script",
             run_script_child_args(code, timeout_secs),
             timeout_secs,
             cancel,
+            progress,
         )
         .await
     }
@@ -3248,6 +3783,8 @@ fn release_error_retires_worker(err: &ToolError) -> bool {
             | ToolError::Cancelled(_)
             | ToolError::DebuggerTeardown(_)
             | ToolError::WorkerCrashed { .. }
+            | ToolError::SdkCrashed(_)
+            | ToolError::WorkerRetired(_)
             | ToolError::RemoteProtocol(_)
             | ToolError::WorkerClosed
     )
@@ -3256,7 +3793,11 @@ fn release_error_retires_worker(err: &ToolError) -> bool {
 fn child_tool_error_retires_worker(tool: &str, err: &ToolError) -> bool {
     if matches!(
         err,
-        ToolError::WorkerClosed | ToolError::WorkerCrashed { .. } | ToolError::RemoteProtocol(_)
+        ToolError::WorkerClosed
+            | ToolError::WorkerCrashed { .. }
+            | ToolError::SdkCrashed(_)
+            | ToolError::WorkerRetired(_)
+            | ToolError::RemoteProtocol(_)
     ) {
         return true;
     }
@@ -3273,11 +3814,16 @@ fn unsettled_open_error_retires_worker(err: &ToolError) -> bool {
         ToolError::Timeout(_)
             | ToolError::TimeoutDetailed(_)
             | ToolError::Cancelled(_)
+            | ToolError::SdkCrashed(_)
+            | ToolError::WorkerRetired(_)
             | ToolError::WorkerClosed
     )
 }
 
 fn open_error_releases_lease(fresh_lease: bool, err: &ToolError) -> bool {
+    if err.never_dispatched() {
+        return false;
+    }
     fresh_lease
         || matches!(
             err,
@@ -3285,61 +3831,11 @@ fn open_error_releases_lease(fresh_lease: bool, err: &ToolError) -> bool {
                 | ToolError::TimeoutDetailed(_)
                 | ToolError::Cancelled(_)
                 | ToolError::WorkerCrashed { .. }
+                | ToolError::SdkCrashed(_)
+                | ToolError::WorkerRetired(_)
                 | ToolError::WorkerClosed
+                | ToolError::DatabaseReplaced
         )
-}
-
-const STDERR_CHUNK_BYTES: usize = 4096;
-const STDERR_LINE_LIMIT_BYTES: usize = 16 * 1024;
-
-fn spawn_stderr_relay(
-    worker_id: usize,
-    stderr: Option<tokio::process::ChildStderr>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let Some(mut stderr) = stderr else {
-            return;
-        };
-        let mut chunk = [0_u8; STDERR_CHUNK_BYTES];
-        let mut pending = Vec::new();
-
-        loop {
-            match stderr.read(&mut chunk).await {
-                Ok(0) => break,
-                Ok(n) => drain_stderr_chunk(worker_id, &mut pending, &chunk[..n]),
-                Err(err) => {
-                    warn!(worker_id, error = %err, "failed to read child stderr");
-                    break;
-                }
-            }
-        }
-
-        if !pending.is_empty() {
-            log_stderr_line(worker_id, &pending);
-        }
-    })
-}
-
-fn drain_stderr_chunk(worker_id: usize, pending: &mut Vec<u8>, mut chunk: &[u8]) {
-    while let Some(pos) = chunk.iter().position(|byte| *byte == b'\n') {
-        pending.extend_from_slice(&chunk[..pos]);
-        log_stderr_line(worker_id, pending);
-        pending.clear();
-        chunk = &chunk[pos + 1..];
-    }
-
-    pending.extend_from_slice(chunk);
-    if pending.len() > STDERR_LINE_LIMIT_BYTES {
-        let truncated = &pending[..STDERR_LINE_LIMIT_BYTES];
-        let line = String::from_utf8_lossy(truncated);
-        debug!(target: "ida_mcp::worker_stderr", worker_id, line = %line, truncated = true);
-        pending.clear();
-    }
-}
-
-fn log_stderr_line(worker_id: usize, line: &[u8]) {
-    let line = String::from_utf8_lossy(line);
-    debug!(target: "ida_mcp::worker_stderr", worker_id, line = %line);
 }
 
 #[cfg(test)]
@@ -3526,7 +4022,9 @@ mod tests {
         };
 
         // Worker loss with no lease installed is a no-op, not a panic.
-        database.clear_handle_if_worker(7).await;
+        database
+            .clear_handle_if_lease(7, DatabaseGeneration(1))
+            .await;
         let LeaseReapDecision::NoLease = database.lease_reap_decision().await else {
             panic!("worker loss without a lease must leave the entry reapable");
         };
@@ -3646,6 +4144,18 @@ mod tests {
         );
         assert!(matches!(crashed, ToolError::DebuggerSessionLost(_)));
 
+        // An SDK crash on a debug-pinned worker is reported as a lost session;
+        // it must stay fatal so batch and optional-status handlers surface it.
+        let sdk_crash = debugger_worker_loss_error(
+            "search",
+            ToolError::SdkCrashed("search crashed inside the IDA SDK".to_string()),
+            true,
+        );
+        assert!(
+            matches!(&sdk_crash, ToolError::DebuggerSessionLost(message) if message.contains("search"))
+        );
+        assert!(sdk_crash.is_fatal());
+
         // No debugger session: the original error survives unchanged.
         let plain = debugger_worker_loss_error(
             "run_script",
@@ -3698,7 +4208,9 @@ mod tests {
             .filter_map(|(key, _)| key.to_str())
             .collect();
 
-        for var in crate::ida::pool::CHILD_FILTER_ENV_VARS {
+        // The CLI reads its filter flags from these same constants, so a
+        // variable the CLI honors cannot be missing from the scrub list.
+        for var in crate::server::tool_filter::FILTER_ENV_VARS {
             assert!(
                 cleared.contains(var),
                 "pooled child workers must not inherit {var}; they need lifecycle tools"
@@ -3880,6 +4392,23 @@ mod tests {
         )));
     }
 
+    /// A wait that ended before the worker took the call must never release
+    /// the lease the healthy call still holds.
+    #[test]
+    fn never_dispatched_errors_keep_the_lease() {
+        for queued in [
+            ToolError::NeverDispatched("cancelled while queued".to_string()),
+            // A full admission queue also rejects before dispatch.
+            ToolError::Busy,
+        ] {
+            assert!(!open_error_releases_lease(false, &queued));
+            assert!(!open_error_releases_lease(true, &queued));
+            assert!(!queued.is_fatal());
+            assert!(queued.never_dispatched());
+            assert!(!release_error_retires_worker(&queued));
+        }
+    }
+
     #[test]
     fn child_tool_error_retire_decision_is_operation_specific() {
         assert!(!child_tool_error_retires_worker(
@@ -3912,6 +4441,10 @@ mod tests {
         assert!(child_tool_error_retires_worker(
             "run_script",
             &ToolError::WorkerClosed
+        ));
+        assert!(child_tool_error_retires_worker(
+            "decompile",
+            &ToolError::SdkCrashed("decompile crashed inside the IDA SDK".to_string())
         ));
     }
 
@@ -4044,31 +4577,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_reservation_counts_toward_pool_capacity() {
-        let pool = test_pool(1);
-        let reservation = pool.reserve_spawn_slot().await;
+    async fn spawn_reservation_delays_lease_without_exceeding_capacity() {
+        let mut pool = test_pool(1);
+        pool.startup_timeout = Duration::from_millis(25);
+        let reservation = pool.reserve_spawn_slot().await.expect("reserve worker");
 
         assert_eq!(pool.live_or_reserved_count().await, 1);
         let err = match pool.lease("session-b").await {
-            Ok(_) => panic!("lease should fail while the only slot is reserved"),
+            Ok(_) => panic!("lease cannot use the only slot while it is reserved"),
             Err(err) => err,
         };
-        match err {
-            ToolError::PoolExhausted { active, max } => {
-                assert_eq!(active, 1);
-                assert_eq!(max, 1);
-            }
-            other => panic!("unexpected lease error: {other}"),
-        }
+        assert!(matches!(err, ToolError::NeverDispatched(_)));
+        assert_eq!(pool.live_or_reserved_count().await, 1);
 
-        reservation.finish(None).await;
+        reservation.finish(None).await.expect("release reservation");
         assert_eq!(pool.live_or_reserved_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_wait_queue_is_bounded_and_dropped_waiters_release_capacity() {
+        let pool = test_pool(1);
+        let reservation = pool.reserve_spawn_slot().await.expect("reserve worker");
+        let mut waiters = (0..crate::ida::pool::POOL_ACQUIRE_CAPACITY)
+            .map(|_| Box::pin(pool.lease("waiting")))
+            .collect::<Vec<_>>();
+        for waiter in &mut waiters {
+            assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        }
+        assert!(matches!(pool.lease("excess").await, Err(ToolError::Busy)));
+        drop(waiters);
+        assert_eq!(
+            pool.acquisition_slots.available_permits(),
+            crate::ida::pool::POOL_ACQUIRE_CAPACITY
+        );
+        reservation.finish(None).await.expect("release reservation");
     }
 
     #[tokio::test]
     async fn dropped_spawn_reservation_releases_pool_capacity() {
         let pool = test_pool(1);
-        let reservation = pool.reserve_spawn_slot().await;
+        let reservation = pool.reserve_spawn_slot().await.expect("reserve worker");
         drop(reservation);
 
         for _ in 0..10 {

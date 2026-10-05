@@ -1019,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "ida-mcp"
-version = "9.4.4"
+version = "9.4.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1051,7 +1051,7 @@ dependencies = [
 [[package]]
 name = "idalib"
 version = "0.7.5+9.4.260713"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#ee6c34e7cf0ad318c47bd93870978d93f82548f4"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#ce777b6a08df70c0f33993707e6b0636c0fdd989"
 dependencies = [
  "anyhow",
  "autocxx",
@@ -1065,7 +1065,7 @@ dependencies = [
 [[package]]
 name = "idalib-build"
 version = "0.7.5+9.4.260713"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#ee6c34e7cf0ad318c47bd93870978d93f82548f4"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#ce777b6a08df70c0f33993707e6b0636c0fdd989"
 dependencies = [
  "anyhow",
  "idalib-sys",
@@ -1074,7 +1074,7 @@ dependencies = [
 [[package]]
 name = "idalib-sys"
 version = "0.7.5+9.4.260713"
-source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#ee6c34e7cf0ad318c47bd93870978d93f82548f4"
+source = "git+https://github.com/blacktop/idalib.git?branch=sdk-9.4.0#ce777b6a08df70c0f33993707e6b0636c0fdd989"
 dependencies = [
  "anyhow",
  "autocxx",
@@ -1983,6 +1983,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

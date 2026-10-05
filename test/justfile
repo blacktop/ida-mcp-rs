@@ -67,8 +67,17 @@ test: fixture
     fi
     echo "🧪 Running stdio integration test..."
     tmp="$(mktemp)"
+    # The payload renames a function and closes (saves); run it on a private
+    # copy of the raw fixture and its database so the shared fixture is never
+    # changed and the test can be rerun.
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work" "$tmp"' EXIT
+    cp "{{ test_bin }}" "$work/mini"
+    [ -d "{{ test_bin }}.dSYM" ] && cp -R "{{ test_bin }}.dSYM" "$work/mini.dSYM"
+    [ -f "{{ test_i64 }}" ] && cp "{{ test_i64 }}" "$work/mini.i64"
+    sed "s#\"path\":\"fixtures/mini\"#\"path\":\"$work/mini\"#" payloads/mini.jsonl > "$work/mini.jsonl"
     # Keep stdin open long enough for open_idb auto-analysis (~10s for raw binaries)
-    (cat payloads/mini.jsonl; sleep 30) | RUST_LOG="{{ rust_log }}" "{{ server_bin }}" >"$tmp" 2>&1 || true
+    (cat "$work/mini.jsonl"; sleep 30) | RUST_LOG="{{ rust_log }}" "{{ server_bin }}" >"$tmp" 2>&1 || true
     cat "$tmp"
     # Known expected errors:
     # - patch_asm on ARM (no assembler support)
@@ -566,7 +575,7 @@ test-callees-indirect:
     echo "✅ callees-indirect test passed"
 
 # Verify server-side tool filtering at the protocol level (Phase 2a)
-test-tool-filter:
+test-tool-filter: test-bootstrap
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -x "{{ server_bin }}" ]; then
@@ -579,7 +588,7 @@ test-tool-filter:
         exit 1
     fi
     echo "🧪 Running stdio tool-filter test..."
-    MCP_STDIO_BIN="{{ server_bin }}" RUST_LOG="{{ rust_log }}" \
+    MCP_STDIO_BIN="{{ server_bin }}" IDB_PATH="{{ test_i64 }}" RUST_LOG="{{ rust_log }}" \
         bash ./stdio_tool_filter.sh
     echo "✅ tool-filter test passed"
 
@@ -602,9 +611,46 @@ measure-tools:
         FAIL_OVER_CHARS="${FAIL_OVER_CHARS:-0}" \
         bash ./measure_tools.sh
 
+# Stable 9.4 tool advertisement and dispatch through the supervised child
+test-stable-api: test-bootstrap
+    python3 ./stdio_stable_api.py --binary "{{ server_bin }}" --fixture "{{ test_i64 }}"
+
+# Shared HTTP cancellation and stuck-call recovery (#58)
+test-http-stuck-call: test-bootstrap
+    python3 ./http_stuck_call.py --binary "{{ server_bin }}" --fixture "{{ test_i64 }}"
+
+# A call stuck inside IDA must time out, retire the child, and reopen on a fresh one (#58)
+test-stuck-call: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        exit 1
+    fi
+    echo "🧪 Running stuck-call test..."
+    python3 ./stdio_reopen.py --binary "{{ server_bin }}" --fixture "{{ test_i64 }}"
+    MCP_STDIO_BIN="{{ server_bin }}" IDB_PATH="{{ test_i64 }}" RUST_LOG="{{ rust_log }}" \
+        bash ./stdio_stuck_call.sh
+    echo "✅ Stuck-call test passed"
+
+# A shutdown signal with stdin still open must save the database and exit (stdio and workspace)
+test-shutdown-signal: test-bootstrap
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -x "{{ server_bin }}" ]; then
+        echo "Server binary not found: {{ server_bin }}"
+        exit 1
+    fi
+    echo "🧪 Running shutdown-signal test..."
+    python3 ./shutdown_preserves.py --binary "{{ server_bin }}" --fixture "{{ test_i64 }}"
+    MCP_STDIO_BIN="{{ server_bin }}" IDB_PATH="{{ test_i64 }}" RAW_PATH="{{ test_bin }}" RUST_LOG="{{ rust_log }}" \
+        bash ./stdio_shutdown_signal.sh
+    echo "✅ Shutdown-signal test passed"
+
 # Run crash-guard integration test
 # Verifies that SIGSEGV during a handler call is caught and converted to a
-# ToolError instead of killing the server. Triggers a real segfault via
+# ToolError instead of killing the server, and that the crashed worker
+# discards its database without saving. Triggers a real segfault via
 # IDAPython ctypes.string_at(0) and checks the session_id stays stable
 
 # across the crash (proof the server process didn't restart).
@@ -695,42 +741,46 @@ test-crash-guard: test-bootstrap
     text=$(echo "$resp" | jq -r '.result.content[0].text // empty')
     echo "   decompile 0xDEADBEEF → ${text:0:60}"
 
-    # Test 2: deliberate SIGSEGV via IDAPython — Linux-only.
-    # macOS delivers EXC_BAD_ACCESS as a Mach exception which bypasses Unix
-    # signal handlers when IDA registers its own Mach handler. The crash guard
-    # works for IDA-internal crashes on both platforms (verified against
-    # kernelcache decompile) but this synthetic ctypes.string_at(0) path
-    # exercises signal-delivered SIGSEGV which only works on Linux.
-    if [ "$(uname -s)" = "Linux" ]; then
-        # Raise SIGSEGV synchronously on the IDA worker thread. Expected
-        # outcome: the signal is caught, an ERROR is logged, but the
-        # run_script response itself may be dropped (tokio foreground
-        # operation machinery is in a weird state after siglongjmp skipped
-        # its destructors). The real verification is that the SERVER is
-        # still alive and processing subsequent requests.
-        send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import signal\nsignal.raise_signal(signal.SIGSEGV)"}}}'
-        sleep 3   # let the crash path complete and log the ERROR line
-        if ! grep -q 'crashed in IDA SDK (signal 11)\|signal 11 caught' "$log"; then
-            echo "❌ expected crash-guard catch message not in log" >&2
-            tail -20 "$log" >&2
-            exit 1
-        fi
-        echo "   SIGSEGV caught by guard (ERROR logged)"
-    else
-        echo "   (skipping forced SIGSEGV on macOS — Mach exceptions bypass signal handlers)"
+    # Test 2: raise SIGSEGV on the IDA thread. The faulting request itself
+    # must get a terminal error within its timeout: siglongjmp skips the
+    # script heartbeat's destructor, which used to leave the request hanging.
+    send '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_script","arguments":{"code":"import signal\nsignal.raise_signal(signal.SIGSEGV)","timeout_secs":15}}}'
+    resp=$(wait_response 4 20) || { echo "❌ the crashing request never got a response"; exit 1; }
+    if ! echo "$resp" | jq -e '.result.isError == true' >/dev/null; then
+        echo "❌ the crashing request did not return an error" >&2
+        echo "$resp" | jq . >&2
+        exit 1
     fi
+    if ! echo "$resp" | grep -q 'crashed inside the IDA SDK (signal 11)'; then
+        echo "❌ the crashing request did not report the SDK crash" >&2
+        echo "$resp" | jq . >&2
+        exit 1
+    fi
+    echo "   crashing request returned the SDK-crash error"
 
-    # Test 3: server is still alive and session_id is unchanged
-    # (this is the real proof the crash guard did its job — server survived
-    # the signal and can still process new requests on the same session)
-    send '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"analysis_status","arguments":{}}}'
-    resp=$(wait_response 5 15) || { echo "❌ server died or hung after Test 2"; exit 1; }
-    session_after=$(echo "$resp" | jq -r '.result.content[0].text' | jq -r '.session_id // empty')
+    # Test 3: the crashed worker discards its database instead of continuing
+    # on it, and the same server process reopens it.
+    send '{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"idb_meta","arguments":{}}}'
+    resp=$(wait_response 41 15) || { echo "❌ server died or hung after the crash"; exit 1; }
+    if ! echo "$resp" | grep -q 'No database is currently open'; then
+        echo "❌ database was still open after an SDK crash" >&2
+        echo "$resp" >&2
+        exit 1
+    fi
+    echo "   database discarded after crash"
+    send '{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"open_idb","arguments":{"path":"fixtures/mini.i64"}}}'
+    resp=$(wait_response 42 30) || { echo "❌ reopen got no response"; exit 1; }
+    session_after=$(echo "$resp" | jq -r '.result.content[0].text' | jq -r '.session_id // empty' 2>/dev/null || true)
+    if echo "$resp" | jq -e '.result.isError == true' >/dev/null || [ -z "$session_after" ]; then
+        echo "❌ reopen after the crash failed" >&2
+        echo "$resp" | jq . >&2
+        exit 1
+    fi
     if [ "$session_before" != "$session_after" ]; then
         echo "❌ session_id changed: ${session_before:0:8} → ${session_after:0:8} (server restarted)"
         exit 1
     fi
-    echo "   server alive after crash, session_id stable: ${session_after:0:8}"
+    echo "   reopened in the same server process, session_id stable: ${session_after:0:8}"
 
     # Close
     send '{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"close_idb","arguments":{}}}'

@@ -127,7 +127,7 @@ echo "$open_resp" | grep -q "function_count" || {
 func_resp=$(curl -sS \
   "${curl_headers[@]}" \
   -H "Mcp-Session-Id: $session_id" \
-  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":10}}}' \
+  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_functions","arguments":{"limit":10,"filter":"interesting_function"}}}' \
   "$url")
 
 echo "$func_resp" | grep -q "interesting_function" || {

@@ -427,6 +427,9 @@ pub enum IdaRequest {
         size: usize,
         resp: oneshot::Sender<Result<Value, ToolError>>,
     },
+    SaveDatabase {
+        resp: oneshot::Sender<Result<Value, ToolError>>,
+    },
     GetString {
         addr: u64,
         max_len: usize,

@@ -31,15 +31,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Always set rpaths for runtime library discovery.
     // This adds the specified install path plus common default locations
     // so the binary can find IDA libraries without DYLD_LIBRARY_PATH.
-    set_rpath(&install_path, using_sdk_stubs);
+    set_rpath(&install_path, using_sdk_stubs, &sdk_ida_version()?);
 
     Ok(())
+}
+
+/// IDA version the bindings target, read from the SDK's `pro.h`
+/// (`IDA_SDK_VERSION`, e.g. 950 → "9.5").
+///
+/// Fallback rpaths must match this version regardless of what IDADIR points
+/// at during the build: the runtime rejects mismatched minors since 9.4, so
+/// rpaths for any other version are pure hazard, and deriving the version
+/// from the build-time install path breaks for unversioned or absent paths
+/// (such as CI runners without an IDA install).
+fn sdk_ida_version() -> Result<String, Box<dyn std::error::Error>> {
+    let (sdk_path, _, _, _) = idalib_build::idalib_sdk_paths_with(false);
+    let pro_h = sdk_path.join("include").join("pro.h");
+    let text = std::fs::read_to_string(&pro_h).map_err(|e| {
+        format!(
+            "cannot read {} to derive the targeted IDA version: {e}",
+            pro_h.display()
+        )
+    })?;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("#define IDA_SDK_VERSION") {
+            let value: u32 = value
+                .trim()
+                .parse()
+                .map_err(|e| format!("unparsable IDA_SDK_VERSION in {}: {e}", pro_h.display()))?;
+            // IDA uses single-digit minors: 950 → 9.5.
+            return Ok(format!("{}.{}", value / 100, (value % 100) / 10));
+        }
+    }
+    Err(format!("IDA_SDK_VERSION not found in {}", pro_h.display()).into())
 }
 
 /// Set rpath to the IDA installation directory for runtime library loading.
 /// Adds multiple common IDA installation paths so the binary can find libraries
 /// without requiring DYLD_LIBRARY_PATH to be set.
-fn set_rpath(install_path: &Path, include_install_path: bool) {
+fn set_rpath(install_path: &Path, include_install_path: bool, version: &str) {
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| {
         if cfg!(target_os = "macos") {
             "macos".to_string()
@@ -49,6 +79,11 @@ fn set_rpath(install_path: &Path, include_install_path: bool) {
             "unknown".to_string()
         }
     });
+    // rpaths are an ELF/Mach-O concept; MSVC's linker rejects -Wl,-rpath
+    // (LNK4044), and Windows finds IDA's DLLs via the executable's directory.
+    if os != "macos" && os != "linux" {
+        return;
+    }
 
     // configure_linkage() already adds the selected runtime path when a local
     // IDA install is present. Stub builds still need us to add it explicitly.
@@ -56,66 +91,22 @@ fn set_rpath(install_path: &Path, include_install_path: bool) {
         add_rpath(install_path);
     }
 
-    let targeting_94 = install_path
-        .components()
-        .rev()
-        .take(3)
-        .any(|c| c.as_os_str().to_string_lossy().contains("9.4"));
-
     if os == "macos" {
         // Common macOS IDA installation paths (all editions)
-        let default_paths: &[&str] = if targeting_94 {
-            &[
-                "/Applications/IDA Professional 9.4.app/Contents/MacOS",
-                "/Applications/IDA Pro 9.4.app/Contents/MacOS",
-                "/Applications/IDA Home 9.4.app/Contents/MacOS",
-                "/Applications/IDA Essential 9.4.app/Contents/MacOS",
-            ]
-        } else {
-            &[
-                // IDA 9.3 paths
-                "/Applications/IDA Professional 9.3.app/Contents/MacOS",
-                "/Applications/IDA Pro 9.3.app/Contents/MacOS",
-                "/Applications/IDA Home 9.3.app/Contents/MacOS",
-                "/Applications/IDA Essential 9.3.app/Contents/MacOS",
-                // IDA 9.2 paths
-                "/Applications/IDA Professional 9.2.app/Contents/MacOS",
-                "/Applications/IDA Pro 9.2.app/Contents/MacOS",
-                "/Applications/IDA Home 9.2.app/Contents/MacOS",
-                "/Applications/IDA Essential 9.2.app/Contents/MacOS",
-            ]
-        };
-        for path in default_paths {
-            add_rpath_if_not_install(Path::new(path), install_path);
+        for edition in ["Professional", "Pro", "Home", "Essential"] {
+            let path = format!("/Applications/IDA {edition} {version}.app/Contents/MacOS");
+            add_rpath_if_not_install(Path::new(&path), install_path);
         }
     } else if os == "linux" {
         // Common Linux IDA installation paths
         let home = env::var("HOME").unwrap_or_else(|_| "/home/user".to_string());
-        let default_paths = if targeting_94 {
-            vec![
-                format!("{home}/idapro-9.4"),
-                format!("{home}/ida-pro-9.4"),
-                "/opt/idapro-9.4".to_string(),
-                "/opt/ida-pro-9.4".to_string(),
-                "/usr/local/idapro-9.4".to_string(),
-            ]
-        } else {
-            vec![
-                // IDA 9.3 paths
-                format!("{}/idapro-9.3", home),
-                format!("{}/ida-pro-9.3", home),
-                "/opt/idapro-9.3".to_string(),
-                "/opt/ida-pro-9.3".to_string(),
-                "/usr/local/idapro-9.3".to_string(),
-                // IDA 9.2 paths
-                format!("{}/idapro-9.2", home),
-                format!("{}/ida-pro-9.2", home),
-                "/opt/idapro-9.2".to_string(),
-                "/opt/ida-pro-9.2".to_string(),
-                "/usr/local/idapro-9.2".to_string(),
-            ]
-        };
-        for path in default_paths {
+        for path in [
+            format!("{home}/idapro-{version}"),
+            format!("{home}/ida-pro-{version}"),
+            format!("/opt/idapro-{version}"),
+            format!("/opt/ida-pro-{version}"),
+            format!("/usr/local/idapro-{version}"),
+        ] {
             add_rpath_if_not_install(Path::new(&path), install_path);
         }
     }

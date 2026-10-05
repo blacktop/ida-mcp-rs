@@ -105,6 +105,11 @@ impl ProgressHeartbeat {
                 match stop_rx.recv_timeout(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // A crash that skipped this heartbeat's destructor
+                        // never signals stop; the closed channel does.
+                        if tx.is_closed() {
+                            break;
+                        }
                         elapsed_secs += HEARTBEAT_INTERVAL_SECS;
                         next_progress = (next_progress + HEARTBEAT_PROGRESS_STEP).min(max_progress);
                         emit_progress(

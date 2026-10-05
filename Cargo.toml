@@ -1,6 +1,6 @@
 [package]
 name = "ida-mcp"
-version = "9.4.4"
+version = "9.4.5"
 edition = "2024"
 rust-version = "1.89"
 description = "Headless IDA Pro MCP Server"
@@ -15,7 +15,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 idalib = { git = "https://github.com/blacktop/idalib.git", branch = "sdk-9.4.0" }
 rmcp = { version = "3.4", features = ["server", "client", "transport-io", "transport-child-process", "transport-streamable-http-server", "elicitation", "request-state", "schemars"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "net", "signal", "process", "io-util"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1.2"

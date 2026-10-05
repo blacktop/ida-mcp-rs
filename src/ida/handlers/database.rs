@@ -412,6 +412,23 @@ fn validate_raw_idb_output(input: &Path, output: &Path) -> Result<(), ToolError>
     Ok(())
 }
 
+/// Write finished auto-analysis to disk right away. MCP clients end a
+/// server with SIGKILL when the conversation ends, so an analysis that only
+/// lives in memory is lost whenever the agent never saves or closes; the
+/// flush keeps the analysis, and a later kill loses only edits since.
+pub(crate) fn flush_analysis(db: &mut IDB, after: &str) {
+    match db.save_database() {
+        Ok(path) => info!(after, path = %path.display(), "Flushed analysis to disk"),
+        Err(error) => warn!(after, %error, "Could not flush analysis to disk"),
+    }
+}
+
+pub fn handle_save_database(idb: &mut Option<IDB>) -> Result<Value, ToolError> {
+    let db = idb.as_mut().ok_or(ToolError::NoDatabaseOpen)?;
+    let database_path = db.save_database()?;
+    Ok(json!({ "saved": true, "path": database_path.display().to_string() }))
+}
+
 fn open_existing_idb(
     path: &Path,
     init_args: &[String],
@@ -1033,6 +1050,7 @@ pub fn handle_open(
             Some(OPEN_IDB_PROGRESS_TOTAL),
             "Raw binary open finished; collecting post-open analysis state",
         );
+        flush_analysis(&mut db, "open_idb");
     }
 
     let mut debug_info = None;

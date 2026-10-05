@@ -149,7 +149,11 @@ impl OperationRegistry {
         let (snapshot, event) = {
             let state = inner.current.get_mut(op_id)?;
             state.phase = phase.to_string();
-            state.status = OperationStatus::Running;
+            state.status = if phase == "queued" {
+                OperationStatus::Queued
+            } else {
+                OperationStatus::Running
+            };
             state.message = message.into();
             state.last_update_ms = now_ms();
             (state.snapshot(), state.event())

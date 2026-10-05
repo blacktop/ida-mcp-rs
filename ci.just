@@ -40,17 +40,11 @@ package-artifacts:
             'bin_dir=$(CDPATH= cd -- "$(dirname -- "$source_path")" && pwd)' \
             '' \
             'ida_dir="${IDADIR:-}"' \
-            'runtime_home="${SNAP_REAL_HOME:-${HOME:-}}"' \
-            'if [ -z "$ida_dir" ] && [ -n "$runtime_home" ]; then' \
-            '    ida_dir="${runtime_home}/ida-pro-9.4"' \
+            'if [ -z "$ida_dir" ] && [ -n "${HOME:-}" ]; then' \
+            '    ida_dir="${HOME}/ida-pro-9.4"' \
             'fi' \
             'if [ -n "$ida_dir" ]; then' \
             '    export LD_LIBRARY_PATH="${ida_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"' \
-            'fi' \
-            '' \
-            '# Snap strict confinement remaps $HOME; point IDA at the real .idapro' \
-            'if [ -n "${SNAP_REAL_HOME:-}" ]; then' \
-            '    export IDAUSR="${SNAP_REAL_HOME}/.idapro"' \
             'fi' \
             '' \
             'exec "${bin_dir}/ida-mcp-bin" "$@"' \
@@ -253,19 +247,6 @@ publish-nur version:
     git add pkgs/ida-mcp/default.nix default.nix
     git diff --cached --quiet || git commit -m "ida-mcp: v${VERSION}"
     git push
-
-# Snap builds are normally automatic via build.snapcraft.io on tag push.
-# This recipe is a manual fallback: it submits a remote build to Launchpad
-# (works from macOS, no local LXD), waits for both arch builds, then uploads.
-# Prereq: `snapcraft login` and the snap name registered to your account.
-publish-snap channel="edge":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    command -v snapcraft >/dev/null || { echo "snapcraft not found; install with: brew install snapcraft" >&2; exit 1; }
-    snapcraft remote-build --launchpad-accept-public-upload
-    for snap in ida-mcp_*.snap; do
-        snapcraft upload "${snap}" --release "{{ channel }}"
-    done
 
 publish-cask version revision="":
     #!/usr/bin/env bash
