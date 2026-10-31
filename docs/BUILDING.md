@@ -9,7 +9,7 @@
 - LLVM/Clang (for C++ bindings)
 - IDA SDK (from Hex-Rays)
 
-`main` builds for the IDA 9.5 beta. The runtime must match the SDK the
+`main` builds for IDA 9.5. The runtime must match the SDK the
 binary was built against (major and minor), so a `main` build will not
 initialize against IDA 9.4. To build for the stable IDA 9.4 line, check out
 the latest `v9.4.x` tag first; packaged releases follow the same rule.

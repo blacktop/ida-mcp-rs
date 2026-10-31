@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression test for the IDA 9.4 final Hex-Rays API magic. The SDK's
+# Regression test for the released SDK's Hex-Rays API magic. The SDK's
 # init_hexrays_plugin() is inline, so a stale binding can open an IDB but
 # report that the installed decompiler is unavailable.
 set -euo pipefail
