@@ -21,20 +21,26 @@
   calls with explicit parameters, not scripts the agent has to write. In a
   measured Claude Code run, selecting and analyzing the x86_64 slice of a
   universal binary took one call and about five seconds.
-- **Fast and lean.** A native Rust server driving IDA through idalib; a 28-tool
-  `--profile=lean` measured 25% cheaper than the full set on real tasks with
-  the same correctness, and the full set is there when you need it.
+- **Fast and lean.** A native Rust server driving IDA through idalib. The
+  28-tool `--profile=lean` cost 25% less than the full set in the
+  [October 2026 Claude Code benchmark](bench/README.md), with the same task
+  success rate. The full set is available when you need it.
 - **Safe to leave running.** Exact-target edits, `save_idb` checkpoints,
-  analysis flushed to disk as soon as it finishes, graceful shutdown on every
-  signal a client sends, and database state discarded rather than trusted
-  after an IDA crash.
+  analysis flushed to disk as soon as it finishes, bounded graceful shutdown,
+  and automatic replacement of crashed or wedged IDA workers.
 - **Scriptable when the tools run out.** `run_script` returns a trailing
   expression as JSON and keeps state between calls, so one script can find,
   filter, and return only what matters.
 
 ## Prerequisites
 
-- IDA Pro 9.5 with a valid license
+- Released IDA Pro 9.5 with a valid license and the same host architecture as ida-mcp
+- A Hex-Rays decompiler for the target processor when using pseudocode tools
+- Working IDAPython when using `run_script`
+
+Open IDA once and complete its first-launch setup, including reviewing and
+accepting the license agreement yourself. The 9.5.0 release was validated with
+IDA `9.5.261026` on macOS ARM64, Linux ARM64, and Windows ARM64.
 
 ## Getting started
 
@@ -66,7 +72,9 @@ nix shell github:blacktop/nur#ida-mcp \
   --extra-experimental-features 'nix-command flakes'
 ```
 
-**Direct download:** grab the archive for your platform from [GitHub Releases](https://github.com/blacktop/ida-mcp-rs/releases).
+**Direct download:** [GitHub Releases](https://github.com/blacktop/ida-mcp-rs/releases/latest)
+provides archives for macOS, Linux, and Windows, each for ARM64 and x86_64.
+Each release includes `checksums.txt`.
 
 **Build from source:** see [docs/BUILDING.md](docs/BUILDING.md).
 
@@ -74,7 +82,12 @@ nix shell github:blacktop/nur#ida-mcp \
 
 #### Upgrading from the IDA 9.5 beta
 
-Install the released IDA 9.5 runtime, then replace the beta cask with the stable cask:
+Install the released IDA 9.5 runtime before switching to the stable server.
+The `9.5.261001` beta uses a different Hex-Rays API and can report
+`Decompiler not available` with the released SDK. If both installations are
+present, make sure the server loads the released runtime.
+
+For Homebrew, replace the beta cask with the stable cask:
 ```bash
 brew uninstall --cask ida-mcp@beta
 brew install blacktop/tap/ida-mcp
@@ -84,15 +97,15 @@ brew install blacktop/tap/ida-mcp
 
 #### macOS
 
-Standard IDA installs in `/Applications` work without extra setup:
+Standard IDA installs in `/Applications` work without extra setup.
+
+If a library cannot be loaded, or an older IDA install is selected, set
+`DYLD_LIBRARY_PATH` for the server process:
 ```bash
-claude mcp add ida -- ida-mcp
+env DYLD_LIBRARY_PATH='/path/to/IDA.app/Contents/MacOS' ida-mcp --version
 ```
 
-If you see `Library not loaded: @rpath/libida.dylib`, point `DYLD_LIBRARY_PATH` at your IDA install:
-```bash
-claude mcp add ida -e DYLD_LIBRARY_PATH='/path/to/IDA.app/Contents/MacOS' -- ida-mcp
-```
+Use the same environment setting in your MCP client configuration.
 
 Paths found automatically:
 - `/Applications/IDA Professional 9.5.app/Contents/MacOS`
@@ -102,17 +115,19 @@ Paths found automatically:
 
 #### Linux
 
-The IDA installer defaults to `~/ida-pro-9.5`, and the launcher script looks there:
+Linux release archives contain the `ida-mcp` launcher and `ida-mcp-bin`.
+Keep both files in the same directory. The launcher looks for IDA at
+`~/ida-pro-9.5` by default.
+
+For another install location, set `IDADIR` for the launcher:
 ```bash
-claude mcp add ida -- ida-mcp
+env IDADIR='/path/to/ida' ida-mcp --version
 ```
 
-For any other install location, set `IDADIR`:
-```bash
-claude mcp add ida -e IDADIR='/path/to/ida' -- ida-mcp
-```
-
-Lookup order: `$IDADIR`, then `~/ida-pro-9.5`, then `/opt/ida-pro-9.5` and the other RUNPATH fallbacks.
+The launcher adds that directory to `LD_LIBRARY_PATH`; otherwise the binary's
+RUNPATH fallbacks apply. A source-built binary has its preferred IDA path set
+at build time. Rebuild it with the desired `IDADIR`, or set `LD_LIBRARY_PATH`
+when launching it. See [Building from Source](docs/BUILDING.md#rpath).
 
 #### Windows
 
@@ -158,9 +173,23 @@ The binary links against IDA's libraries at runtime. Baked-in RPATHs cover the s
 
 | Platform | Library | Fallback Configuration |
 |----------|---------|------------------------|
-| macOS | `libida.dylib` | `DYLD_LIBRARY_PATH` |
-| Linux | `libida.so` | `IDADIR` (launcher reads it) or `LD_LIBRARY_PATH` |
-| Windows | `ida.dll` | Place exe in IDA dir, or set `IDADIR` and add IDA dir to `PATH` |
+| macOS | `libida.dylib`, `libidalib.dylib` | `DYLD_LIBRARY_PATH` |
+| Linux | `libida.so`, `libidalib.so` | `IDADIR` (release launcher) or `LD_LIBRARY_PATH` |
+| Windows | `ida.dll`, `idalib.dll` | Place exe in IDA dir, or set `IDADIR` and add IDA dir to `PATH` |
+
+### Verify the installation
+
+Check the server version, then use `probe` with a binary you want to analyze:
+
+```bash
+ida-mcp --version
+mkdir -p ~/ida-work
+ida-mcp probe --path /path/to/sample --idb-out ~/ida-work/sample.i64 --list 5
+```
+
+`--version` checks that the executable starts; `probe` also initializes IDA,
+opens the input, and reports the loaded runtime. Use `ida-mcp --help` and
+`ida-mcp serve-http --help` for the available startup options.
 
 ### Configure your AI agent
 
@@ -194,29 +223,26 @@ Add to `.cursor/mcp.json`:
 Once your agent is configured, it can drive the tools directly:
 
 ```
-# Open a binary. This returns quickly; analysis runs separately.
-open_idb(path: "~/samples/malware")
+# Open one binary. Raw inputs default to analysis disabled.
+open_idb(path: "~/samples/malware", idb_out: "~/ida-work/sample.i64")
 
-# Keep the generated database out of a read-only input directory
-open_idb(path: "/System/example", idb_out: "~/ida-work/example.i64")
-
-# Pick one slice of a universal (fat) Mach-O
-open_idb(path: "/bin/ls", arch: "arm64e", idb_out: "~/ida-work/ls.i64")
-
-# These work immediately, no analysis needed
-list_functions(limit: 20)
-disasm_by_name(name: "main", count: 20)
-strings(limit: 10)
-
-# For xrefs/decompile on large binaries, run analysis in the background
+# Check readiness, then run analysis when functions or xrefs are incomplete
+analysis_status()
 analyze_funcs(background: true)   # returns task_id
 task_status(task_id: "analyze-<random>") # poll progress (ID from the analyze_funcs response)
 
-# Decompile (requires Hex-Rays + completed analysis)
-decompile(address: "0x100000f00")
+# After analysis completes, inspect functions and resolve a real address
+list_functions(limit: 20)
+resolve_function(name: "main")
+decompile(address: "<address returned by resolve_function>")
+strings(limit: 10)
 
 # Discover more tools
 tool_catalog(query: "find callers")
+
+# Save edits and release the database when finished
+save_idb()
+close_idb()
 ```
 
 Tools that change the database (`rename`, `set_comments`, `patch`, `patch_asm`,
@@ -326,7 +352,7 @@ service. Older IDA builds fall back to the legacy `idat` background flow when a
 open_dsc(path: "/path/to/dyld_shared_cache_arm64e", arch: "arm64e",
          module: "/usr/lib/libobjc.A.dylib")
 
-# If a legacy background task was started, poll until done
+# If open_dsc returns a task_id, poll until done
 task_status(task_id: "dsc-<random>")  # ID from the open_dsc response
 
 # Load additional frameworks for cross-module references
@@ -374,7 +400,7 @@ run_script(file: "/path/to/analysis_script.py")
 
 # Build state in one call, return a value from the next
 run_script(code: "import idautils\nfuncs = list(idautils.Functions())")
-run_script(code: "{'count': len(funcs), 'first': hex(funcs[0])}")
+run_script(code: "{'count': len(funcs), 'first': hex(funcs[0]) if funcs else None}")
 
 # With timeout (default 120s, max 600s)
 run_script(code: "import ida_bytes; print(ida_bytes.get_bytes(0x1000, 16).hex())",
@@ -536,7 +562,7 @@ debug_stop(database_id: "…", action: "auto")
 `debug_open_module` opens standalone binaries and dlopen'd plugins directly. On
 macOS it also resolves system libraries such as `/usr/lib/libobjc.A.dylib`
 through the host dyld shared cache for the target's architecture, then loads the
-image with IDA 9.4's in-process DSC service. It doesn't extract a temporary
+image with the native DSC service available in IDA 9.4 and later. It doesn't extract a temporary
 dylib or run `idat`.
 
 `debug_open_module` always requires `idb_out`. Runtime modules often live in
@@ -610,10 +636,11 @@ doesn't modify the database.
 
 ## Context optimization
 
-By default `tools/list` returns 76 tools. The full tool list is roughly 15k
-tokens, estimated at four characters per token. Seven more are opt-in: the six
-debugger tools and `list_databases` appear only with
-`--enable-debugger` or `--workspace`. Clients with dynamic tool discovery defer
+By default `tools/list` returns 76 tools. In 9.5.0, its compact tool array is
+about 62.2 KB of JSON, or roughly 15.5k tokens using the `measure-tools` estimate.
+Six debugger tools are gated by `--enable-debugger` on supported hosts;
+`debug_open_module` also needs `--workspace`. The seventh opt-in tool,
+`list_databases`, appears in workspace mode. Clients with dynamic tool discovery defer
 the schema cost; clients that preload schemas pay it every session. To trim the
 surface to what you need:
 
@@ -631,9 +658,12 @@ With no flags you get all 76 baseline tools. Categories: `core`, `functions`,
 debugger is enabled on a supported platform (run `tool_catalog` to list them).
 Flags override env vars, and unknown names are rejected at startup.
 
+`--read-only` filters the exposed MCP tools. Database lifecycle calls remain
+available and can create or save IDB files; it is not a filesystem sandbox.
+
 ### The `lean` profile
 
-`--profile=lean` advertises 28 tools, about 26 KB of schemas, chosen for Apple
+`--profile=lean` advertises 28 tools, about 26.3 KB of `tools/list` JSON, chosen for Apple
 reverse engineering: opening binaries, caches and debug info
 (`open_idb`, `open_dsc`, `dsc_add_dylib`, `dsc_add_region`, `load_debug_info`,
 `analysis_status`, `analyze_funcs`, `save_idb`, `close_idb`, `task_status`),
@@ -659,18 +689,17 @@ Lean cost 25% less than full ($0.275 vs $0.367), used 42 vs 52 tool calls,
 and recorded 0 vs 1 MCP tool errors; cache-read input fell from 849,325 to
 442,166 tokens. The saving is almost all cache-read tokens from the smaller
 inventory, so it applies to clients that send the tool list with every
-request. No other client was measured.
+request. No other client was measured. See [the benchmark harness](bench/README.md)
+for the tasks, correctness oracles, and reproduction instructions.
 
 ### Recommendations by client
 
-- **Claude Code:** use `--profile=lean` for Apple RE work; it was 25% cheaper than the full set on the measured tasks with the same correctness. Add `--tools` for anything specific you need beyond it.
-- **Cursor:** defers MCP tool schemas and loads them on demand, so filtering is mainly about limiting what the agent can do; not measured.
-- **Codex CLI:** current models with tool search defer MCP tools automatically. For models without tool search, or to limit what the agent can do, pick a focused subset:
+- **Claude Code:** use `--profile=lean` for the Apple RE workflows covered by the benchmark. Add `--tools` for anything you need beyond it.
+- **Clients that load every schema into context:** choose a focused subset to reduce the advertised tool list:
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile,xrefs
   ```
-- **Clients without lazy tool loading:** every session receives the full tool list, estimated at ~15k tokens. Pick a focused subset as shown above.
-- **Gemini CLI:** filtering is optional, but a smaller surface cuts down on wrong tool picks when several MCP servers are enabled:
+- **Clients with deferred tool discovery:** the full default is useful for broad work. Filters still let you constrain the operations available to the agent. A read-only disassembly setup is:
   ```bash
   ida-mcp --toolsets=core,functions,disassembly,decompile --read-only
   ```
@@ -699,7 +728,11 @@ Most MCP configs run `ida-mcp` with no subcommand. The env vars work there too:
 
 ### Measuring
 
-`just measure-tools` prints a per-tool char/token breakdown. It starts the server without filter flags, so the numbers cover the full default list. To see what a filter saves, check your client's context view (`/context` in Claude Code, or its equivalent elsewhere).
+`just measure-tools` prints a per-tool character count and a rough token estimate.
+It measures the full default list unless filter environment variables are set.
+For example, `env IDA_MCP_PROFILE=lean just measure-tools` measures the lean
+profile. For the client's actual token usage, use its context view (`/context`
+in Claude Code, or the equivalent elsewhere).
 
 ## Docs
 
