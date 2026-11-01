@@ -47,6 +47,7 @@ brew install blacktop/tap/ida-mcp        # Latest (IDA 9.5)
 
 **macOS (Apple Silicon), older IDA releases** (via versioned Homebrew casks)
 ```bash
+brew install blacktop/tap/ida-mcp@9.4    # IDA 9.4
 brew install blacktop/tap/ida-mcp@9.3    # IDA 9.3/9.3sp1
 brew install blacktop/tap/ida-mcp@9.2    # IDA 9.2
 ```
@@ -315,7 +316,7 @@ path is reused; a different file there is never overwritten. The response's
 
 ### `dyld_shared_cache`
 
-`open_dsc` opens one module from Apple's dyld_shared_cache. On IDA 9.4, ida-mcp
+`open_dsc` opens one module from Apple's dyld_shared_cache. On IDA 9.4+, ida-mcp
 reads the DSC header directly and loads images through IDA's native `dscu`
 service. Older IDA builds fall back to the legacy `idat` background flow when a
 `.i64` has to be generated.
